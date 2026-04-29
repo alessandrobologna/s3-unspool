@@ -67,7 +67,7 @@ Resources:
               Resource: !Sub 'arn:${AWS::Partition}:s3:::${BenchmarkBucketName}'
               Condition:
                 StringLike:
-                  s3:prefix:
+                  's3:prefix':
                     - !Sub '${BenchmarkFixturePrefix}*'
                     - !Sub '${BenchmarkDestinationPrefix}*'
             - Sid: ReadWriteDeleteTestBucketObjects
