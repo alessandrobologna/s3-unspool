@@ -10,6 +10,7 @@ use std::time::Duration;
 use aws_sdk_s3::Client;
 use bytes::Bytes;
 use futures_util::FutureExt;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncSeek, ReadBuf, SeekFrom};
 use tokio::sync::futures::OwnedNotified;
 use tokio::sync::{Notify, Semaphore};
@@ -397,6 +398,7 @@ pub(crate) struct BlockStore {
     capacity_notify: Arc<Notify>,
     source: Option<Arc<SourceClient>>,
     fetch_semaphore: Arc<Semaphore>,
+    fetch_concurrency: usize,
     diagnostics: Option<Arc<SourceDiagnosticsCollector>>,
 }
 
@@ -483,6 +485,7 @@ impl BlockStore {
             capacity_notify: Arc::new(Notify::new()),
             source,
             fetch_semaphore: Arc::new(Semaphore::new(source_get_concurrency.max(1))),
+            fetch_concurrency: source_get_concurrency.max(1),
             diagnostics,
         })
     }
@@ -589,6 +592,10 @@ impl BlockStore {
 
     pub(crate) fn block_count(&self) -> usize {
         self.blocks.len()
+    }
+
+    fn fetch_concurrency(&self) -> usize {
+        self.fetch_concurrency
     }
 
     #[cfg(test)]
@@ -938,20 +945,27 @@ pub(crate) struct BlockSlice {
 
 pub(crate) fn start_source_scheduler(store: Arc<BlockStore>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tasks = Vec::with_capacity(store.block_count());
+        let mut tasks = FuturesUnordered::new();
+        let block_count = store.block_count();
+        let fetch_concurrency = store.fetch_concurrency();
+        let mut next_index = 0;
 
-        for index in 0..store.block_count() {
-            let Some(range) = store.reserve_fetch(index).await else {
-                continue;
-            };
-            let store = Arc::clone(&store);
-            tasks.push(tokio::spawn(async move {
-                let _ = store.fetch_reserved_block(index, range).await;
-            }));
-        }
+        loop {
+            while tasks.len() < fetch_concurrency && next_index < block_count {
+                let index = next_index;
+                next_index += 1;
+                let Some(range) = store.reserve_fetch(index).await else {
+                    continue;
+                };
+                let store = Arc::clone(&store);
+                tasks.push(tokio::spawn(async move {
+                    let _ = store.fetch_reserved_block(index, range).await;
+                }));
+            }
 
-        for task in tasks {
-            let _ = task.await;
+            if tasks.next().await.is_none() {
+                break;
+            }
         }
     })
 }

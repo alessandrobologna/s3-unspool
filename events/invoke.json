@@ -5,5 +5,5 @@
   "diagnostics": false,
   "ignoreCatalog": false,
   "includeOperations": false,
-  "concurrency": 64
+  "concurrency": 16
 }
