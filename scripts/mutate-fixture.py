@@ -308,6 +308,12 @@ def write_changed_file(
     return digest.hexdigest()
 
 
+def random_bytes(rng: random.Random, length: int) -> bytes:
+    if hasattr(rng, "randbytes"):
+        return rng.randbytes(length)
+    return rng.getrandbits(length * 8).to_bytes(length, "little")
+
+
 class MutatedContentStream:
     def __init__(self, *, seed: int, index: int, kind: str) -> None:
         if kind not in {"compressible", "incompressible", "mixed"}:
@@ -323,7 +329,7 @@ class MutatedContentStream:
 
     def next_bytes(self, length: int) -> bytes:
         if self.kind == "incompressible":
-            return self.rng.randbytes(length)
+            return random_bytes(self.rng, length)
         if self.kind == "compressible":
             return self._compressible(length)
         return self._mixed(length)
@@ -342,7 +348,7 @@ class MutatedContentStream:
             block_remaining = 4096 - ((self.offset + len(data)) % 4096)
             want = min(block_remaining, length - len(data))
             if block_index % 4 == 3:
-                data.extend(self.rng.randbytes(want))
+                data.extend(random_bytes(self.rng, want))
             else:
                 data.extend(self._pattern_slice(want))
             if (self.offset + len(data)) % 4096 == 0:

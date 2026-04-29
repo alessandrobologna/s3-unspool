@@ -5,7 +5,8 @@ Description: S3 ZIP extraction Lambda built with Cargo Lambda.
 Parameters:
   BenchmarkBucketName:
     Type: String
-    Description: Existing S3 bucket that stores benchmark fixture ZIPs and destination prefixes.
+    Default: ''
+    Description: Optional existing S3 bucket that stores benchmark fixture ZIPs and destination prefixes.
   BenchmarkFixturePrefix:
     Type: String
     Default: benchmarks/fixtures/
@@ -26,6 +27,9 @@ Globals:
     Architectures:
       - arm64
     Tracing: Active
+
+Conditions:
+  HasBenchmarkBucket: !Not [!Equals [!Ref BenchmarkBucketName, '']]
 
 Resources:
   TestBucket:
@@ -60,16 +64,25 @@ Resources:
               Action:
                 - s3:ListBucket
               Resource: !GetAtt TestBucket.Arn
-            - Sid: ListBenchmarkBucket
+            - Sid: XRayWriteAccess
               Effect: Allow
               Action:
-                - s3:ListBucket
-              Resource: !Sub 'arn:${AWS::Partition}:s3:::${BenchmarkBucketName}'
-              Condition:
-                StringLike:
-                  's3:prefix':
-                    - !Sub '${BenchmarkFixturePrefix}*'
-                    - !Sub '${BenchmarkDestinationPrefix}*'
+                - xray:PutTraceSegments
+                - xray:PutTelemetryRecords
+              Resource: '*'
+            - !If
+              - HasBenchmarkBucket
+              - Sid: ListBenchmarkBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${BenchmarkBucketName}'
+                Condition:
+                  StringLike:
+                    's3:prefix':
+                      - !Sub '${BenchmarkFixturePrefix}*'
+                      - !Sub '${BenchmarkDestinationPrefix}*'
+              - !Ref AWS::NoValue
             - Sid: ReadWriteDeleteTestBucketObjects
               Effect: Allow
               Action:
@@ -77,18 +90,24 @@ Resources:
                 - s3:PutObject
                 - s3:DeleteObject
               Resource: !Sub '${TestBucket.Arn}/*'
-            - Sid: ReadBenchmarkFixtureObjects
-              Effect: Allow
-              Action:
-                - s3:GetObject
-              Resource: !Sub 'arn:${AWS::Partition}:s3:::${BenchmarkBucketName}/${BenchmarkFixturePrefix}*'
-            - Sid: ReadWriteDeleteBenchmarkDestinationObjects
-              Effect: Allow
-              Action:
-                - s3:GetObject
-                - s3:PutObject
-                - s3:DeleteObject
-              Resource: !Sub 'arn:${AWS::Partition}:s3:::${BenchmarkBucketName}/${BenchmarkDestinationPrefix}*'
+            - !If
+              - HasBenchmarkBucket
+              - Sid: ReadBenchmarkFixtureObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${BenchmarkBucketName}/${BenchmarkFixturePrefix}*'
+              - !Ref AWS::NoValue
+            - !If
+              - HasBenchmarkBucket
+              - Sid: ReadWriteDeleteBenchmarkDestinationObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${BenchmarkBucketName}/${BenchmarkDestinationPrefix}*'
+              - !Ref AWS::NoValue
 
 Outputs:
   FunctionName:
@@ -101,11 +120,14 @@ Outputs:
     Description: Test bucket allowed by the Lambda execution role.
     Value: !Ref TestBucket
   BenchmarkBucketName:
+    Condition: HasBenchmarkBucket
     Description: Existing benchmark bucket allowed by the Lambda execution role.
     Value: !Ref BenchmarkBucketName
   BenchmarkFixturePrefix:
+    Condition: HasBenchmarkBucket
     Description: Benchmark fixture prefix readable by the Lambda execution role.
     Value: !Ref BenchmarkFixturePrefix
   BenchmarkDestinationPrefix:
+    Condition: HasBenchmarkBucket
     Description: Benchmark destination prefix readable and writable by the Lambda execution role.
     Value: !Ref BenchmarkDestinationPrefix
