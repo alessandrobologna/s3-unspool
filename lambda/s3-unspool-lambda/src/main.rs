@@ -62,6 +62,7 @@ async fn handle(event: LambdaEvent<InvokePayload>) -> Result<InvokeResponse, Lam
     let memory_mb = u64::try_from(context.env_config.memory).unwrap_or_default();
     let concurrency = payload
         .concurrency
+        .map(clamp_lambda_concurrency)
         .unwrap_or_else(|| adaptive_lambda_concurrency(memory_mb));
     tracing::info!(
         request_id = %context.request_id,
@@ -76,11 +77,10 @@ async fn handle(event: LambdaEvent<InvokePayload>) -> Result<InvokeResponse, Lam
         "lambda extract invoke started"
     );
 
-    let source_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-    let destination_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-    let source_client = Client::new(&source_config);
+    let shared_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let source_client = Client::new(&shared_config);
     let destination_client = Client::from_conf(
-        aws_sdk_s3::config::Builder::from(&destination_config)
+        aws_sdk_s3::config::Builder::from(&shared_config)
             .stalled_stream_protection(
                 StalledStreamProtectionConfig::enabled()
                     .upload_enabled(false)
@@ -185,6 +185,10 @@ impl InvokePayload {
 fn adaptive_lambda_concurrency(memory_mb: u64) -> usize {
     let memory_ratio = memory_mb as f64 / LAMBDA_BASE_MEMORY_MB;
     let workers = (LAMBDA_BASE_CONCURRENCY * memory_ratio.sqrt()).round() as usize;
+    clamp_lambda_concurrency(workers)
+}
+
+fn clamp_lambda_concurrency(workers: usize) -> usize {
     workers.clamp(MIN_LAMBDA_CONCURRENCY, MAX_LAMBDA_CONCURRENCY)
 }
 
@@ -299,6 +303,13 @@ mod tests {
         assert_eq!(adaptive_lambda_concurrency(1024), 11);
         assert_eq!(adaptive_lambda_concurrency(2048), 16);
         assert_eq!(adaptive_lambda_concurrency(3008), 16);
+    }
+
+    #[test]
+    fn explicit_lambda_concurrency_is_clamped() {
+        assert_eq!(clamp_lambda_concurrency(0), MIN_LAMBDA_CONCURRENCY);
+        assert_eq!(clamp_lambda_concurrency(8), 8);
+        assert_eq!(clamp_lambda_concurrency(64), MAX_LAMBDA_CONCURRENCY);
     }
 
     #[test]

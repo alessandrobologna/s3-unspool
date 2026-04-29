@@ -766,9 +766,16 @@ impl BlockStore {
     }
 
     fn block_index_at(&self, position: u64) -> Option<usize> {
-        self.blocks
-            .iter()
-            .position(|block| block.range.start <= position && position <= block.range.end)
+        let index = self
+            .blocks
+            .partition_point(|block| block.range.start <= position);
+        if index == 0 {
+            return None;
+        }
+
+        let block_index = index - 1;
+        let block = &self.blocks[block_index];
+        (position <= block.range.end).then_some(block_index)
     }
 
     fn block_end(&self, index: usize) -> Option<u64> {
@@ -1328,5 +1335,29 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), wait)
             .await
             .expect("enabled capacity waiter should observe an immediate notification");
+    }
+
+    #[test]
+    fn block_index_at_uses_sorted_block_ranges() {
+        let store = BlockStore::new(
+            SourcePlan {
+                planned_entries: 3,
+                blocks: vec![
+                    SourceRange { start: 10, end: 19 },
+                    SourceRange { start: 30, end: 39 },
+                    SourceRange { start: 50, end: 59 },
+                ],
+            },
+            30,
+            None,
+        );
+
+        assert_eq!(store.block_index_at(9), None);
+        assert_eq!(store.block_index_at(10), Some(0));
+        assert_eq!(store.block_index_at(19), Some(0));
+        assert_eq!(store.block_index_at(20), None);
+        assert_eq!(store.block_index_at(30), Some(1));
+        assert_eq!(store.block_index_at(55), Some(2));
+        assert_eq!(store.block_index_at(60), None);
     }
 }

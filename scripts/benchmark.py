@@ -63,6 +63,7 @@ FIXTURE_METADATA = {
     },
 }
 FIXTURE_MIX = "40% compressible / 40% incompressible / 20% mixed"
+NUMBER_TYPES = (int, float)
 BENCHMARK_SECTION_START = "<!-- s3-unspool-benchmark-results:start -->"
 BENCHMARK_SECTION_END = "<!-- s3-unspool-benchmark-results:end -->"
 REPORT_RE = re.compile(
@@ -196,7 +197,7 @@ def main() -> int:
                     all_results.append(result)
                     status = "ok" if result.get("ok") else "failed"
                     duration = result.get("lambda_report", {}).get("duration_ms")
-                    duration_text = f"{duration / 1000:.2f}s" if isinstance(duration, int | float) else "n/a"
+                    duration_text = f"{duration / 1000:.2f}s" if isinstance(duration, NUMBER_TYPES) else "n/a"
                     print(f"  {status:6} {task.output_stem} {duration_text}", flush=True)
     finally:
         if args.restore_memory and original_memory is not None:
@@ -641,7 +642,7 @@ def aggregate_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         durations = [
             item.get("lambda_report", {}).get("duration_ms")
             for item in ok_group
-            if isinstance(item.get("lambda_report", {}).get("duration_ms"), int | float)
+            if isinstance(item.get("lambda_report", {}).get("duration_ms"), NUMBER_TYPES)
         ]
         max_memory = [
             item.get("lambda_report", {}).get("max_memory_used_mb")
@@ -683,12 +684,12 @@ def stats(values: list[int | float]) -> dict[str, float | None]:
 
 
 def median_field(items: list[dict[str, Any]], field: str) -> float | None:
-    values = [item.get(field) for item in items if isinstance(item.get(field), int | float)]
+    values = [item.get(field) for item in items if isinstance(item.get(field), NUMBER_TYPES)]
     return float(statistics.median(values)) if values else None
 
 
 def sum_field(items: list[dict[str, Any]], field: str) -> int:
-    return int(sum(item.get(field, 0) for item in items if isinstance(item.get(field), int | float)))
+    return int(sum(item.get(field, 0) for item in items if isinstance(item.get(field), NUMBER_TYPES)))
 
 
 def aggregate_range(diagnostics: list[dict[str, Any]]) -> dict[str, float | None]:
@@ -719,7 +720,7 @@ def sum_error_code_maps(items: list[dict[str, Any]]) -> dict[str, int]:
         if not isinstance(failures, dict):
             continue
         for code, count in failures.items():
-            if isinstance(code, str) and isinstance(count, int | float):
+            if isinstance(code, str) and isinstance(count, NUMBER_TYPES):
                 totals[code] = totals.get(code, 0) + int(count)
     return dict(sorted(totals.items()))
 
