@@ -121,29 +121,29 @@ available CPU. The current policy is:
 
 | Lambda memory | Entry workers | Source block | Source GETs | PUTs |
 | ---: | ---: | ---: | ---: | ---: |
-| 128 MB | 4 | 8 MiB | 1 | 2 |
-| 256 MB | 6 | 8 MiB | 1 | 2 |
-| 512 MB | 8 | 8 MiB | 2 | 2 |
-| 1024 MB | 11 | 8 MiB | 4 | 4 |
+| 128 MB | 4 | 8 MiB | 1 | 4 |
+| 256 MB | 6 | 8 MiB | 1 | 6 |
+| 512 MB | 8 | 8 MiB | 2 | 8 |
+| 1024 MB | 11 | 8 MiB | 4 | 8 |
 | 2048 MB | 16 | 8 MiB | 8 | 8 |
 
 The default worker count grows with the square root of memory:
 
 ```text
 workers = clamp(round(4 * sqrt(lambda_memory_mb / 128)), 4, 16)
-puts = min(workers, max(source_get_concurrency, 2), 8)
+puts = min(workers, 8)
 ```
 
-Before extraction, the Lambda inspects the ZIP central directory to count file
-entries. The source block window then uses otherwise idle memory after reserving
-fixed runtime overhead, worker overhead, per-file metadata overhead, and
-in-flight source blocks:
+After the ZIP manifest is loaded, the library resolves the source block window
+from the Lambda memory budget and the real file count. The window uses otherwise
+idle memory after reserving fixed runtime overhead, worker overhead, per-file
+metadata overhead, and in-flight source blocks:
 
 ```text
-window = max(0, M - 64 MiB - 12 MiB * workers - 2 KiB * zip_files - in_flight)
+window = M - 64 MiB - 12 MiB * workers - 2 KiB * zip_files - in_flight
 in_flight = source_get_concurrency * source_block_size
 if window > 512 MiB, window = window - 384 MiB
-window = min(window, 512 MiB)
+window = clamp(window, one source block, 512 MiB)
 ```
 
 The window is capped by the source ZIP size. If the computed window is smaller

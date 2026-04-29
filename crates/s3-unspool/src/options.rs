@@ -41,13 +41,14 @@ pub struct SyncOptions {
     pub source_get_concurrency: usize,
     /// Maximum bytes held by the planned source block window.
     pub source_window_capacity: usize,
-    /// Lambda-style adaptive source window memory budget.
+    /// Available memory budget, in MiB, used to derive the source block window.
     ///
     /// When set, extraction computes [`Self::source_window_capacity`] after the
     /// ZIP manifest is loaded, using the real source ZIP size and file count.
-    /// This avoids a separate pre-inspection pass while still reserving memory
-    /// for catalog metadata and worker overhead.
-    pub adaptive_source_window_memory_mb: Option<u64>,
+    /// This is useful for memory-bounded runtimes that want to assign otherwise
+    /// idle memory to source block buffering while reserving space for catalog
+    /// metadata and worker overhead.
+    pub source_window_memory_budget_mb: Option<u64>,
     /// Buffer size used when streaming entry bodies to S3.
     pub body_chunk_size: usize,
     /// Capacity of the in-memory pipe between decompression and S3 upload.
@@ -72,7 +73,7 @@ impl SyncOptions {
             source_block_merge_gap: DEFAULT_SOURCE_BLOCK_MERGE_GAP,
             source_get_concurrency: DEFAULT_SOURCE_GET_CONCURRENCY,
             source_window_capacity: DEFAULT_SOURCE_WINDOW_CAPACITY,
-            adaptive_source_window_memory_mb: None,
+            source_window_memory_budget_mb: None,
             body_chunk_size: DEFAULT_BODY_CHUNK_SIZE,
             pipe_capacity: DEFAULT_PIPE_CAPACITY,
         }
@@ -167,14 +168,10 @@ pub fn adaptive_source_window_capacity(
     }
     .min(ADAPTIVE_CACHE_MAX_WINDOW_CAPACITY);
 
-    let minimum_block_capacity = u64::try_from(source_block_size)
+    let minimum_block_capacity = u64::try_from(source_block_size.max(1))
         .unwrap_or(u64::MAX)
         .min(source_zip_bytes);
-    let capacity = if capacity < minimum_block_capacity {
-        0
-    } else {
-        capacity
-    };
+    let capacity = capacity.max(minimum_block_capacity);
 
     usize::try_from(capacity).unwrap_or(usize::MAX)
 }

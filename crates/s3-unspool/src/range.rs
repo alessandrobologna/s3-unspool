@@ -28,7 +28,10 @@ pub(crate) struct SourceRange {
 
 impl SourceRange {
     pub(crate) fn len(self) -> u64 {
-        self.end.saturating_sub(self.start).saturating_add(1)
+        self.end
+            .checked_sub(self.start)
+            .and_then(|len| len.checked_add(1))
+            .expect("SourceRange must be constructed with end >= start")
     }
 
     fn end_exclusive(self) -> u64 {
@@ -300,6 +303,15 @@ impl SourceClient {
         if end < start {
             return Err(invalid_source_range(start, end));
         }
+        if start >= self.len || end >= self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "S3 range bytes={start}-{end} is outside source object length {}",
+                    self.len
+                ),
+            ));
+        }
 
         let mut last_error = None;
         for attempt in 1..=GET_OBJECT_MAX_ATTEMPTS {
@@ -532,7 +544,8 @@ impl BlockStore {
         self.add_replay_claims(&indices);
         let store = Arc::clone(self);
         tokio::spawn(async move {
-            let mut tasks = Vec::with_capacity(indices.len());
+            let mut tasks = FuturesUnordered::new();
+            let fetch_concurrency = store.fetch_concurrency();
             for index in indices {
                 let Some(range) = store.reserve_fetch(index).await else {
                     continue;
@@ -541,10 +554,13 @@ impl BlockStore {
                 tasks.push(tokio::spawn(async move {
                     let _ = store.fetch_reserved_block(index, range).await;
                 }));
+                while tasks.len() >= fetch_concurrency {
+                    if tasks.next().await.is_none() {
+                        break;
+                    }
+                }
             }
-            for task in tasks {
-                let _ = task.await;
-            }
+            while tasks.next().await.is_some() {}
         })
     }
 

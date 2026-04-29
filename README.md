@@ -307,9 +307,9 @@ currently in-flight source blocks before assigning remaining memory to the block
 window. When that computed window exceeds 512 MiB, the Lambda leaves an
 additional 384 MiB unused as measured RSS headroom for allocator, catalog, SDK,
 and upload buffers, then caps the adaptive window at 512 MiB. Lambda also caps
-concurrent destination PUTs at
-`min(entry_workers, max(source_get_concurrency, 2), 8)` so S3 `SlowDown` backoff
-can control write pressure without changing the invoke payload shape.
+concurrent destination PUTs at `min(entry_workers, 8)`. Source GET concurrency
+remains independently bounded; tying PUT lanes to source GET lanes starved
+low-memory full extracts with many small files.
 
 See [Architecture](docs/architecture.md) for the extraction flow, source
 scheduler behavior, and diagnostics glossary.
@@ -324,11 +324,11 @@ The included SAM template deploys:
 
 - One direct-invoke Lambda function built with Cargo Lambda.
 - One test S3 bucket.
-- A Lambda role that can list, read, write, and delete objects in that test
-  bucket.
+- A Lambda role that can list, read, write, and optionally delete objects in
+  that test bucket.
 - Optional benchmark-bucket access scoped to `BenchmarkFixturePrefix` for
   fixture reads and `BenchmarkDestinationPrefix` for benchmark reads, writes,
-  and deletes.
+  and optional deletes.
 
 Validate and build:
 

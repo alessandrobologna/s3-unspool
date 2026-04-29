@@ -157,6 +157,7 @@ def main() -> int:
         "runs": parse_csv(args.runs),
         "samples": args.samples,
         "max_workers": args.max_workers,
+        "cleanup_before_run": args.cleanup_before_run,
         "diagnostics": args.diagnostics,
         "include_operations": args.include_operations,
     }
@@ -283,6 +284,14 @@ def parse_args() -> argparse.Namespace:
         "--allow-parallel-s3-costs",
         action="store_true",
         help="Allow --max-workers greater than 1 despite multiplied S3 PUT/LIST request costs",
+    )
+    parser.add_argument(
+        "--cleanup-before-run",
+        action="store_true",
+        help=(
+            "Delete each run-specific destination prefix before invoking Lambda. "
+            "Disabled by default because S3 cleanup listing and DeleteObjects add request cost."
+        ),
     )
     parser.add_argument("--lambda-timeout", type=int, default=900, help="Lambda timeout in seconds")
     parser.add_argument("--aws-max-attempts", type=int, default=5)
@@ -448,7 +457,8 @@ def run_sample(
     setup_dir: Path,
 ) -> dict[str, Any]:
     destination_prefix = task.destination_prefix.replace(DEFAULT_DESTINATION_PREFIX, args.destination_prefix, 1)
-    cleanup_prefix(clients, args.bucket, destination_prefix)
+    if args.cleanup_before_run:
+        cleanup_prefix(clients, args.bucket, destination_prefix)
 
     setup_result = None
     if task.case.setup_zip:

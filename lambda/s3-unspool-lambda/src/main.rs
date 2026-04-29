@@ -93,7 +93,7 @@ async fn handle(event: LambdaEvent<InvokePayload>) -> Result<InvokeResponse, Lam
     options.source_get_concurrency = adaptive_source_get_concurrency(memory_mb);
     options.put_concurrency =
         adaptive_lambda_put_concurrency(options.concurrency, options.source_get_concurrency);
-    options.adaptive_source_window_memory_mb = Some(memory_mb);
+    options.source_window_memory_budget_mb = Some(memory_mb);
     tracing::info!(
         request_id = %context.request_id,
         memory_mb,
@@ -101,7 +101,7 @@ async fn handle(event: LambdaEvent<InvokePayload>) -> Result<InvokeResponse, Lam
         source_block_size = options.source_block_size,
         source_block_merge_gap = options.source_block_merge_gap,
         source_get_concurrency = options.source_get_concurrency,
-        adaptive_source_window_memory_mb = ?options.adaptive_source_window_memory_mb,
+        source_window_memory_budget_mb = ?options.source_window_memory_budget_mb,
         put_concurrency = options.put_concurrency,
         body_chunk_size = options.body_chunk_size,
         pipe_capacity = options.pipe_capacity,
@@ -181,8 +181,8 @@ fn clamp_lambda_concurrency(workers: usize) -> usize {
     workers.clamp(MIN_LAMBDA_CONCURRENCY, MAX_LAMBDA_CONCURRENCY)
 }
 
-fn adaptive_lambda_put_concurrency(entry_workers: usize, source_get_concurrency: usize) -> usize {
-    entry_workers.min(source_get_concurrency.max(2)).clamp(1, 8)
+fn adaptive_lambda_put_concurrency(entry_workers: usize, _source_get_concurrency: usize) -> usize {
+    entry_workers.clamp(1, 8)
 }
 
 #[cfg(test)]
@@ -240,7 +240,7 @@ mod tests {
         assert!(options.ignore_embedded_catalog);
         assert!(!options.fail_on_conditional_conflict);
         assert!(options.collect_operations);
-        assert_eq!(options.adaptive_source_window_memory_mb, None);
+        assert_eq!(options.source_window_memory_budget_mb, None);
     }
 
     #[test]
@@ -305,9 +305,9 @@ mod tests {
 
     #[test]
     fn lambda_put_concurrency_follows_source_and_entry_limits() {
-        assert_eq!(adaptive_lambda_put_concurrency(4, 1), 2);
-        assert_eq!(adaptive_lambda_put_concurrency(6, 1), 2);
-        assert_eq!(adaptive_lambda_put_concurrency(8, 4), 4);
+        assert_eq!(adaptive_lambda_put_concurrency(4, 1), 4);
+        assert_eq!(adaptive_lambda_put_concurrency(6, 1), 6);
+        assert_eq!(adaptive_lambda_put_concurrency(8, 4), 8);
         assert_eq!(adaptive_lambda_put_concurrency(16, 8), 8);
         assert_eq!(adaptive_lambda_put_concurrency(4, 8), 4);
     }
@@ -348,7 +348,7 @@ mod tests {
                 8 * 1024 * 1024,
                 small_source_get_concurrency
             ),
-            0
+            8 * 1024 * 1024
         );
 
         let large_memory_concurrency = adaptive_lambda_concurrency(2048);

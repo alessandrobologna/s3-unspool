@@ -200,6 +200,9 @@ The harness:
 - runs fixture/configuration samples serially by default within each memory
   size;
 - gives every measured sample its own destination prefix;
+- leaves those run-specific prefixes in place by default to avoid hidden
+  `ListObjectsV2` and `DeleteObjects` request cost; pass
+  `--cleanup-before-run` only when a destructive pre-clean is intentional;
 - seeds update samples with the base ZIP before measuring the mutated ZIP;
 - captures Lambda `REPORT` duration and max memory from invoke log tails;
 - writes per-sample JSON, aggregate JSON, Markdown tables, and SVG bar charts
@@ -233,9 +236,11 @@ The benchmark Lambda template scopes access to fixture reads under
 `benchmarks/fixtures/` and destination reads/writes/deletes under
 `benchmarks/extract/` by default. Destination `s3:GetObject` is required for
 changed-file `PutObject` calls that use `If-Match`; without it, S3 rejects the
-conditional overwrite with `AccessDenied`. The benchmark harness also refuses to
-clean up prefixes outside `benchmarks/extract/`, and each sample deletes only
-its own run-specific destination prefix.
+conditional overwrite with `AccessDenied`. When `--cleanup-before-run` is used,
+the benchmark harness refuses to clean up prefixes outside
+`benchmarks/extract/`, and each cleanup is limited to the sample's own
+run-specific destination prefix. The default benchmark path avoids cleanup and
+relies on unique prefixes plus bucket lifecycle expiration for cost control.
 
 Invoke one run:
 

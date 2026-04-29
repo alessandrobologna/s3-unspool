@@ -199,7 +199,7 @@ fn adaptive_source_window_resolves_after_manifest_count_is_known() {
         S3Prefix::parse("s3://bucket/destination/").unwrap(),
     );
     options.source_window_capacity = 123;
-    options.adaptive_source_window_memory_mb = Some(256);
+    options.source_window_memory_budget_mb = Some(256);
     options.concurrency = 6;
     options.source_get_concurrency = 1;
     options.source_block_size = 8 * 1024 * 1024;
@@ -537,6 +537,23 @@ async fn source_client_rejects_invalid_ranges_before_fetch() {
 
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     assert!(err.to_string().contains("start 9"));
+}
+
+#[tokio::test]
+async fn source_client_rejects_out_of_bounds_ranges_before_fetch() {
+    let source = SourceClient {
+        client: dummy_s3_client(),
+        bucket: "bucket".to_string(),
+        key: "source.zip".to_string(),
+        len: 10,
+        etag: None,
+        diagnostics: None,
+    };
+
+    let err = source.get_range(8, 10).await.unwrap_err();
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("outside source object length 10"));
 }
 
 #[test]
@@ -912,7 +929,7 @@ async fn builds_manifest_from_stored_and_deflated_entries() {
 }
 
 #[tokio::test]
-async fn manifest_uses_zip_length_as_last_entry_span_end() {
+async fn manifest_uses_payload_end_as_last_entry_span_end() {
     let data = test_zip(&[("last.txt", Compression::Stored, b"alpha".as_slice())]).await;
     let source_len = data.len() as u64;
     let reader = async_zip::base::read::mem::ZipFileReader::new(data)
@@ -924,7 +941,12 @@ async fn manifest_uses_zip_length_as_last_entry_span_end() {
         build_manifest_entries(reader.file().entries(), &destination, source_len).unwrap();
 
     assert_eq!(manifest.entries.len(), 1);
-    assert_eq!(manifest.entries[0].source_span_end, source_len);
+    let stored = &reader.file().entries()[0];
+    assert_eq!(
+        manifest.entries[0].source_span_end,
+        stored.header_offset() + stored.header_size() + stored.compressed_size()
+    );
+    assert!(manifest.entries[0].source_span_end < source_len);
 }
 
 #[tokio::test]
@@ -1046,6 +1068,31 @@ async fn entry_reader_rejects_local_header_lengths_outside_source_span() {
         err,
         Error::InvalidZipEntry { ref path, ref reason }
             if path == "a.txt" && reason.contains("name or extra field")
+    ));
+}
+
+#[tokio::test]
+async fn entry_reader_rejects_encrypted_local_header() {
+    let data = test_zip(&[("a.txt", Compression::Stored, b"alpha".as_slice())]).await;
+    let mut data = set_first_local_general_purpose_flags(data, 1);
+    let source_len = data.len() as u64;
+    let reader = async_zip::base::read::mem::ZipFileReader::new(data.clone())
+        .await
+        .unwrap();
+    let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
+    let manifest =
+        build_manifest_entries(reader.file().entries(), &destination, source_len).unwrap();
+    let store = block_store_from_zip(std::mem::take(&mut data), &manifest.entries);
+
+    let err = match entry_reader(store, &manifest.entries[0]).await {
+        Ok(_) => panic!("expected encrypted local header to be rejected"),
+        Err(err) => err,
+    };
+
+    assert!(matches!(
+        err,
+        Error::InvalidZipEntry { ref path, ref reason }
+            if path == "a.txt" && reason.contains("encrypted ZIP entries")
     ));
 }
 
@@ -1329,6 +1376,31 @@ async fn rejects_duplicate_zip_paths_in_manifest() {
     assert!(matches!(err, Error::DuplicateZipPath(path) if path == "same.txt"));
 }
 
+#[tokio::test]
+async fn manifest_last_entry_span_excludes_central_directory() {
+    let data = test_zip(&[
+        ("a.txt", Compression::Stored, b"alpha".as_slice()),
+        ("b.txt", Compression::Stored, b"bravo".as_slice()),
+    ])
+    .await;
+    let source_len = data.len() as u64;
+    let reader = async_zip::base::read::mem::ZipFileReader::new(data)
+        .await
+        .unwrap();
+    let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
+
+    let manifest =
+        build_manifest_entries(reader.file().entries(), &destination, source_len).unwrap();
+    let last = manifest.entries.last().unwrap();
+    let stored = reader.file().entries().last().unwrap();
+
+    assert_eq!(
+        last.source_span_end,
+        stored.header_offset() + stored.header_size() + stored.compressed_size()
+    );
+    assert!(last.source_span_end < source_len);
+}
+
 async fn test_zip(entries: &[(&str, Compression, &[u8])]) -> Vec<u8> {
     let mut writer = async_zip::base::write::ZipFileWriter::new(Vec::new());
     for (path, compression, data) in entries {
@@ -1407,6 +1479,15 @@ fn replace_first_local_file_name(
 
     assert_eq!(&data[name_start..name_end], expected);
     data[name_start..name_end].copy_from_slice(replacement);
+    data
+}
+
+fn set_first_local_general_purpose_flags(mut data: Vec<u8>, flags: u16) -> Vec<u8> {
+    let index = data
+        .windows(4)
+        .position(|window| window == [0x50, 0x4b, 0x03, 0x04])
+        .expect("test fixture should contain a local file header");
+    data[index + 6..index + 8].copy_from_slice(&flags.to_le_bytes());
     data
 }
 

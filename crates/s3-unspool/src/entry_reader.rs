@@ -11,9 +11,12 @@ use crate::zip_manifest::{ManifestEntry, normalize_zip_file_path};
 
 const LOCAL_FILE_HEADER_SIGNATURE: u32 = 0x0403_4b50;
 const LOCAL_FILE_HEADER_LEN: usize = 30;
+const LOCAL_GENERAL_PURPOSE_FLAG_OFFSET: usize = 6;
 const LOCAL_FILE_NAME_LEN_OFFSET: usize = 26;
 const LOCAL_EXTRA_FIELD_LEN_OFFSET: usize = 28;
 const LOCAL_COMPRESSION_OFFSET: usize = 8;
+const GENERAL_PURPOSE_ENCRYPTED: u16 = 1 << 0;
+const GENERAL_PURPOSE_STRONG_ENCRYPTION: u16 = 1 << 6;
 
 pub(crate) type EntryReader = Pin<Box<dyn AsyncRead + Send>>;
 
@@ -47,6 +50,23 @@ pub(crate) async fn entry_reader(
                 "unexpected local file header signature {signature:#x} at offset {}",
                 entry.source_offset
             ),
+        });
+    }
+
+    let local_flags = u16::from_le_bytes([
+        header[LOCAL_GENERAL_PURPOSE_FLAG_OFFSET],
+        header[LOCAL_GENERAL_PURPOSE_FLAG_OFFSET + 1],
+    ]);
+    if local_flags & GENERAL_PURPOSE_ENCRYPTED != 0 {
+        return Err(Error::InvalidZipEntry {
+            path: entry.zip_path.clone(),
+            reason: "encrypted ZIP entries are not supported".to_string(),
+        });
+    }
+    if local_flags & GENERAL_PURPOSE_STRONG_ENCRYPTION != 0 {
+        return Err(Error::InvalidZipEntry {
+            path: entry.zip_path.clone(),
+            reason: "strongly encrypted ZIP entries are not supported".to_string(),
         });
     }
 
