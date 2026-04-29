@@ -3,8 +3,8 @@
 This file contains generated benchmark output from `scripts/benchmark.py`.
 For fixture generation, Lambda setup, and reproduction commands, see
 [Benchmark Methodology](benchmark-methodology.md). The checked-in table below
-was generated before the catalog-driven source scheduler rewrite and is kept as
-the checkpoint comparison baseline until the next benchmark refresh.
+is a post source-scheduler checkpoint from the 2026-04-28 rewrite branch. It is
+kept as a comparison baseline until the next benchmark refresh.
 
 <!-- s3-unspool-benchmark-results:start -->
 ## Automated Benchmark Results
