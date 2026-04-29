@@ -12,7 +12,7 @@ import random
 import re
 import shutil
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 
 SIZE_RE = re.compile(r"^(\d+(?:\.\d+)?)([a-zA-Z]*)$")
@@ -253,10 +253,18 @@ def hardlink_or_copy(source: str, destination: str) -> None:
 
 def safe_manifest_path(entry: object) -> Path:
     raw_path = entry_string(entry, "path")
-    relative_path = Path(raw_path)
-    if relative_path.is_absolute() or ".." in relative_path.parts:
+    posix_path = PurePosixPath(raw_path)
+    windows_path = PureWindowsPath(raw_path)
+    if (
+        "\\" in raw_path
+        or posix_path.is_absolute()
+        or windows_path.drive
+        or windows_path.anchor
+        or not posix_path.parts
+        or ".." in posix_path.parts
+    ):
         raise FixtureMutationError(f"unsafe manifest path: {raw_path}")
-    return relative_path
+    return Path(*posix_path.parts)
 
 
 def entry_string(entry: object, key: str) -> str:
