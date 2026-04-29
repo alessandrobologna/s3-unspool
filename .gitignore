@@ -1,0 +1,6 @@
+/target
+/.aws-sam
+__pycache__/
+*.pyc
+/benchmark-results/
+/docs/assets/benchmarks/

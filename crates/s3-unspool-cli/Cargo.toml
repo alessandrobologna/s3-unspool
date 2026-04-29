@@ -1,0 +1,24 @@
+[package]
+name = "s3-unspool-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "s3-unspool"
+path = "src/main.rs"
+
+[dependencies]
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+clap.workspace = true
+s3-unspool.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+terminal_size.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
