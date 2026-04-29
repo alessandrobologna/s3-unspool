@@ -1008,6 +1008,31 @@ async fn entry_reader_rejects_local_header_name_mismatch() {
 }
 
 #[tokio::test]
+async fn entry_reader_rejects_local_header_lengths_outside_source_span() {
+    let data = test_zip(&[("a.txt", Compression::Stored, b"alpha".as_slice())]).await;
+    let source_len = data.len() as u64;
+    let reader = async_zip::base::read::mem::ZipFileReader::new(data.clone())
+        .await
+        .unwrap();
+    let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
+    let mut manifest =
+        build_manifest_entries(reader.file().entries(), &destination, source_len).unwrap();
+    manifest.entries[0].source_span_end = manifest.entries[0].source_offset + 30;
+    let store = block_store_from_zip(data, &manifest.entries);
+
+    let err = match entry_reader(store, &manifest.entries[0]).await {
+        Ok(_) => panic!("expected local header span overflow to be rejected"),
+        Err(err) => err,
+    };
+
+    assert!(matches!(
+        err,
+        Error::InvalidZipEntry { ref path, ref reason }
+            if path == "a.txt" && reason.contains("name or extra field")
+    ));
+}
+
+#[tokio::test]
 async fn manifest_ignores_embedded_catalog_entry() {
     let data = test_zip(&[
         ("a.txt", Compression::Stored, b"alpha".as_slice()),

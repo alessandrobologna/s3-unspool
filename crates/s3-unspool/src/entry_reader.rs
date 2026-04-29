@@ -22,6 +22,19 @@ pub(crate) async fn entry_reader(
     entry: &ManifestEntry,
 ) -> Result<EntryReader> {
     let mut reader = BlockRangeReader::new(store, entry.source_offset, entry.source_span_end)?;
+    let local_header_end = entry
+        .source_offset
+        .checked_add(LOCAL_FILE_HEADER_LEN as u64)
+        .ok_or_else(|| Error::InvalidZipEntry {
+            path: entry.zip_path.clone(),
+            reason: "local file header offset overflowed".to_string(),
+        })?;
+    if local_header_end > entry.source_span_end {
+        return Err(Error::InvalidZipEntry {
+            path: entry.zip_path.clone(),
+            reason: "local file header extends beyond the planned source span".to_string(),
+        });
+    }
 
     let mut header = [0_u8; LOCAL_FILE_HEADER_LEN];
     reader.read_exact(&mut header).await?;
@@ -68,6 +81,13 @@ pub(crate) async fn entry_reader(
             path: entry.zip_path.clone(),
             reason: "local file data offset overflowed".to_string(),
         })?;
+    if data_offset > entry.source_span_end {
+        return Err(Error::InvalidZipEntry {
+            path: entry.zip_path.clone(),
+            reason: "local header name or extra field extends beyond the planned source span"
+                .to_string(),
+        });
+    }
 
     let mut local_file_name = vec![0_u8; file_name_len as usize];
     reader.read_exact(&mut local_file_name).await?;
@@ -94,7 +114,13 @@ pub(crate) async fn entry_reader(
 
     let mut local_extra = vec![0_u8; extra_field_len as usize];
     reader.read_exact(&mut local_extra).await?;
-    if data_offset.saturating_add(entry.compressed_size) > entry.source_span_end {
+    let compressed_data_end = data_offset
+        .checked_add(entry.compressed_size)
+        .ok_or_else(|| Error::InvalidZipEntry {
+            path: entry.zip_path.clone(),
+            reason: "local file compressed data offset overflowed".to_string(),
+        })?;
+    if compressed_data_end > entry.source_span_end {
         return Err(Error::InvalidZipEntry {
             path: entry.zip_path.clone(),
             reason: "local file data extends beyond the planned source span".to_string(),
