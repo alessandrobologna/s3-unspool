@@ -911,6 +911,29 @@ async fn manifest_uses_zip_length_as_last_entry_span_end() {
 }
 
 #[tokio::test]
+async fn manifest_rejects_header_offsets_outside_source_length() {
+    let data = test_zip(&[
+        ("a.txt", Compression::Stored, b"alpha".as_slice()),
+        ("b.txt", Compression::Stored, b"bravo".as_slice()),
+    ])
+    .await;
+    let reader = async_zip::base::read::mem::ZipFileReader::new(data)
+        .await
+        .unwrap();
+    let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
+    let truncated_source_len = reader.file().entries()[1].header_offset();
+
+    let err = build_manifest_entries(reader.file().entries(), &destination, truncated_source_len)
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::InvalidZipEntry { ref path, ref reason }
+            if path == "b.txt" && reason.contains("outside source ZIP length")
+    ));
+}
+
+#[tokio::test]
 async fn counts_zip_files_excluding_directories_and_embedded_catalog() {
     let data = test_zip(&[
         ("a.txt", Compression::Stored, b"alpha".as_slice()),

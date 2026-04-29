@@ -98,10 +98,25 @@ pub(crate) fn build_manifest_entries(
         let size = stored.uncompressed_size();
         let key = destination.join_key(&zip_path);
         let source_span_start = stored.header_offset();
+        if source_span_start >= source_len {
+            return Err(Error::InvalidZipEntry {
+                path: zip_path,
+                reason: format!(
+                    "local file header offset {source_span_start} is outside source ZIP length {source_len}"
+                ),
+            });
+        }
         let source_span_end = next_source_offset(&source_offsets, source_span_start)
             .unwrap_or(source_len)
-            .min(source_len)
-            .max(source_span_start);
+            .min(source_len);
+        if source_span_end <= source_span_start {
+            return Err(Error::InvalidZipEntry {
+                path: zip_path,
+                reason: format!(
+                    "local file source span {source_span_start}..{source_span_end} is empty"
+                ),
+            });
+        }
         manifest.push(ManifestEntry {
             source_offset: source_span_start,
             source_span_start,
