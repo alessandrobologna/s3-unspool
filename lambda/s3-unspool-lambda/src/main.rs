@@ -4,8 +4,7 @@ use aws_sdk_s3::config::StalledStreamProtectionConfig;
 use lambda_runtime::{Error as LambdaError, LambdaEvent, service_fn};
 use s3_unspool::{
     ObjectReport, S3Object, S3Prefix, SyncDiagnostics, SyncOptions, SyncReport, SyncSummary,
-    adaptive_source_get_concurrency, adaptive_source_window_capacity, inspect_s3_zip,
-    sync_zip_to_s3_with_clients,
+    adaptive_source_get_concurrency, sync_zip_to_s3_with_clients,
 };
 use serde::{Deserialize, Serialize};
 
@@ -94,29 +93,19 @@ async fn handle(event: LambdaEvent<InvokePayload>) -> Result<InvokeResponse, Lam
     options.source_get_concurrency = adaptive_source_get_concurrency(memory_mb);
     options.put_concurrency =
         adaptive_lambda_put_concurrency(options.concurrency, options.source_get_concurrency);
-    let source_info = inspect_s3_zip(&source_client, &options.source).await?;
-    options.source_window_capacity = adaptive_source_window_capacity(
-        memory_mb,
-        source_info.size,
-        options.concurrency,
-        source_info.file_count,
-        options.source_block_size,
-        options.source_get_concurrency,
-    );
+    options.adaptive_source_window_memory_mb = Some(memory_mb);
     tracing::info!(
         request_id = %context.request_id,
         memory_mb,
-        source_zip_bytes = source_info.size,
-        source_zip_files = source_info.file_count,
         concurrency = options.concurrency,
         source_block_size = options.source_block_size,
         source_block_merge_gap = options.source_block_merge_gap,
         source_get_concurrency = options.source_get_concurrency,
-        source_window_capacity = options.source_window_capacity,
+        adaptive_source_window_memory_mb = ?options.adaptive_source_window_memory_mb,
         put_concurrency = options.put_concurrency,
         body_chunk_size = options.body_chunk_size,
         pipe_capacity = options.pipe_capacity,
-        "lambda extract options resolved"
+        "lambda extract options prepared"
     );
     let report = sync_zip_to_s3_with_clients(&source_client, &destination_client, options).await;
     trim_process_allocator();
@@ -199,6 +188,7 @@ fn adaptive_lambda_put_concurrency(entry_workers: usize, source_get_concurrency:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use s3_unspool::adaptive_source_window_capacity;
 
     #[test]
     fn parses_minimal_camel_case_payload() {
@@ -250,6 +240,7 @@ mod tests {
         assert!(options.ignore_embedded_catalog);
         assert!(!options.fail_on_conditional_conflict);
         assert!(options.collect_operations);
+        assert_eq!(options.adaptive_source_window_memory_mb, None);
     }
 
     #[test]

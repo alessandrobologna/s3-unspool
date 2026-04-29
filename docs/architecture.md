@@ -156,6 +156,12 @@ was not enough for the 2048 MB large-archive run. The final 512 MiB cap is also
 intentional: larger source windows produced OOMs before improving completion
 time for the current large benchmark fixture.
 
+The Lambda does not pre-inspect the ZIP to get `F`. Instead, it passes the
+assigned memory budget into the library, and extraction resolves the adaptive
+window immediately after the ZIP manifest has been loaded. That keeps source
+metadata reads to one central-directory pass while still sizing the block window
+with the real file count.
+
 The Lambda asks glibc to return freed pages at invocation boundaries. This is
 intentional: warm execution environments can otherwise retain ZIP catalog/block
 pages in RSS after Rust values are dropped, and Lambda memory limits are

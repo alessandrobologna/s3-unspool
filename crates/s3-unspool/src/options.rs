@@ -41,6 +41,13 @@ pub struct SyncOptions {
     pub source_get_concurrency: usize,
     /// Maximum bytes held by the planned source block window.
     pub source_window_capacity: usize,
+    /// Lambda-style adaptive source window memory budget.
+    ///
+    /// When set, extraction computes [`Self::source_window_capacity`] after the
+    /// ZIP manifest is loaded, using the real source ZIP size and file count.
+    /// This avoids a separate pre-inspection pass while still reserving memory
+    /// for catalog metadata and worker overhead.
+    pub adaptive_source_window_memory_mb: Option<u64>,
     /// Buffer size used when streaming entry bodies to S3.
     pub body_chunk_size: usize,
     /// Capacity of the in-memory pipe between decompression and S3 upload.
@@ -65,6 +72,7 @@ impl SyncOptions {
             source_block_merge_gap: DEFAULT_SOURCE_BLOCK_MERGE_GAP,
             source_get_concurrency: DEFAULT_SOURCE_GET_CONCURRENCY,
             source_window_capacity: DEFAULT_SOURCE_WINDOW_CAPACITY,
+            adaptive_source_window_memory_mb: None,
             body_chunk_size: DEFAULT_BODY_CHUNK_SIZE,
             pipe_capacity: DEFAULT_PIPE_CAPACITY,
         }

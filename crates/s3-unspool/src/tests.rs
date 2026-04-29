@@ -15,8 +15,8 @@ use crate::constants::{
 use crate::entry_reader::entry_reader;
 use crate::extract::{
     DestinationObject, catalog_skip_report, comparable_destination_md5, conditional_conflict_error,
-    normalized_list_prefix, validate_extracted_size, validate_options,
-    validate_source_range_options,
+    normalized_list_prefix, resolve_source_window_capacity, validate_extracted_size,
+    validate_options, validate_source_range_options,
 };
 use crate::range::{
     BlockRangeReader, BlockStore, SourceClient, SourceDiagnosticsCollector, SourcePlan,
@@ -190,6 +190,23 @@ fn sync_options_allow_large_source_block_for_small_source_zip() {
     options.source_block_size = 16;
 
     validate_source_range_options(&options, 8).unwrap();
+}
+
+#[test]
+fn adaptive_source_window_resolves_after_manifest_count_is_known() {
+    let mut options = SyncOptions::new(
+        S3Object::parse("s3://bucket/source.zip").unwrap(),
+        S3Prefix::parse("s3://bucket/destination/").unwrap(),
+    );
+    options.source_window_capacity = 123;
+    options.adaptive_source_window_memory_mb = Some(256);
+    options.concurrency = 6;
+    options.source_get_concurrency = 1;
+    options.source_block_size = 8 * 1024 * 1024;
+
+    resolve_source_window_capacity(&mut options, 3 * 1024 * 1024 * 1024, 49_152);
+
+    assert_eq!(options.source_window_capacity, 16 * 1024 * 1024);
 }
 
 #[test]

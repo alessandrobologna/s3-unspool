@@ -299,12 +299,15 @@ The library defaults are conservative:
 The Lambda harness uses different defaults because Lambda memory often buys CPU.
 It scales entry workers with a square-root curve (`round(4 *
 sqrt(memory_mb / 128))`, clamped to `4..=16`) and reuses otherwise idle memory
-for the source block window. The budget reserves a fixed 64 MiB baseline, 12 MiB
-per worker, 2 KiB per ZIP file, and currently in-flight source blocks before
-assigning remaining memory to the block window. When that computed window exceeds
-512 MiB, the Lambda leaves an additional 384 MiB unused as measured RSS
-headroom for allocator, catalog, SDK, and upload buffers, then caps the adaptive
-window at 512 MiB. Lambda also caps concurrent destination PUTs at
+for the source block window. The Lambda passes the memory budget into the
+library, and the library resolves the window after loading the ZIP manifest so
+the file count is known without a separate pre-inspection pass. The budget
+reserves a fixed 64 MiB baseline, 12 MiB per worker, 2 KiB per ZIP file, and
+currently in-flight source blocks before assigning remaining memory to the block
+window. When that computed window exceeds 512 MiB, the Lambda leaves an
+additional 384 MiB unused as measured RSS headroom for allocator, catalog, SDK,
+and upload buffers, then caps the adaptive window at 512 MiB. Lambda also caps
+concurrent destination PUTs at
 `min(entry_workers, max(source_get_concurrency, 2), 8)` so S3 `SlowDown` backoff
 can control write pressure without changing the invoke payload shape.
 

@@ -24,7 +24,7 @@ use tokio_util::io::ReaderStream;
 use crate::constants::{MAX_BODY_CHUNK_SIZE, MAX_PIPE_CAPACITY};
 use crate::entry_reader::{EntryReader, entry_reader};
 use crate::error::{Error, Result, aws_error_context, aws_error_message};
-use crate::options::{PutRetryPolicy, RetryJitter, SyncOptions};
+use crate::options::{PutRetryPolicy, RetryJitter, SyncOptions, adaptive_source_window_capacity};
 use crate::range::{
     BlockStore, SourceClient, SourceDiagnosticsCollector, plan_source_blocks,
     start_source_scheduler,
@@ -319,7 +319,7 @@ pub async fn sync_zip_to_s3(client: &Client, options: SyncOptions) -> Result<Syn
 pub async fn sync_zip_to_s3_with_clients(
     source_client: &Client,
     destination_client: &Client,
-    options: SyncOptions,
+    mut options: SyncOptions,
 ) -> Result<SyncReport> {
     validate_options(&options)?;
     let started = Instant::now();
@@ -338,6 +338,7 @@ pub async fn sync_zip_to_s3_with_clients(
         source_block_merge_gap = options.source_block_merge_gap,
         source_get_concurrency = options.source_get_concurrency,
         source_window_capacity = options.source_window_capacity,
+        adaptive_source_window_memory_mb = ?options.adaptive_source_window_memory_mb,
         put_concurrency = options.put_concurrency,
         put_max_attempts = options.put_retry_policy.max_attempts,
         put_base_delay_ms = duration_millis_u64(options.put_retry_policy.base_delay),
@@ -359,7 +360,6 @@ pub async fn sync_zip_to_s3_with_clients(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "source object metadata loaded"
     );
-    validate_source_range_options(&options, source_head.len)?;
     let diagnostics = options
         .collect_diagnostics
         .then(|| Arc::new(SourceDiagnosticsCollector::new(source_head.len)));
@@ -382,6 +382,8 @@ pub async fn sync_zip_to_s3_with_clients(
         options.source_block_size,
     )
     .await?;
+    resolve_source_window_capacity(&mut options, source_head.len, manifest.entries.len());
+    validate_source_range_options(&options, source_head.len)?;
     let entries_with_catalog_md5 = manifest
         .entries
         .iter()
@@ -390,6 +392,7 @@ pub async fn sync_zip_to_s3_with_clients(
     tracing::info!(
         zip_files = manifest.entries.len(),
         entries_with_catalog_md5,
+        source_window_capacity = options.source_window_capacity,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "zip manifest loaded"
     );
@@ -1839,6 +1842,24 @@ pub(crate) fn validate_source_range_options(
     }
 
     Ok(())
+}
+
+pub(crate) fn resolve_source_window_capacity(
+    options: &mut SyncOptions,
+    source_zip_bytes: u64,
+    zip_file_count: usize,
+) {
+    let Some(memory_mb) = options.adaptive_source_window_memory_mb else {
+        return;
+    };
+    options.source_window_capacity = adaptive_source_window_capacity(
+        memory_mb,
+        source_zip_bytes,
+        options.concurrency,
+        zip_file_count,
+        options.source_block_size,
+        options.source_get_concurrency,
+    );
 }
 
 fn validate_put_retry_policy(policy: &PutRetryPolicy) -> Result<()> {
