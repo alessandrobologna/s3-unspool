@@ -1,0 +1,9 @@
+{
+  "source": "s3://REPLACE_WITH_TEST_BUCKET/source/archive.zip",
+  "destinationPrefix": "s3://REPLACE_WITH_TEST_BUCKET/destination/",
+  "deleteExtra": false,
+  "diagnostics": false,
+  "ignoreCatalog": false,
+  "includeOperations": false,
+  "concurrency": 16
+}

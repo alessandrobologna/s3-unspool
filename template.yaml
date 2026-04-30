@@ -1,0 +1,133 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: S3 ZIP extraction Lambda built with Cargo Lambda.
+
+Parameters:
+  BenchmarkBucketName:
+    Type: String
+    Default: ''
+    Description: Optional existing S3 bucket that stores benchmark fixture ZIPs and destination prefixes.
+  BenchmarkFixturePrefix:
+    Type: String
+    Default: benchmarks/fixtures/
+    AllowedPattern: '^[^/*?][^*?]*/$'
+    ConstraintDescription: Must be a literal non-empty S3 key prefix ending in /, not beginning with /, and containing no * or ? wildcards.
+    Description: Prefix in BenchmarkBucketName that stores source ZIP fixtures.
+  BenchmarkDestinationPrefix:
+    Type: String
+    Default: benchmarks/extract/
+    AllowedPattern: '^[^/*?][^*?]*/$'
+    ConstraintDescription: Must be a literal non-empty S3 key prefix ending in /, not beginning with /, and containing no * or ? wildcards.
+    Description: Prefix in BenchmarkBucketName that Lambda may read, write, and delete during benchmarks.
+
+Globals:
+  Function:
+    Timeout: 900
+    MemorySize: 256
+    Architectures:
+      - arm64
+    Tracing: Active
+
+Conditions:
+  HasBenchmarkBucket: !Not [!Equals [!Ref BenchmarkBucketName, '']]
+
+Resources:
+  TestBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  S3UnspoolFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: rust-cargolambda
+      BuildProperties:
+        Binary: s3-unspool-lambda
+    Properties:
+      CodeUri: .
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Environment:
+        Variables:
+          RUST_LOG: s3_unspool=info,s3_unspool_lambda=info
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: ListTestBucket
+              Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: !GetAtt TestBucket.Arn
+            - Sid: XRayWriteAccess
+              Effect: Allow
+              Action:
+                - xray:PutTraceSegments
+                - xray:PutTelemetryRecords
+              Resource: '*'
+            - !If
+              - HasBenchmarkBucket
+              - Sid: ListBenchmarkBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${BenchmarkBucketName}'
+                Condition:
+                  StringLike:
+                    's3:prefix':
+                      - !Sub '${BenchmarkFixturePrefix}*'
+                      - !Sub '${BenchmarkDestinationPrefix}*'
+              - !Ref AWS::NoValue
+            - Sid: ReadWriteDeleteTestBucketObjects
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub '${TestBucket.Arn}/*'
+            - !If
+              - HasBenchmarkBucket
+              - Sid: ReadBenchmarkFixtureObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${BenchmarkBucketName}/${BenchmarkFixturePrefix}*'
+              - !Ref AWS::NoValue
+            - !If
+              - HasBenchmarkBucket
+              - Sid: ReadWriteDeleteBenchmarkDestinationObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${BenchmarkBucketName}/${BenchmarkDestinationPrefix}*'
+              - !Ref AWS::NoValue
+
+Outputs:
+  FunctionName:
+    Description: Lambda function name for direct AWS CLI invokes.
+    Value: !Ref S3UnspoolFunction
+  FunctionArn:
+    Description: Lambda function ARN.
+    Value: !GetAtt S3UnspoolFunction.Arn
+  TestBucketName:
+    Description: Test bucket allowed by the Lambda execution role.
+    Value: !Ref TestBucket
+  BenchmarkBucketName:
+    Condition: HasBenchmarkBucket
+    Description: Existing benchmark bucket allowed by the Lambda execution role.
+    Value: !Ref BenchmarkBucketName
+  BenchmarkFixturePrefix:
+    Condition: HasBenchmarkBucket
+    Description: Benchmark fixture prefix readable by the Lambda execution role.
+    Value: !Ref BenchmarkFixturePrefix
+  BenchmarkDestinationPrefix:
+    Condition: HasBenchmarkBucket
+    Description: Benchmark destination prefix readable and writable by the Lambda execution role.
+    Value: !Ref BenchmarkDestinationPrefix
