@@ -37,6 +37,8 @@ jobs:
             --profile minimal \
             --component clippy \
             --component rustfmt
+          rustup default "$RUSTUP_TOOLCHAIN"
+          rustc --version
 
       - name: Check formatting
         run: cargo fmt --all -- --check

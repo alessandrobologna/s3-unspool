@@ -547,7 +547,7 @@ identifiers such as `0.1.0-alpha.1`, `0.1.0-beta.1`, or `0.1.0-rc.1`.
 Consumers opt into a pre-release explicitly:
 
 ```sh
-cargo add s3-unspool@0.1.0-alpha.1
+cargo add s3-unspool@0.1.0-beta.2
 ```
 
 Releases are published by the manual `Publish s3-unspool` GitHub Actions

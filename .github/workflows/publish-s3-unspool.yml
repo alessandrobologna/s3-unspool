@@ -42,6 +42,8 @@ jobs:
             --profile minimal \
             --component clippy \
             --component rustfmt
+          rustup default "$RUSTUP_TOOLCHAIN"
+          rustc --version
 
       - name: Read crate version
         id: crate
