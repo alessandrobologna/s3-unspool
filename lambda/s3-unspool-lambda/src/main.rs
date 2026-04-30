@@ -91,8 +91,7 @@ async fn handle(event: LambdaEvent<InvokePayload>) -> Result<InvokeResponse, Lam
 
     let mut options = payload.into_options(concurrency)?;
     options.source_get_concurrency = adaptive_source_get_concurrency(memory_mb);
-    options.put_concurrency =
-        adaptive_lambda_put_concurrency(options.concurrency, options.source_get_concurrency);
+    options.put_concurrency = adaptive_lambda_put_concurrency(options.concurrency);
     options.source_window_memory_budget_mb = Some(memory_mb);
     tracing::info!(
         request_id = %context.request_id,
@@ -181,7 +180,7 @@ fn clamp_lambda_concurrency(workers: usize) -> usize {
     workers.clamp(MIN_LAMBDA_CONCURRENCY, MAX_LAMBDA_CONCURRENCY)
 }
 
-fn adaptive_lambda_put_concurrency(entry_workers: usize, _source_get_concurrency: usize) -> usize {
+fn adaptive_lambda_put_concurrency(entry_workers: usize) -> usize {
     entry_workers.clamp(1, 8)
 }
 
@@ -304,12 +303,11 @@ mod tests {
     }
 
     #[test]
-    fn lambda_put_concurrency_follows_source_and_entry_limits() {
-        assert_eq!(adaptive_lambda_put_concurrency(4, 1), 4);
-        assert_eq!(adaptive_lambda_put_concurrency(6, 1), 6);
-        assert_eq!(adaptive_lambda_put_concurrency(8, 4), 8);
-        assert_eq!(adaptive_lambda_put_concurrency(16, 8), 8);
-        assert_eq!(adaptive_lambda_put_concurrency(4, 8), 4);
+    fn lambda_put_concurrency_is_capped_by_entry_workers() {
+        assert_eq!(adaptive_lambda_put_concurrency(4), 4);
+        assert_eq!(adaptive_lambda_put_concurrency(6), 6);
+        assert_eq!(adaptive_lambda_put_concurrency(8), 8);
+        assert_eq!(adaptive_lambda_put_concurrency(16), 8);
     }
 
     #[test]
