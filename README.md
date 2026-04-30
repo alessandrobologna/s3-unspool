@@ -1,5 +1,11 @@
 # s3-unspool
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/s3-unspool-hero-v2.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/s3-unspool-hero-v2-light.png">
+  <img alt="s3-unspool technical blueprint" src="docs/assets/s3-unspool-hero-v2.png">
+</picture>
+
 `s3-unspool` is a Rust crate for fast, bounded-memory ZIP extraction from S3
 into S3.
 
@@ -32,6 +38,34 @@ changed files.
 It is not a general archive library. ZIP extraction currently supports Stored
 and Deflate entries, destination writes are single `PutObject` requests, and
 destination ETags are expected to be single-part MD5 ETags.
+
+## Lambda Benchmark Snapshot
+
+The latest benchmark uses a 1,000-file fixture with a 40% compressible, 40%
+incompressible, and 20% mixed-content split. The archive is 4,506 MiB when
+extracted and 2,071 MiB as a ZIP, so every memory size below extracts a source
+archive much larger than available Lambda memory.
+
+Timings are Lambda CloudWatch `REPORT` duration medians from three samples per
+configuration. Cold-start init time and local AWS CLI round-trip time are not
+included.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmarks/streaming-20260430T011727Z/duration-streaming-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/benchmarks/streaming-20260430T011727Z/duration-streaming-light.svg">
+  <img alt="Lambda benchmark duration for the streaming fixture" src="docs/assets/benchmarks/streaming-20260430T011727Z/duration-streaming-light.svg">
+</picture>
+
+| Lambda memory | Full extract | 5% update with catalog | 5% update without catalog | Median max memory |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 MB | 340.31s | 14.09s | 260.73s | 92-103 MB |
+| 256 MB | 153.54s | 7.71s | 121.60s | 115-202 MB |
+| 512 MB | 78.99s | 4.03s | 58.57s | 200-511 MB |
+
+All 27 measured invokes completed with zero reported extraction errors, zero S3
+throttles, and zero source `GetObject` errors. Four destination `PutObject`
+dispatch failures occurred in the 256 MB full-extract samples and were retried
+successfully.
 
 ## Contents
 
@@ -367,34 +401,6 @@ memory budget.
 
 See [Architecture](docs/architecture.md) for the extraction flow, source
 scheduler behavior, and diagnostics glossary.
-
-### Lambda Benchmark Snapshot
-
-The latest benchmark uses a 1,000-file fixture with a 40% compressible, 40%
-incompressible, and 20% mixed-content split. The archive is 4,506 MiB when
-extracted and 2,071 MiB as a ZIP, so every memory size below extracts a source
-archive much larger than available Lambda memory.
-
-Timings are Lambda CloudWatch `REPORT` duration medians from three samples per
-configuration. Cold-start init time and local AWS CLI round-trip time are not
-included.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmarks/streaming-20260430T011727Z/duration-streaming-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="docs/assets/benchmarks/streaming-20260430T011727Z/duration-streaming-light.svg">
-  <img alt="Lambda benchmark duration for the streaming fixture" src="docs/assets/benchmarks/streaming-20260430T011727Z/duration-streaming-light.svg">
-</picture>
-
-| Lambda memory | Full extract | 5% update with catalog | 5% update without catalog | Median max memory |
-| ---: | ---: | ---: | ---: | ---: |
-| 128 MB | 340.31s | 14.09s | 260.73s | 92-103 MB |
-| 256 MB | 153.54s | 7.71s | 121.60s | 115-202 MB |
-| 512 MB | 78.99s | 4.03s | 58.57s | 200-511 MB |
-
-All 27 measured invokes completed with zero reported extraction errors, zero S3
-throttles, and zero source `GetObject` errors. Four destination `PutObject`
-dispatch failures occurred in the 256 MB full-extract samples and were retried
-successfully.
 
 ## Benchmarking With Lambda
 
