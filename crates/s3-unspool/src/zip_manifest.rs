@@ -106,9 +106,24 @@ pub(crate) fn build_manifest_entries(
                 ),
             });
         }
+        let payload_span_end = source_span_start
+            .checked_add(stored.header_size())
+            .and_then(|offset| offset.checked_add(stored.compressed_size()))
+            .ok_or_else(|| Error::InvalidZipEntry {
+                path: zip_path.clone(),
+                reason: "central directory entry source span overflowed".to_string(),
+            })?;
+        if payload_span_end > source_len {
+            return Err(Error::InvalidZipEntry {
+                path: zip_path,
+                reason: format!(
+                    "central directory entry source span ends at {payload_span_end}, beyond source ZIP length {source_len}"
+                ),
+            });
+        }
         let source_span_end = next_source_offset(&source_offsets, source_span_start)
-            .unwrap_or(source_len)
-            .min(source_len);
+            .unwrap_or(payload_span_end)
+            .min(payload_span_end);
         if source_span_end <= source_span_start {
             return Err(Error::InvalidZipEntry {
                 path: zip_path,

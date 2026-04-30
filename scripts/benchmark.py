@@ -37,12 +37,18 @@ from botocore.exceptions import ClientError
 
 
 DEFAULT_BUCKET = os.environ.get("S3_UNSPOOL_BENCHMARK_BUCKET", "your-benchmark-bucket")
-DEFAULT_FIXTURE_PREFIX = "benchmarks/fixtures/2026-04-26"
-DEFAULT_DESTINATION_PREFIX = "benchmarks/extract/2026-04-26"
+DEFAULT_FIXTURE_PREFIX = "benchmarks/fixtures/2026-04-29"
+DEFAULT_DESTINATION_PREFIX = "benchmarks/extract/2026-04-29"
 SAFE_DESTINATION_PREFIX_ROOT = "benchmarks/extract/"
-DEFAULT_MEMORIES = (256, 1024, 2048)
-DEFAULT_FIXTURES = ("small", "medium", "large")
+DEFAULT_MEMORIES = (128, 256, 512)
+DEFAULT_FIXTURES = ("streaming",)
 FIXTURE_METADATA = {
+    "streaming": {
+        "title": "Streaming artifact",
+        "uncompressed": "4,506 MiB",
+        "zip": "2,071 MiB ZIP",
+        "files": "1,000 files",
+    },
     "small": {
         "title": "Small artifact",
         "uncompressed": "10 MiB",
@@ -157,6 +163,7 @@ def main() -> int:
         "runs": parse_csv(args.runs),
         "samples": args.samples,
         "max_workers": args.max_workers,
+        "cleanup_before_run": args.cleanup_before_run,
         "diagnostics": args.diagnostics,
         "include_operations": args.include_operations,
     }
@@ -284,6 +291,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow --max-workers greater than 1 despite multiplied S3 PUT/LIST request costs",
     )
+    parser.add_argument(
+        "--cleanup-before-run",
+        action="store_true",
+        help=(
+            "Delete each run-specific destination prefix before invoking Lambda. "
+            "Disabled by default because S3 cleanup listing and DeleteObjects add request cost."
+        ),
+    )
     parser.add_argument("--lambda-timeout", type=int, default=900, help="Lambda timeout in seconds")
     parser.add_argument("--aws-max-attempts", type=int, default=5)
     parser.add_argument("--run-id", help="Stable run id; defaults to UTC timestamp")
@@ -291,8 +306,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--results-md",
         type=Path,
-        default=Path("docs/benchmark-results.md"),
-        help="Markdown results file to update",
+        help="Optional Markdown results file to update",
     )
     parser.add_argument("--no-results-md", action="store_true", help="Do not update the Markdown results file")
     parser.add_argument("--profile", help="AWS profile for boto3")
@@ -448,7 +462,8 @@ def run_sample(
     setup_dir: Path,
 ) -> dict[str, Any]:
     destination_prefix = task.destination_prefix.replace(DEFAULT_DESTINATION_PREFIX, args.destination_prefix, 1)
-    cleanup_prefix(clients, args.bucket, destination_prefix)
+    if args.cleanup_before_run:
+        cleanup_prefix(clients, args.bucket, destination_prefix)
 
     setup_result = None
     if task.case.setup_zip:

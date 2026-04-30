@@ -37,6 +37,11 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireObjectsAfterOneDay
+            Status: Enabled
+            ExpirationInDays: 1
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true

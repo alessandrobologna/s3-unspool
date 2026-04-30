@@ -1,10 +1,12 @@
 # Benchmarks
 
-The benchmark documentation is split by purpose:
+The current benchmark snapshot and reproduction notes live in the README:
 
-- [Benchmark Methodology](docs/benchmark-methodology.md): fixture generation,
-  upload commands, Lambda setup, and reproducible run steps.
-- [Benchmark Results](docs/benchmark-results.md): latest generated tables and
-  charts from `scripts/benchmark.py`.
-- [Architecture](docs/architecture.md): extraction flow, source range cache,
-  prefetch/reactive fetches, and diagnostics terminology.
+- [Lambda Benchmark Snapshot](README.md#lambda-benchmark-snapshot): latest
+  measured Lambda timings and chart.
+- [Benchmarking With Lambda](README.md#benchmarking-with-lambda): SAM deploy,
+  fixture upload, and benchmark harness commands.
+- [Fixture Tools](README.md#fixture-tools): local fixture generation and
+  mutation scripts.
+- [Architecture](docs/architecture.md): extraction flow, source scheduler, block
+  window behavior, and diagnostics terminology.

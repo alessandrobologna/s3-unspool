@@ -338,7 +338,7 @@ pub async fn sync_zip_to_s3_with_clients(
         source_block_merge_gap = options.source_block_merge_gap,
         source_get_concurrency = options.source_get_concurrency,
         source_window_capacity = options.source_window_capacity,
-        adaptive_source_window_memory_mb = ?options.adaptive_source_window_memory_mb,
+        source_window_memory_budget_mb = ?options.source_window_memory_budget_mb,
         put_concurrency = options.put_concurrency,
         put_max_attempts = options.put_retry_policy.max_attempts,
         put_base_delay_ms = duration_millis_u64(options.put_retry_policy.base_delay),
@@ -445,6 +445,7 @@ pub async fn sync_zip_to_s3_with_clients(
             &options,
             operation,
             &mut fail_fast_error,
+            true,
         );
         if fail_fast_error.is_some() {
             break;
@@ -471,6 +472,7 @@ pub async fn sync_zip_to_s3_with_clients(
                         &options,
                         operation,
                         &mut fail_fast_error,
+                        true,
                     );
                 }
                 HashPhaseResult::Upload(job) => upload_jobs.push(job),
@@ -488,8 +490,11 @@ pub async fn sync_zip_to_s3_with_clients(
             upload_jobs,
             &options,
             source_head.len,
-            diagnostics.clone(),
-            put_diagnostics.clone(),
+            PhaseObservers {
+                source_diagnostics: diagnostics.clone(),
+                put_diagnostics: put_diagnostics.clone(),
+                progress: Arc::clone(&progress),
+            },
         )
         .await;
         for operation in upload_results {
@@ -500,6 +505,7 @@ pub async fn sync_zip_to_s3_with_clients(
                 &options,
                 operation,
                 &mut fail_fast_error,
+                false,
             );
             if fail_fast_error.is_some() {
                 break;
@@ -659,10 +665,13 @@ fn record_operation(
     options: &SyncOptions,
     operation: ObjectReport,
     fail_fast_error: &mut Option<Error>,
+    update_progress: bool,
 ) {
     summarize_operation(summary, &operation);
-    progress.record_operation(&operation);
-    log_operation_issue(&operation, progress);
+    if update_progress {
+        progress.record_operation(&operation);
+        log_operation_issue(&operation, progress);
+    }
     if let Some(err) = conditional_conflict_error(
         &options.destination,
         &operation,
@@ -903,14 +912,13 @@ async fn run_upload_phase(
     jobs: Vec<UploadJob>,
     options: &SyncOptions,
     source_len: u64,
-    diagnostics: Option<Arc<SourceDiagnosticsCollector>>,
-    put_diagnostics: Option<Arc<PutDiagnosticsCollector>>,
+    observers: PhaseObservers,
 ) -> Vec<ObjectReport> {
     let entries = jobs.iter().map(|job| job.entry.clone()).collect::<Vec<_>>();
-    let put_diagnostics_for_throttle = put_diagnostics.clone();
+    let put_diagnostics_for_throttle = observers.put_diagnostics.clone();
     let context = Arc::new(UploadPhaseContext {
         client,
-        put_diagnostics,
+        put_diagnostics: observers.put_diagnostics,
         put_semaphore: Arc::new(Semaphore::new(options.put_concurrency.max(1))),
         put_throttle: Arc::new(PutThrottle::new(put_diagnostics_for_throttle)),
     });
@@ -919,7 +927,7 @@ async fn run_upload_phase(
         &entries,
         options,
         source_len,
-        diagnostics.clone(),
+        observers.source_diagnostics,
     );
     let mut reports = Vec::with_capacity(jobs.len());
     let mut stream = stream::iter(jobs)
@@ -933,6 +941,8 @@ async fn run_upload_phase(
 
     let mut stopped_early = false;
     while let Some(report) = stream.next().await {
+        observers.progress.record_operation(&report);
+        log_operation_issue(&report, &observers.progress);
         stopped_early = options.fail_on_conditional_conflict
             && report.status == OperationStatus::ConditionalConflict;
         reports.push(report);
@@ -1085,6 +1095,12 @@ enum PutResult {
     Uploaded(ExtractDigest),
     ConditionalConflict(String),
     Failed(String),
+}
+
+struct PhaseObservers {
+    source_diagnostics: Option<Arc<SourceDiagnosticsCollector>>,
+    put_diagnostics: Option<Arc<PutDiagnosticsCollector>>,
+    progress: Arc<ExtractProgress>,
 }
 
 struct PutSourceContext {
@@ -1849,7 +1865,7 @@ pub(crate) fn resolve_source_window_capacity(
     source_zip_bytes: u64,
     zip_file_count: usize,
 ) {
-    let Some(memory_mb) = options.adaptive_source_window_memory_mb else {
+    let Some(memory_mb) = options.source_window_memory_budget_mb else {
         return;
     };
     options.source_window_capacity = adaptive_source_window_capacity(

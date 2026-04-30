@@ -1,40 +1,94 @@
 # s3-unspool
 
-`s3-unspool` is a Rust crate for fast, streaming extraction of large ZIP
-archives from S3 into S3 prefixes.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/s3-unspool-hero-v2.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/s3-unspool-hero-v2-light.png">
+  <img alt="s3-unspool technical blueprint" src="docs/assets/s3-unspool-hero-v2.png">
+</picture>
 
-It is built for deployment archives and low-scratch environments: the source ZIP
-is read with ranged S3 `GetObject` requests, the destination prefix is listed
-once, unchanged files can be skipped with an embedded MD5 catalog, and missing or
-changed files are written with S3 conditional `PutObject` requests.
+`s3-unspool` is a Rust crate for fast, bounded-memory ZIP extraction from S3
+into S3.
+
+It is built for deployment-style archives, Lambda jobs, and other low-scratch
+environments where downloading a ZIP to local disk is either slow or impossible.
+The extractor reads the source archive with ranged S3 `GetObject` requests,
+lists the destination prefix once, skips unchanged files when a catalog is
+available, and writes missing or changed files with conditional `PutObject`
+requests.
 
 The crate also includes an upload helper that streams a local directory into a
-ZIP object in S3 and embeds the catalog used by later incremental extracts.
+cataloged ZIP object in S3. ZIPs produced by that helper can be extracted later
+without decompressing unchanged entries.
 
-For high-concurrency extraction, the destination S3 client should relax or
-disable AWS SDK upload stalled-stream protection. `s3-unspool` can legitimately
-pause a destination request body while waiting for planned source ranges. Keep
-download stalled-stream protection enabled for source reads; the repository CLI
-and Lambda example configure this split.
+## At a Glance
 
-## Why Use It
+| Capability | What happens |
+| --- | --- |
+| Full extract | Stream a ZIP object from S3 into an S3 prefix without local archive storage. |
+| Incremental extract | Skip unchanged files before decompression when the ZIP contains the embedded catalog. |
+| Safe overwrite | Use `If-None-Match` for new keys and `If-Match` for changed keys. |
+| Destination scan | Use one `ListObjectsV2` pass; no per-object destination `HeadObject` calls. |
+| Upload helper | Stream a local directory into a cataloged ZIP object with multipart upload. |
+| Large archive support | Plan source byte ranges and keep only a bounded source block window in memory. |
 
-- Streams extraction from S3 to S3 without downloading the ZIP or extracted files
-  to local storage.
-- Handles large archives with bounded memory and single-part destination writes.
-- Optimizes wall time with concurrent entry extraction and a catalog-driven
-  source scheduler that fetches only the ZIP byte ranges needed for the run.
-- Skips unchanged files quickly when the ZIP was produced by `s3-unspool`.
-- Avoids per-object `HeadObject` calls; destination ETags come from the initial
-  `ListObjectsV2` pass.
-- Protects changed destinations with conditional writes instead of overwriting
-  objects whose ETag changed during the run.
+Use `s3-unspool` when you need to deploy or synchronize many files from a ZIP
+archive already stored in S3, especially when repeated runs should touch only
+changed files.
+
+It is not a general archive library. ZIP extraction currently supports Stored
+and Deflate entries, destination writes are single `PutObject` requests, and
+destination ETags are expected to be single-part MD5 ETags.
+
+## Lambda Benchmark Snapshot
+
+The latest benchmark uses a 1,000-file fixture with a 40% compressible, 40%
+incompressible, and 20% mixed-content split. The archive is 4,506 MiB when
+extracted and 2,071 MiB as a ZIP, so every memory size below extracts a source
+archive much larger than available Lambda memory.
+
+Timings are Lambda CloudWatch `REPORT` duration medians from three samples per
+configuration. Cold-start init time and local AWS CLI round-trip time are not
+included.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmarks/streaming-20260430T011727Z/duration-streaming-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/benchmarks/streaming-20260430T011727Z/duration-streaming-light.svg">
+  <img alt="Lambda benchmark duration for the streaming fixture" src="docs/assets/benchmarks/streaming-20260430T011727Z/duration-streaming-light.svg">
+</picture>
+
+| Lambda memory | Full extract | 5% update with catalog | 5% update without catalog | Median max memory |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 MB | 340.31s | 14.09s | 260.73s | 92-103 MB |
+| 256 MB | 153.54s | 7.71s | 121.60s | 115-202 MB |
+| 512 MB | 78.99s | 4.03s | 58.57s | 200-511 MB |
+
+All 27 measured invokes completed with zero reported extraction errors, zero S3
+throttles, and zero source `GetObject` errors. Four destination `PutObject`
+dispatch failures occurred in the 256 MB full-extract samples and were retried
+successfully.
+
+## Contents
+
+- [Install](#install)
+- [Quick Start](#quick-start)
+- [Extraction Model](#extraction-model)
+- [Required S3 Permissions](#required-s3-permissions)
+- [Fast Updates](#fast-updates)
+- [Command-Line Testing](#command-line-testing)
+- [Performance and Architecture](#performance-and-architecture)
+- [Benchmarking With Lambda](#benchmarking-with-lambda)
+- [Fixture Tools](#fixture-tools)
+- [Assumptions and Limits](#assumptions-and-limits)
 
 ## Install
 
 ```sh
 cargo add s3-unspool
 ```
+
+The published crate contains the library API. The CLI and Lambda code in this
+repository are development and benchmark tools, not separate published
+artifacts.
 
 ## Quick Start
 
@@ -110,6 +164,47 @@ async fn main() -> s3_unspool::Result<()> {
 `UploadOptions::include_catalog` is `true` by default. Set it to `false` only
 when you need a plain ZIP without the update-skip catalog.
 
+### Source and Destination Clients
+
+For simple jobs, `sync_zip_to_s3` uses one S3 client for source reads and
+destination writes.
+
+For high-concurrency extraction, prefer separate clients with AWS SDK upload
+stalled-stream protection disabled on the destination client. A destination
+request body can legitimately pause while it waits for planned source ranges.
+Keep download stalled-stream protection enabled for source reads.
+
+```rust
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::config::StalledStreamProtectionConfig;
+use aws_sdk_s3::Client;
+use s3_unspool::{S3Object, S3Prefix, SyncOptions, sync_zip_to_s3_with_clients};
+
+#[tokio::main]
+async fn main() -> s3_unspool::Result<()> {
+    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let source_client = Client::new(&config);
+    let destination_client = Client::from_conf(
+        aws_sdk_s3::config::Builder::from(&config)
+            .stalled_stream_protection(
+                StalledStreamProtectionConfig::enabled()
+                    .upload_enabled(false)
+                    .download_enabled(true)
+                    .build(),
+            )
+            .build(),
+    );
+
+    let extract = SyncOptions::new(
+        S3Object::parse("s3://my-bucket/releases/site.zip")?,
+        S3Prefix::parse("s3://my-bucket/www/")?,
+    );
+
+    sync_zip_to_s3_with_clients(&source_client, &destination_client, extract).await?;
+    Ok(())
+}
+```
+
 ## Extraction Model
 
 The extract flow is:
@@ -140,12 +235,15 @@ deleting extra destination objects.
 
 ## Required S3 Permissions
 
-Extraction needs these object-level permissions:
+Extraction needs:
 
-- Source ZIP object: `s3:GetObject`.
-- Destination prefix: `s3:PutObject`.
-- Destination prefix, for changed-object overwrites: `s3:GetObject`.
-- Destination prefix, only when deleting extras: `s3:DeleteObject`.
+| Scope | Permission | Why |
+| --- | --- | --- |
+| Source ZIP object | `s3:GetObject` | Read ZIP metadata and ranged source bytes. |
+| Destination bucket | `s3:ListBucket` | List destination keys and ETags once. |
+| Destination prefix | `s3:PutObject` | Write missing and changed objects. |
+| Destination prefix | `s3:GetObject` | Authorize conditional overwrites with `If-Match`. |
+| Destination prefix | `s3:DeleteObject` | Only needed when `delete_extra` is enabled. |
 
 The destination `s3:GetObject` permission is required even though
 `s3-unspool` does not issue per-file destination `HeadObject` requests or read
@@ -218,7 +316,7 @@ Global CLI options:
 - `--quiet`: suppress human-readable status output.
 - `--color auto|always|never`: control semantic color output.
 
-## CLI Output And Reports
+## CLI Output and Reports
 
 Interactive upload and extract commands show a single-line spinner with elapsed
 time and progress where available:
@@ -276,7 +374,7 @@ Example extract summary:
 }
 ```
 
-## Performance And Architecture
+## Performance and Architecture
 
 Extraction starts by reading the ZIP central directory and listing the
 destination prefix. Entries that match the embedded MD5 catalog are skipped
@@ -284,51 +382,37 @@ before any source file data is fetched. The remaining entries are converted into
 a source-ordered block plan, with nearby byte spans coalesced so workers can
 share ranged `GetObject` responses.
 
-The library defaults are conservative:
+The most important tuning knobs are:
 
-- `SyncOptions::concurrency`: `64`
-- `SyncOptions::put_concurrency`: `16`
-- `SyncOptions::source_block_size`: 8 MiB
-- `SyncOptions::source_block_merge_gap`: 256 KiB
-- `SyncOptions::source_get_concurrency`: `4`
-- `SyncOptions::source_window_capacity`: 64 MiB
-- `SyncOptions::put_retry_policy`: 6 attempts, 250 ms base retry delay, 5 s
-  max retry delay, 1 s base `SlowDown` delay, 30 s max `SlowDown` delay, full
-  jitter
+| Option | Default | Use it to control |
+| --- | ---: | --- |
+| `SyncOptions::concurrency` | `64` | ZIP entries processed concurrently. |
+| `SyncOptions::put_concurrency` | `16` | Destination `PutObject` requests in flight. |
+| `SyncOptions::source_block_size` | 8 MiB | Maximum planned source range size. |
+| `SyncOptions::source_block_merge_gap` | 256 KiB | Nearby ZIP spans coalesced into one source range. |
+| `SyncOptions::source_get_concurrency` | `4` | Ranged source `GetObject` requests in flight. |
+| `SyncOptions::source_window_capacity` | 64 MiB | Resident source block window. |
+| `SyncOptions::put_retry_policy` | 6 attempts | Destination PUT retry and `SlowDown` backoff behavior. |
 
-The Lambda harness uses different defaults because Lambda memory often buys CPU.
-It scales entry workers with a square-root curve (`round(4 *
-sqrt(memory_mb / 128))`, clamped to `4..=16`) and reuses otherwise idle memory
-for the source block window. The Lambda passes the memory budget into the
-library, and the library resolves the window after loading the ZIP manifest so
-the file count is known without a separate pre-inspection pass. The budget
-reserves a fixed 64 MiB baseline, 12 MiB per worker, 2 KiB per ZIP file, and
-currently in-flight source blocks before assigning remaining memory to the block
-window. When that computed window exceeds 512 MiB, the Lambda leaves an
-additional 384 MiB unused as measured RSS headroom for allocator, catalog, SDK,
-and upload buffers, then caps the adaptive window at 512 MiB. Lambda also caps
-concurrent destination PUTs at
-`min(entry_workers, max(source_get_concurrency, 2), 8)` so S3 `SlowDown` backoff
-can control write pressure without changing the invoke payload shape.
+The repository Lambda harness derives those settings from Lambda memory because
+Lambda memory also buys CPU. For example, it uses 4 entry workers at 128 MB, 6
+at 256 MB, and 8 at 512 MB, while keeping the source block window bounded by the
+memory budget.
 
 See [Architecture](docs/architecture.md) for the extraction flow, source
 scheduler behavior, and diagnostics glossary.
-
-Benchmark documentation is split into [methodology](docs/benchmark-methodology.md)
-and [results](docs/benchmark-results.md). The methodology doc is the
-reproducible recipe; the results doc is refreshed by `scripts/benchmark.py`.
 
 ## Benchmarking With Lambda
 
 The included SAM template deploys:
 
 - One direct-invoke Lambda function built with Cargo Lambda.
-- One test S3 bucket.
-- A Lambda role that can list, read, write, and delete objects in that test
-  bucket.
+- One test S3 bucket with a one-day object lifecycle rule for benchmark cleanup.
+- A Lambda role that can list, read, write, and optionally delete objects in
+  that test bucket.
 - Optional benchmark-bucket access scoped to `BenchmarkFixturePrefix` for
   fixture reads and `BenchmarkDestinationPrefix` for benchmark reads, writes,
-  and deletes.
+  and optional deletes.
 
 Validate and build:
 
@@ -451,7 +535,7 @@ with a known mix of file sizes and compressibility.
 | `crates/s3-unspool-cli` | Repository CLI for testing and reports |
 | `lambda/s3-unspool-lambda` | SAM/Cargo Lambda benchmark harness |
 | `scripts/` | Fixture generation and benchmark helpers |
-| `docs/` | Architecture and benchmark documentation |
+| `docs/` | Architecture notes and generated benchmark chart assets |
 
 The CLI and Lambda packages are repository tools. The published crate is
 `s3-unspool`.
@@ -466,7 +550,7 @@ Consumers opt into a pre-release explicitly:
 cargo add s3-unspool@0.1.0-alpha.1
 ```
 
-## Assumptions And Limits
+## Assumptions and Limits
 
 - The crate is built for Rust 1.95 and edition 2024.
 - ZIP extraction supports Stored and Deflate entries.

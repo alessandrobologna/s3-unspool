@@ -15,6 +15,9 @@ pub struct SyncOptions {
     /// Destination prefix that receives ZIP entries.
     pub destination: S3Prefix,
     /// Delete destination objects under the prefix that are not present in the ZIP.
+    ///
+    /// This option requires a non-empty destination prefix so a bucket root is
+    /// never swept accidentally.
     pub delete_extra: bool,
     /// Collect source scheduler diagnostics in the returned report.
     pub collect_diagnostics: bool,
@@ -28,29 +31,45 @@ pub struct SyncOptions {
     /// Collect one operation record per processed object in the returned report.
     pub collect_operations: bool,
     /// Maximum number of ZIP entries processed concurrently.
+    ///
+    /// Must be greater than zero.
     pub concurrency: usize,
     /// Maximum number of destination `PutObject` requests in flight.
+    ///
+    /// Must be greater than zero.
     pub put_concurrency: usize,
     /// Retry and backoff policy for destination `PutObject` attempts.
     pub put_retry_policy: PutRetryPolicy,
     /// Maximum size for planned source ZIP blocks.
+    ///
+    /// Must be greater than zero.
     pub source_block_size: usize,
     /// Maximum gap that can be read while coalescing adjacent source spans.
     pub source_block_merge_gap: usize,
     /// Maximum number of ranged source `GetObject` requests in flight.
+    ///
+    /// Must be greater than zero.
     pub source_get_concurrency: usize,
     /// Maximum bytes held by the planned source block window.
+    ///
+    /// When nonzero, this must be large enough to hold the effective source
+    /// block size after clamping that block size to the source ZIP size.
     pub source_window_capacity: usize,
-    /// Lambda-style adaptive source window memory budget.
+    /// Available memory budget, in MiB, used to derive the source block window.
     ///
     /// When set, extraction computes [`Self::source_window_capacity`] after the
     /// ZIP manifest is loaded, using the real source ZIP size and file count.
-    /// This avoids a separate pre-inspection pass while still reserving memory
-    /// for catalog metadata and worker overhead.
-    pub adaptive_source_window_memory_mb: Option<u64>,
+    /// This is useful for memory-bounded runtimes that want to assign otherwise
+    /// idle memory to source block buffering while reserving space for catalog
+    /// metadata and worker overhead.
+    pub source_window_memory_budget_mb: Option<u64>,
     /// Buffer size used when streaming entry bodies to S3.
+    ///
+    /// Must be greater than zero and no larger than 16 MiB.
     pub body_chunk_size: usize,
     /// Capacity of the in-memory pipe between decompression and S3 upload.
+    ///
+    /// Must be greater than zero and no larger than 64 MiB.
     pub pipe_capacity: usize,
 }
 
@@ -72,7 +91,7 @@ impl SyncOptions {
             source_block_merge_gap: DEFAULT_SOURCE_BLOCK_MERGE_GAP,
             source_get_concurrency: DEFAULT_SOURCE_GET_CONCURRENCY,
             source_window_capacity: DEFAULT_SOURCE_WINDOW_CAPACITY,
-            adaptive_source_window_memory_mb: None,
+            source_window_memory_budget_mb: None,
             body_chunk_size: DEFAULT_BODY_CHUNK_SIZE,
             pipe_capacity: DEFAULT_PIPE_CAPACITY,
         }
@@ -83,14 +102,20 @@ impl SyncOptions {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PutRetryPolicy {
     /// Maximum number of application-level `PutObject` attempts per object.
+    ///
+    /// Must be greater than zero.
     pub max_attempts: usize,
     /// Base delay for retryable non-throttling failures.
     pub base_delay: Duration,
     /// Maximum delay for retryable non-throttling failures.
+    ///
+    /// Must be greater than or equal to [`Self::base_delay`].
     pub max_delay: Duration,
     /// Base delay for throttling failures such as S3 `SlowDown`.
     pub slowdown_base_delay: Duration,
     /// Maximum delay for throttling failures such as S3 `SlowDown`.
+    ///
+    /// Must be greater than or equal to [`Self::slowdown_base_delay`].
     pub slowdown_max_delay: Duration,
     /// Jitter mode applied to computed retry delays.
     pub jitter: RetryJitter,
@@ -167,14 +192,10 @@ pub fn adaptive_source_window_capacity(
     }
     .min(ADAPTIVE_CACHE_MAX_WINDOW_CAPACITY);
 
-    let minimum_block_capacity = u64::try_from(source_block_size)
+    let minimum_block_capacity = u64::try_from(source_block_size.max(1))
         .unwrap_or(u64::MAX)
         .min(source_zip_bytes);
-    let capacity = if capacity < minimum_block_capacity {
-        0
-    } else {
-        capacity
-    };
+    let capacity = capacity.max(minimum_block_capacity);
 
     usize::try_from(capacity).unwrap_or(usize::MAX)
 }
@@ -189,8 +210,12 @@ pub struct UploadOptions {
     /// Include the embedded update catalog at [`crate::EMBEDDED_CATALOG_PATH`].
     pub include_catalog: bool,
     /// Buffer size used when streaming the ZIP body to S3.
+    ///
+    /// Must be greater than zero and no larger than 16 MiB.
     pub body_chunk_size: usize,
     /// Capacity of the in-memory pipe between ZIP production and S3 upload.
+    ///
+    /// Must be greater than zero and no larger than 64 MiB.
     pub pipe_capacity: usize,
     /// Optional progress callback invoked during upload preparation and ZIP streaming.
     pub progress: Option<UploadProgressHandler>,

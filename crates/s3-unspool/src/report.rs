@@ -50,7 +50,7 @@ pub struct SyncReport {
     pub destination: S3Prefix,
     /// Aggregate extract counters.
     pub summary: SyncSummary,
-    /// Optional source range diagnostics.
+    /// Optional source scheduler and destination `PutObject` diagnostics.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<SyncDiagnostics>,
     /// Per-object operation records.
@@ -122,11 +122,14 @@ pub struct SourceDiagnostics {
     pub block_hits: u64,
     /// Number of block read requests that waited for scheduled data.
     pub block_waits: u64,
-    /// Number of ready source blocks released after all planned claims consumed them.
+    /// Number of ready source blocks released from the resident window after all
+    /// planned claims consumed them.
     pub block_releases: u64,
-    /// Number of reader cache misses. This should remain zero for the broker scheduler.
+    /// Number of reader cache misses. This should remain zero for the planned
+    /// source scheduler.
     pub block_misses: u64,
-    /// Number of explicit replay fetches for blocks that had already been released.
+    /// Number of explicit replay fetches for blocks that had already been
+    /// released from the resident window.
     pub block_refetches: u64,
     /// Highest number of concurrent ranged `GetObject` requests.
     pub active_gets_high_water: u64,
