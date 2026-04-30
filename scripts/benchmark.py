@@ -37,12 +37,18 @@ from botocore.exceptions import ClientError
 
 
 DEFAULT_BUCKET = os.environ.get("S3_UNSPOOL_BENCHMARK_BUCKET", "your-benchmark-bucket")
-DEFAULT_FIXTURE_PREFIX = "benchmarks/fixtures/2026-04-26"
-DEFAULT_DESTINATION_PREFIX = "benchmarks/extract/2026-04-26"
+DEFAULT_FIXTURE_PREFIX = "benchmarks/fixtures/2026-04-29"
+DEFAULT_DESTINATION_PREFIX = "benchmarks/extract/2026-04-29"
 SAFE_DESTINATION_PREFIX_ROOT = "benchmarks/extract/"
-DEFAULT_MEMORIES = (256, 1024, 2048)
-DEFAULT_FIXTURES = ("small", "medium", "large")
+DEFAULT_MEMORIES = (128, 256, 512)
+DEFAULT_FIXTURES = ("streaming",)
 FIXTURE_METADATA = {
+    "streaming": {
+        "title": "Streaming artifact",
+        "uncompressed": "4,506 MiB",
+        "zip": "2,071 MiB ZIP",
+        "files": "1,000 files",
+    },
     "small": {
         "title": "Small artifact",
         "uncompressed": "10 MiB",
@@ -300,8 +306,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--results-md",
         type=Path,
-        default=Path("docs/benchmark-results.md"),
-        help="Markdown results file to update",
+        help="Optional Markdown results file to update",
     )
     parser.add_argument("--no-results-md", action="store_true", help="Do not update the Markdown results file")
     parser.add_argument("--profile", help="AWS profile for boto3")

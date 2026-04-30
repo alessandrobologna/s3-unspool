@@ -26,6 +26,13 @@
 //! consider relaxing or disabling AWS SDK upload stalled-stream protection on
 //! the destination client. Keep download stalled-stream protection enabled for
 //! source reads. The repository CLI and Lambda example configure this split.
+//! Library users can call [`sync_zip_to_s3_with_clients`] when source reads and
+//! destination writes need separate S3 client configuration.
+//!
+//! [`inspect_s3_zip`] reads source ZIP size and file count without downloading
+//! the archive. It is useful before choosing memory-sensitive scheduler options
+//! such as [`SyncOptions::source_window_capacity`] or
+//! [`SyncOptions::source_window_memory_budget_mb`].
 //!
 //! ZIPs created with [`upload_directory_zip_to_s3`] include an embedded catalog
 //! at [`EMBEDDED_CATALOG_PATH`] by default. The catalog stores each file path and

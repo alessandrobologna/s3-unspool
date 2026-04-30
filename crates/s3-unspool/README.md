@@ -95,6 +95,37 @@ async fn main() -> s3_unspool::Result<()> {
   `SyncOptions::put_retry_policy` for destination write backoff, including shared
   throttling for S3 `SlowDown`.
 
+## Required S3 Permissions
+
+Extraction needs:
+
+| Scope | Permission | Why |
+| --- | --- | --- |
+| Source ZIP object | `s3:GetObject` | Read ZIP metadata and ranged source bytes. |
+| Destination bucket | `s3:ListBucket` | List destination keys and ETags once. |
+| Destination prefix | `s3:PutObject` | Write missing and changed objects. |
+| Destination prefix | `s3:GetObject` | Authorize conditional overwrites with `If-Match`. |
+| Destination prefix | `s3:DeleteObject` | Only needed when `delete_extra` is enabled. |
+
+The destination `s3:GetObject` permission is required even though
+`s3-unspool` does not issue per-file destination `HeadObject` requests or read
+destination object bodies. S3 authorizes `PutObject` requests with
+`If-Match: <etag>` against object-read permission; without destination
+`s3:GetObject`, changed files are rejected with `AccessDenied`.
+
+## Advanced Usage
+
+Use `sync_zip_to_s3_with_clients` when source ranged reads and destination
+streaming writes should use different S3 client configuration. This is useful
+for high-concurrency extraction, where the destination client may disable AWS
+SDK upload stalled-stream protection while the source client keeps download
+protection enabled.
+
+Use `inspect_s3_zip` to read source ZIP size and file count before choosing
+memory settings. `adaptive_source_get_concurrency` and
+`adaptive_source_window_capacity` can then derive scheduler settings for
+memory-bounded runtimes such as Lambda.
+
 For high-concurrency extracts, configure the destination S3 client so AWS SDK
 upload stalled-stream protection is relaxed or disabled. The source scheduler can
 legitimately pause a destination body while waiting for planned ZIP bytes. Keep
