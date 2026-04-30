@@ -1,6 +1,6 @@
 [package]
 name = "s3-unspool"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -9,8 +9,8 @@ license.workspace = true
 readme = "README.md"
 repository.workspace = true
 documentation = "https://docs.rs/s3-unspool"
-keywords = ["aws", "s3", "zip", "lambda", "deployment"]
-categories = ["filesystem"]
+keywords = ["aws", "s3", "zip", "archive", "deployment"]
+categories = ["compression", "filesystem"]
 
 [dependencies]
 async-compression.workspace = true
