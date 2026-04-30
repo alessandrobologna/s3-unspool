@@ -1,5 +1,8 @@
 # s3-unspool
 
+[![Built with Codex](https://img.shields.io/badge/built%20with-Codex-111111?style=flat-square)](https://openai.com/codex)
+[![Crates.io](https://img.shields.io/crates/v/s3-unspool?style=flat-square)](https://crates.io/crates/s3-unspool)
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/s3-unspool-hero-v2.png">
   <source media="(prefers-color-scheme: light)" srcset="docs/assets/s3-unspool-hero-v2-light.png">
