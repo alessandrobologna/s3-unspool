@@ -547,8 +547,16 @@ identifiers such as `0.1.0-alpha.1`, `0.1.0-beta.1`, or `0.1.0-rc.1`.
 Consumers opt into a pre-release explicitly:
 
 ```sh
-cargo add s3-unspool@0.1.0-alpha.1
+cargo add s3-unspool@0.1.0-beta.2
 ```
+
+Releases are published by the manual `Publish s3-unspool` GitHub Actions
+workflow. The workflow reads the version from `crates/s3-unspool/Cargo.toml`,
+publishes with crates.io Trusted Publishing, and creates the matching
+`v<version>` git tag only after `cargo publish` succeeds. Configure the
+`s3-unspool` crate on crates.io to trust this repository's
+`publish-s3-unspool.yml` workflow and the `release` GitHub environment before
+running it.
 
 ## Assumptions and Limits
 
