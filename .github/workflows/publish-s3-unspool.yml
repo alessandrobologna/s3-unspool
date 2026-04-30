@@ -1,0 +1,106 @@
+name: Publish s3-unspool
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: publish-s3-unspool
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish crate
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      RUSTUP_TOOLCHAIN: "1.95.0"
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - name: Require main branch
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "This workflow must be dispatched from main; got $GITHUB_REF" >&2
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" \
+            --profile minimal \
+            --component clippy \
+            --component rustfmt
+
+      - name: Read crate version
+        id: crate
+        run: |
+          set -euo pipefail
+          version="$(python3 - <<'PY'
+          import pathlib
+          import tomllib
+
+          manifest = pathlib.Path("crates/s3-unspool/Cargo.toml")
+          data = tomllib.loads(manifest.read_text())
+          print(data["package"]["version"])
+          PY
+          )"
+          tag="v${version}"
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Reject existing release tag
+        run: |
+          set -euo pipefail
+          git fetch --tags --force origin
+          if git rev-parse -q --verify "refs/tags/${{ steps.crate.outputs.tag }}" >/dev/null; then
+            echo "Tag ${{ steps.crate.outputs.tag }} already exists" >&2
+            exit 1
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run crate tests
+        run: cargo test -p s3-unspool
+
+      - name: Run clippy
+        run: cargo clippy -p s3-unspool --all-targets -- -D warnings
+
+      - name: Build crate documentation
+        run: cargo doc -p s3-unspool --no-deps
+
+      - name: Verify crate package
+        run: cargo publish -p s3-unspool --dry-run
+
+      - name: Authenticate to crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
+
+      - name: Publish crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish -p s3-unspool
+
+      - name: Tag published commit
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.crate.outputs.tag }}" \
+            -m "Release s3-unspool ${{ steps.crate.outputs.version }}" \
+            "$GITHUB_SHA"
+          git push origin "refs/tags/${{ steps.crate.outputs.tag }}"
