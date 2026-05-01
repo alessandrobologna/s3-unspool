@@ -4,11 +4,11 @@
 archives from S3 into S3 prefixes.
 
 It is designed for large archives and low scratch-space environments: the source
-ZIP is read with ranged S3 `GetObject` calls, extracted files are streamed
-directly into S3 `PutObject` requests, and no local ZIP or extracted entry files
-are written. The crate also includes an upload helper that streams a local
-directory into a ZIP object in S3 and embeds the catalog used by later
-incremental extracts.
+ZIP is read with ranged S3 `GetObject` calls, and extracted files can be
+streamed directly into S3 `PutObject` requests or written to a local directory.
+The crate also includes zip helpers that stream a local directory or existing S3
+prefix into a local or S3 ZIP and embed the catalog used by later incremental
+extracts.
 
 ## Install
 
@@ -50,7 +50,8 @@ async fn main() -> s3_unspool::Result<()> {
 ### Upload a Directory as a Cataloged ZIP
 
 Use `upload_directory_zip_to_s3` when you want the crate to produce the source
-ZIP and embed the catalog used by fast future extracts.
+ZIP and embed the catalog used by fast future extracts. Empty local directories
+are written as ZIP directory entries.
 
 ```rust
 use aws_config::BehaviorVersion;
@@ -74,6 +75,34 @@ async fn main() -> s3_unspool::Result<()> {
 }
 ```
 
+### Upload an S3 Prefix as a Cataloged ZIP
+
+Use `zip_s3_prefix_to_s3` when the source files already live in S3 and should be
+snapshotted into a ZIP object without local object storage. Use
+`zip_s3_prefix_to_file` when the ZIP destination should be a local file instead.
+
+```rust
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::Client;
+use s3_unspool::{S3Object, S3Prefix, S3PrefixUploadOptions, zip_s3_prefix_to_s3};
+
+#[tokio::main]
+async fn main() -> s3_unspool::Result<()> {
+    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let client = Client::new(&config);
+
+    let upload = S3PrefixUploadOptions::new(
+        S3Prefix::parse("s3://my-bucket/www/")?,
+        S3Object::parse("s3://my-bucket/releases/site.zip")?,
+    );
+    let report = zip_s3_prefix_to_s3(&client, upload).await?;
+
+    println!("uploaded {} files", report.files);
+
+    Ok(())
+}
+```
+
 ## Behavior
 
 - Reads source ZIP data with ranged S3 `GetObject` requests.
@@ -84,7 +113,9 @@ async fn main() -> s3_unspool::Result<()> {
 - Optionally deletes destination objects that are not present in the ZIP.
 - Supports Stored and Deflate ZIP entries.
 - Uploads generated source ZIPs with S3 multipart upload.
-- Emits optional upload progress events through `UploadOptions::progress`.
+- Uploads existing S3 prefixes into generated ZIPs without local object storage.
+- Preserves ZIP directory entries and zero-byte S3 folder marker objects.
+- Emits optional upload progress events through upload option progress handlers.
 - Can ignore the embedded catalog with `SyncOptions::ignore_embedded_catalog`
   when you need to force the fallback extract-and-hash comparison path.
 - Can fail fast on destination write races with
@@ -106,6 +137,10 @@ Extraction needs:
 | Destination prefix | `s3:PutObject` | Write missing and changed objects. |
 | Destination prefix | `s3:GetObject` | Authorize conditional overwrites with `If-Match`. |
 | Destination prefix | `s3:DeleteObject` | Only needed when `delete_extra` is enabled. |
+
+S3-prefix upload additionally needs `s3:ListBucket` for the source bucket,
+`s3:GetObject` for the source prefix, and multipart-upload write permissions for
+the destination ZIP object.
 
 The destination `s3:GetObject` permission is required even though
 `s3-unspool` does not issue per-file destination `HeadObject` requests or read
@@ -135,6 +170,11 @@ ZIPs created by `upload_directory_zip_to_s3` include an embedded catalog at
 `.s3-unspool/catalog.v1.json`. The catalog stores each file path and MD5 digest
 so later extracts can skip unchanged files before decompressing them.
 
+Directory markers are preserved explicitly. ZIP directory entries such as
+`assets/empty/` extract to zero-byte S3 objects with trailing-slash keys, and
+empty local directories or zero-byte S3 keys ending in `/` upload as ZIP
+directory entries. Nonzero S3 objects ending in `/` are rejected as ambiguous.
+
 ## Assumptions
 
 - Destination objects are written with single-part `PutObject`.
@@ -142,6 +182,7 @@ so later extracts can skip unchanged files before decompressing them.
 - Multipart destination objects and SSE-C destination ETags are out of scope for
   comparison.
 - Destination writes use single `PutObject` requests, not multipart upload.
+- S3-prefix upload rejects nonzero objects whose keys end in `/`.
 
 The CLI and Lambda harness live in the repository workspace, but they are not
 included in the published `s3-unspool` crate.

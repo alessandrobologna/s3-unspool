@@ -24,6 +24,13 @@ pub(crate) async fn entry_reader(
     store: Arc<BlockStore>,
     entry: &ManifestEntry,
 ) -> Result<EntryReader> {
+    if entry.is_directory {
+        return Err(Error::InvalidZipEntry {
+            path: entry.zip_path.clone(),
+            reason: "directory entries do not have file data".to_string(),
+        });
+    }
+
     let mut reader = BlockRangeReader::new(store, entry.source_offset, entry.source_span_end)?;
     let local_header_end = entry
         .source_offset

@@ -15,7 +15,7 @@ repository = "https://github.com/alessandrobologna/s3-unspool"
 
 [workspace.dependencies]
 async-compression = { version = "0.4.42", default-features = false, features = ["tokio", "deflate"] }
-async_zip = { version = "0.0.18", features = ["tokio", "deflate"] }
+async_zip = { version = "0.0.18", features = ["tokio", "tokio-fs", "deflate"] }
 aws-config = "1.8.16"
 aws-sdk-s3 = { version = "1.131.0", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
 aws-smithy-types = { version = "1.4.7", features = ["http-body-1-x"] }

@@ -1,12 +1,14 @@
 //! Streaming ZIP upload and extraction for Amazon S3.
 //!
-//! `s3-unspool` uploads local directories as ZIP objects in S3 and extracts S3
-//! ZIP objects into destination prefixes without writing the archive or
-//! extracted files to local storage.
+//! `s3-unspool` zips local directories and existing S3 prefixes into local or
+//! S3 ZIP files, and unzips local or S3 ZIP files into local directories or S3
+//! prefixes.
 //!
-//! Local directory uploads generate the ZIP once and send it with S3 multipart
-//! upload, so the archive does not need to be sized or written locally before
-//! upload.
+//! Local directory and S3-prefix zip operations generate the ZIP once. S3 ZIP
+//! destinations are streamed with multipart upload, and local ZIP destinations
+//! are written through a temporary sibling file before being renamed into place.
+//! Empty local directories and zero-byte S3 marker objects are preserved as ZIP
+//! directory entries.
 //!
 //! Extraction compares ZIP entries with destination objects listed by
 //! `ListObjectsV2`. Missing objects are uploaded with `If-None-Match: *`, and
@@ -34,11 +36,18 @@
 //! such as [`SyncOptions::source_window_capacity`] or
 //! [`SyncOptions::source_window_memory_budget_mb`].
 //!
-//! ZIPs created with [`upload_directory_zip_to_s3`] include an embedded catalog
-//! at [`EMBEDDED_CATALOG_PATH`] by default. The catalog stores each file path and
+//! ZIPs created with [`upload_directory_zip_to_s3`], [`zip_directory_to_file`],
+//! [`zip_s3_prefix_to_s3`], or [`zip_s3_prefix_to_file`] include an embedded catalog at
+//! [`EMBEDDED_CATALOG_PATH`] by default. The catalog stores each file path and
 //! MD5 digest so later extracts can skip unchanged files before decompressing
-//! them. Set [`SyncOptions::ignore_embedded_catalog`] when you need to measure or
-//! force the fallback extract-and-hash path.
+//! them. Set [`SyncOptions::ignore_embedded_catalog`] when you need to measure
+//! or force the fallback extract-and-hash path.
+//!
+//! ZIP directory entries round-trip as zero-byte S3 marker objects whose keys
+//! end in `/`. Local upload preserves empty directories as ZIP directory
+//! entries, and S3-prefix upload preserves zero-byte S3 marker objects as ZIP
+//! directory entries while rejecting nonzero trailing-slash S3 objects as
+//! ambiguous.
 //!
 //! # Extract an S3 ZIP to a Destination Prefix
 //!
@@ -84,6 +93,27 @@
 //! # }
 //! ```
 //!
+//! # Upload an S3 Prefix as a Cataloged ZIP
+//!
+//! ```no_run
+//! use aws_config::BehaviorVersion;
+//! use aws_sdk_s3::Client;
+//! use s3_unspool::{S3Object, S3Prefix, S3PrefixUploadOptions, zip_s3_prefix_to_s3};
+//!
+//! # async fn run() -> s3_unspool::Result<()> {
+//! let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+//! let client = Client::new(&config);
+//!
+//! let upload = S3PrefixUploadOptions::new(
+//!     S3Prefix::parse("s3://my-bucket/www/")?,
+//!     S3Object::parse("s3://my-bucket/releases/site.zip")?,
+//! );
+//! let report = zip_s3_prefix_to_s3(&client, upload).await?;
+//! println!("uploaded files: {}", report.files);
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Assumptions
 //!
 //! The crate assumes destination objects use single-part S3 ETags that match the
@@ -108,18 +138,26 @@ mod zip_manifest;
 
 pub use constants::EMBEDDED_CATALOG_PATH;
 pub use error::{Error, Result};
-pub use extract::{sync_zip_to_s3, sync_zip_to_s3_with_clients};
+pub use extract::{
+    sync_zip_to_s3, sync_zip_to_s3_with_clients, unzip_file_to_local, unzip_file_to_s3,
+    unzip_s3_zip_to_local,
+};
 pub use inspect::{S3ZipInfo, inspect_s3_zip};
 pub use options::{
-    PutRetryPolicy, RetryJitter, SyncOptions, UploadOptions, UploadProgress, UploadProgressHandler,
-    adaptive_source_get_concurrency, adaptive_source_window_capacity,
+    LocalUnzipOptions, LocalZipOptions, LocalZipSyncOptions, PutRetryPolicy, RetryJitter,
+    S3PrefixLocalZipOptions, S3PrefixUploadOptions, S3ZipLocalUnzipOptions, SyncOptions,
+    UploadOptions, UploadProgress, UploadProgressHandler, adaptive_source_get_concurrency,
+    adaptive_source_window_capacity,
 };
 pub use report::{
-    ObjectReport, OperationStatus, PutDiagnostics, PutRetryDiagnostics, SourceDiagnostics,
+    LocalUnzipDiagnostics, LocalUnzipReport, LocalZipReport, LocalZipToS3Report, ObjectReport,
+    OperationStatus, PutDiagnostics, PutRetryDiagnostics, S3PrefixUploadReport, SourceDiagnostics,
     SyncDiagnostics, SyncReport, SyncSummary, UploadReport,
 };
 pub use s3_uri::{S3Object, S3Prefix};
-pub use upload::upload_directory_zip_to_s3;
+pub use upload::{
+    upload_directory_zip_to_s3, zip_directory_to_file, zip_s3_prefix_to_file, zip_s3_prefix_to_s3,
+};
 
 #[cfg(test)]
 mod tests;

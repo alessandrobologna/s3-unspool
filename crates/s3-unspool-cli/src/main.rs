@@ -10,9 +10,13 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::StalledStreamProtectionConfig;
 use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
 use s3_unspool::{
-    ObjectReport, OperationStatus, PutDiagnostics, S3Object, S3Prefix, SyncDiagnostics,
-    SyncOptions, SyncReport, UploadOptions, UploadProgress, UploadProgressHandler, UploadReport,
-    sync_zip_to_s3, upload_directory_zip_to_s3,
+    LocalUnzipOptions, LocalUnzipReport, LocalZipOptions, LocalZipReport, LocalZipSyncOptions,
+    LocalZipToS3Report, ObjectReport, OperationStatus, PutDiagnostics, S3Object, S3Prefix,
+    S3PrefixLocalZipOptions, S3PrefixUploadOptions, S3PrefixUploadReport, S3ZipLocalUnzipOptions,
+    SyncDiagnostics, SyncOptions, SyncReport, SyncSummary, UploadOptions, UploadProgress,
+    UploadProgressHandler, UploadReport, sync_zip_to_s3, unzip_file_to_local, unzip_file_to_s3,
+    unzip_s3_zip_to_local, upload_directory_zip_to_s3, zip_directory_to_file,
+    zip_s3_prefix_to_file, zip_s3_prefix_to_s3,
 };
 use serde::Serialize;
 use terminal_size::{Width, terminal_size};
@@ -35,8 +39,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let matches = cli().get_matches_from(env::args_os());
     let output = Output::from_matches(&matches);
+
+    match matches.subcommand() {
+        Some(("zip", matches)) => run_zip(matches, &output).await,
+        Some(("unzip", matches)) => run_unzip(matches, &output).await,
+        _ => unreachable!("subcommand is required by clap"),
+    }
+}
+
+async fn s3_client() -> aws_sdk_s3::Client {
     let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-    let client = aws_sdk_s3::Client::from_conf(
+    aws_sdk_s3::Client::from_conf(
         aws_sdk_s3::config::Builder::from(&config)
             .stalled_stream_protection(
                 StalledStreamProtectionConfig::enabled()
@@ -45,17 +58,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .build(),
             )
             .build(),
-    );
-
-    match matches.subcommand() {
-        Some(("extract", matches)) => run_extract(&client, matches, &output).await,
-        Some(("upload", matches)) => run_upload(&client, matches, &output).await,
-        _ => unreachable!("subcommand is required by clap"),
-    }
+    )
 }
 
-async fn run_extract(
-    client: &aws_sdk_s3::Client,
+async fn run_unzip(
     matches: &ArgMatches,
     output: &Output,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -72,11 +78,15 @@ async fn run_extract(
     let diagnostics = matches.get_flag("diagnostics");
     let ignore_catalog = matches.get_flag("ignore-catalog");
     let report_destination = ReportDestination::from_cli_value(matches.get_one::<String>("report"));
+    let source = parse_zip_source(source)?;
+    let destination = parse_tree_destination(destination)?;
+    validate_delete_extra_destination(delete_extra, &destination)?;
+    validate_diagnostics_source(diagnostics, &source)?;
 
     output.write(&Transcript::running(
-        "Extract",
+        "Unzip",
         vec![
-            format!("{source} -> {destination}"),
+            format!("{} -> {}", source.display(), destination.display()),
             format!(
                 "{} workers{}",
                 concurrency,
@@ -85,65 +95,109 @@ async fn run_extract(
         ],
     ))?;
 
-    let mut options = SyncOptions::new(S3Object::parse(source)?, S3Prefix::parse(destination)?);
-    options.concurrency = concurrency;
-    options.delete_extra = delete_extra;
-    options.collect_diagnostics = diagnostics;
-    options.collect_operations = !matches!(report_destination, ReportDestination::None);
-    options.ignore_embedded_catalog = ignore_catalog;
-
-    let activity = output.start_activity("Extracting", None);
-    let report = sync_zip_to_s3(client, options).await;
+    let activity = output.start_activity("Unzipping", None);
+    let report = match (source, destination) {
+        (ZipSource::S3(source), TreeDestination::S3(destination)) => {
+            let client = s3_client().await;
+            let mut options = SyncOptions::new(source, destination);
+            options.concurrency = concurrency;
+            options.delete_extra = delete_extra;
+            options.collect_diagnostics = diagnostics;
+            options.collect_operations = !matches!(report_destination, ReportDestination::None);
+            options.ignore_embedded_catalog = ignore_catalog;
+            UnzipCommandReport::S3(sync_zip_to_s3(&client, options).await?)
+        }
+        (ZipSource::Local(source_zip), TreeDestination::S3(destination)) => {
+            let client = s3_client().await;
+            let mut options = LocalZipSyncOptions::new(source_zip, destination);
+            options.concurrency = concurrency;
+            options.delete_extra = delete_extra;
+            options.collect_operations = !matches!(report_destination, ReportDestination::None);
+            options.ignore_embedded_catalog = ignore_catalog;
+            UnzipCommandReport::LocalZipToS3(unzip_file_to_s3(&client, options).await?)
+        }
+        (ZipSource::S3(source), TreeDestination::Local(destination_dir)) => {
+            let client = s3_client().await;
+            let mut options = S3ZipLocalUnzipOptions::new(source, destination_dir);
+            options.concurrency = concurrency;
+            options.collect_diagnostics = diagnostics;
+            options.collect_operations = !matches!(report_destination, ReportDestination::None);
+            options.ignore_embedded_catalog = ignore_catalog;
+            UnzipCommandReport::Local(unzip_s3_zip_to_local(&client, options).await?)
+        }
+        (ZipSource::Local(source_zip), TreeDestination::Local(destination_dir)) => {
+            let mut options = LocalUnzipOptions::new(source_zip, destination_dir);
+            options.concurrency = concurrency;
+            options.collect_operations = !matches!(report_destination, ReportDestination::None);
+            options.ignore_embedded_catalog = ignore_catalog;
+            UnzipCommandReport::Local(unzip_file_to_local(options).await?)
+        }
+    };
     activity.finish().await;
-    let report = report?;
-    write_report(&report_destination, &report).await?;
-    output.write(&extract_transcript(&report, &report_destination))?;
+    report.write(&report_destination).await?;
+    output.write(&unzip_transcript(&report, &report_destination))?;
 
     if report.has_errors() {
         return Err(
-            "extract completed with per-object errors; rerun with --report for details".into(),
+            "unzip completed with per-entry errors; rerun with --report for details".into(),
         );
     }
 
     Ok(())
 }
 
-async fn run_upload(
-    client: &aws_sdk_s3::Client,
-    matches: &ArgMatches,
-    output: &Output,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let source_dir = matches
-        .get_one::<PathBuf>("source-dir")
+async fn run_zip(matches: &ArgMatches, output: &Output) -> Result<(), Box<dyn std::error::Error>> {
+    let source = matches
+        .get_one::<String>("source")
         .expect("required by clap");
     let destination = matches
-        .get_one::<String>("destination-zip")
+        .get_one::<String>("destination")
         .expect("required by clap");
     let report_destination = ReportDestination::from_cli_value(matches.get_one::<String>("report"));
+    let source = parse_tree_source(source)?;
+    let destination = parse_zip_destination(destination)?;
 
     output.write(&Transcript::running(
-        "Upload",
-        vec![format!("{} -> {destination}", source_dir.display())],
+        "Zip",
+        vec![format!("{} -> {}", source.display(), destination.display())],
     ))?;
 
     let progress_detail = ActivityDetail::default();
-    let mut options = UploadOptions::new(source_dir, S3Object::parse(destination)?);
     let progress_sink = progress_detail.clone();
-    options.progress = Some(UploadProgressHandler::new(move |progress| {
+    let progress = UploadProgressHandler::new(move |progress| {
         progress_sink.set(upload_progress_state(&progress));
-    }));
-    let activity = output.start_activity("Uploading", Some(progress_detail));
-    let upload_started = Instant::now();
-    let report = upload_directory_zip_to_s3(client, options).await;
+    });
+    let activity = output.start_activity("Zipping", Some(progress_detail));
+    let zip_started = Instant::now();
+    let report = match (source, destination) {
+        (TreeSource::Local(source_dir), ZipDestination::S3(destination)) => {
+            let client = s3_client().await;
+            let mut options = UploadOptions::new(source_dir, destination);
+            options.progress = Some(progress);
+            ZipCommandReport::Upload(upload_directory_zip_to_s3(&client, options).await?)
+        }
+        (TreeSource::Local(source_dir), ZipDestination::Local(destination_zip)) => {
+            let mut options = LocalZipOptions::new(source_dir, destination_zip);
+            options.progress = Some(progress);
+            ZipCommandReport::Local(zip_directory_to_file(options).await?)
+        }
+        (TreeSource::S3(source), ZipDestination::S3(destination)) => {
+            let client = s3_client().await;
+            let mut options = S3PrefixUploadOptions::new(source, destination);
+            options.progress = Some(progress);
+            ZipCommandReport::S3Prefix(zip_s3_prefix_to_s3(&client, options).await?)
+        }
+        (TreeSource::S3(source), ZipDestination::Local(destination_zip)) => {
+            let client = s3_client().await;
+            let mut options = S3PrefixLocalZipOptions::new(source, destination_zip);
+            options.progress = Some(progress);
+            ZipCommandReport::Local(zip_s3_prefix_to_file(&client, options).await?)
+        }
+    };
     activity.finish().await;
-    let upload_elapsed = upload_started.elapsed();
-    let report = report?;
-    write_report(&report_destination, &report).await?;
-    output.write(&upload_transcript(
-        &report,
-        &report_destination,
-        upload_elapsed,
-    ))?;
+    let zip_elapsed = zip_started.elapsed();
+    report.write(&report_destination).await?;
+    output.write(&zip_transcript(&report, &report_destination, zip_elapsed))?;
 
     Ok(())
 }
@@ -177,9 +231,139 @@ impl ReportDestination {
     }
 }
 
+enum TreeSource {
+    Local(PathBuf),
+    S3(S3Prefix),
+}
+
+impl TreeSource {
+    fn display(&self) -> String {
+        match self {
+            Self::Local(path) => path.display().to_string(),
+            Self::S3(prefix) => prefix.uri(),
+        }
+    }
+}
+
+enum TreeDestination {
+    Local(PathBuf),
+    S3(S3Prefix),
+}
+
+impl TreeDestination {
+    fn display(&self) -> String {
+        match self {
+            Self::Local(path) => path.display().to_string(),
+            Self::S3(prefix) => prefix.uri(),
+        }
+    }
+}
+
+enum ZipSource {
+    Local(PathBuf),
+    S3(S3Object),
+}
+
+impl ZipSource {
+    fn display(&self) -> String {
+        match self {
+            Self::Local(path) => path.display().to_string(),
+            Self::S3(object) => object.uri(),
+        }
+    }
+}
+
+enum ZipDestination {
+    Local(PathBuf),
+    S3(S3Object),
+}
+
+impl ZipDestination {
+    fn display(&self) -> String {
+        match self {
+            Self::Local(path) => path.display().to_string(),
+            Self::S3(object) => object.uri(),
+        }
+    }
+}
+
+fn parse_tree_source(value: &str) -> Result<TreeSource, Box<dyn std::error::Error>> {
+    reject_file_uri(value)?;
+    if value.starts_with("s3://") {
+        Ok(TreeSource::S3(S3Prefix::parse(value)?))
+    } else {
+        Ok(TreeSource::Local(PathBuf::from(value)))
+    }
+}
+
+fn parse_tree_destination(value: &str) -> Result<TreeDestination, Box<dyn std::error::Error>> {
+    reject_file_uri(value)?;
+    if value.starts_with("s3://") {
+        Ok(TreeDestination::S3(S3Prefix::parse(value)?))
+    } else {
+        Ok(TreeDestination::Local(PathBuf::from(value)))
+    }
+}
+
+fn parse_zip_source(value: &str) -> Result<ZipSource, Box<dyn std::error::Error>> {
+    reject_file_uri(value)?;
+    if value.starts_with("s3://") {
+        Ok(ZipSource::S3(S3Object::parse(value)?))
+    } else {
+        Ok(ZipSource::Local(PathBuf::from(value)))
+    }
+}
+
+fn parse_zip_destination(value: &str) -> Result<ZipDestination, Box<dyn std::error::Error>> {
+    reject_file_uri(value)?;
+    if value.starts_with("s3://") {
+        Ok(ZipDestination::S3(S3Object::parse(value)?))
+    } else {
+        Ok(ZipDestination::Local(PathBuf::from(value)))
+    }
+}
+
+fn validate_delete_extra_destination(
+    delete_extra: bool,
+    destination: &TreeDestination,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !delete_extra {
+        return Ok(());
+    }
+
+    match destination {
+        TreeDestination::Local(_) => {
+            Err("--delete-extra is only supported for s3:// destinations".into())
+        }
+        TreeDestination::S3(prefix) if prefix.prefix.is_empty() => {
+            Err("--delete-extra requires a non-empty s3:// destination prefix".into())
+        }
+        TreeDestination::S3(_) => Ok(()),
+    }
+}
+
+fn validate_diagnostics_source(
+    diagnostics: bool,
+    source: &ZipSource,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if diagnostics && matches!(source, ZipSource::Local(_)) {
+        Err("--diagnostics is only supported for s3:// ZIP sources".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_file_uri(value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if value.starts_with("file://") {
+        Err("file:// URIs are not supported; use a plain local path".into())
+    } else {
+        Ok(())
+    }
+}
+
 fn cli() -> Command {
     Command::new("s3-unspool")
-        .about("Upload local directories as S3 ZIPs and extract S3 ZIPs into S3 prefixes")
+        .about("Zip and unzip local paths and S3 prefixes")
         .arg_required_else_help(true)
         .subcommand_required(true)
         .arg(
@@ -200,18 +384,18 @@ fn cli() -> Command {
                 .default_value("auto"),
         )
         .subcommand(
-            Command::new("extract")
-                .about("Extract missing or changed files from an S3 ZIP object into an S3 prefix")
+            Command::new("unzip")
+                .about("Unzip a local or S3 ZIP into a local directory or S3 prefix")
                 .arg(
                     Arg::new("source")
                         .value_name("SOURCE_ZIP")
-                        .help("Source ZIP object, for example s3://bucket/archive.zip")
+                        .help("Source ZIP file, for example ./archive.zip or s3://bucket/archive.zip")
                         .required(true),
                 )
                 .arg(
                     Arg::new("destination")
-                        .value_name("DESTINATION_PREFIX")
-                        .help("Destination S3 prefix, for example s3://bucket/prefix/")
+                        .value_name("DESTINATION_TREE")
+                        .help("Destination tree, for example ./site or s3://bucket/prefix/")
                         .required(true),
                 )
                 .arg(
@@ -240,7 +424,7 @@ fn cli() -> Command {
                 .arg(
                     Arg::new("diagnostics")
                         .long("diagnostics")
-                        .help("Collect aggregate source range, block cache, and PUT retry diagnostics in the JSON report")
+                        .help("Collect source range diagnostics for s3:// ZIP sources in the JSON report")
                         .action(ArgAction::SetTrue),
                 )
                 .arg(
@@ -251,19 +435,18 @@ fn cli() -> Command {
                 ),
         )
         .subcommand(
-            Command::new("upload")
-                .about("Zip a local directory and upload the archive to S3")
+            Command::new("zip")
+                .about("Zip a local directory or S3 prefix into a local or S3 ZIP")
                 .arg(
-                    Arg::new("source-dir")
-                        .value_name("LOCAL_DIR")
-                        .help("Local directory whose contents should be zipped")
-                        .value_parser(value_parser!(PathBuf))
+                    Arg::new("source")
+                        .value_name("SOURCE_TREE")
+                        .help("Source tree, for example ./site or s3://bucket/prefix/")
                         .required(true),
                 )
                 .arg(
-                    Arg::new("destination-zip")
+                    Arg::new("destination")
                         .value_name("DESTINATION_ZIP")
-                        .help("Destination ZIP object, for example s3://bucket/archive.zip")
+                        .help("Destination ZIP file, for example ./archive.zip or s3://bucket/archive.zip")
                         .required(true),
                 )
                 .arg(
@@ -273,7 +456,7 @@ fn cli() -> Command {
                         .num_args(0..=1)
                         .require_equals(true)
                         .default_missing_value("-")
-                        .help("Show a formatted upload report, or write JSON to a path with --report=PATH"),
+                        .help("Show a formatted zip report, or write JSON to a path with --report=PATH"),
                 ),
         )
 }
@@ -589,31 +772,181 @@ impl Transcript {
     }
 }
 
-fn upload_transcript(
-    report: &UploadReport,
+enum ZipCommandReport {
+    Upload(UploadReport),
+    S3Prefix(S3PrefixUploadReport),
+    Local(LocalZipReport),
+}
+
+impl ZipCommandReport {
+    async fn write(
+        &self,
+        destination: &ReportDestination,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::Upload(report) => write_report(destination, report).await,
+            Self::S3Prefix(report) => write_report(destination, report).await,
+            Self::Local(report) => write_report(destination, report).await,
+        }
+    }
+
+    fn source(&self) -> String {
+        match self {
+            Self::Upload(report) => report.source_dir.clone(),
+            Self::S3Prefix(report) => report.source.uri(),
+            Self::Local(report) => report.source.clone(),
+        }
+    }
+
+    fn destination(&self) -> String {
+        match self {
+            Self::Upload(report) => report.destination.uri(),
+            Self::S3Prefix(report) => report.destination.uri(),
+            Self::Local(report) => report.destination_zip.clone(),
+        }
+    }
+
+    fn files(&self) -> usize {
+        match self {
+            Self::Upload(report) => report.files,
+            Self::S3Prefix(report) => report.files,
+            Self::Local(report) => report.files,
+        }
+    }
+
+    fn directories(&self) -> usize {
+        match self {
+            Self::Upload(report) => report.directories,
+            Self::S3Prefix(report) => report.directories,
+            Self::Local(report) => report.directories,
+        }
+    }
+
+    fn uncompressed_bytes(&self) -> u64 {
+        match self {
+            Self::Upload(report) => report.uncompressed_bytes,
+            Self::S3Prefix(report) => report.uncompressed_bytes,
+            Self::Local(report) => report.uncompressed_bytes,
+        }
+    }
+
+    fn zip_bytes(&self) -> u64 {
+        match self {
+            Self::Upload(report) => report.zip_bytes,
+            Self::S3Prefix(report) => report.zip_bytes,
+            Self::Local(report) => report.zip_bytes,
+        }
+    }
+}
+
+enum UnzipCommandReport {
+    S3(SyncReport),
+    LocalZipToS3(LocalZipToS3Report),
+    Local(LocalUnzipReport),
+}
+
+impl UnzipCommandReport {
+    async fn write(
+        &self,
+        destination: &ReportDestination,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::S3(report) => write_report(destination, report).await,
+            Self::LocalZipToS3(report) => write_report(destination, report).await,
+            Self::Local(report) => write_report(destination, report).await,
+        }
+    }
+
+    fn has_errors(&self) -> bool {
+        match self {
+            Self::S3(report) => report.has_errors(),
+            Self::LocalZipToS3(report) => report.has_errors(),
+            Self::Local(report) => report.has_errors(),
+        }
+    }
+
+    fn summary(&self) -> &SyncSummary {
+        match self {
+            Self::S3(report) => &report.summary,
+            Self::LocalZipToS3(report) => &report.summary,
+            Self::Local(report) => &report.summary,
+        }
+    }
+
+    fn source(&self) -> String {
+        match self {
+            Self::S3(report) => report.source.uri(),
+            Self::LocalZipToS3(report) => report.source_zip.clone(),
+            Self::Local(report) => report.source_zip.clone(),
+        }
+    }
+
+    fn destination(&self) -> String {
+        match self {
+            Self::S3(report) => report.destination.uri(),
+            Self::LocalZipToS3(report) => report.destination.uri(),
+            Self::Local(report) => report.destination_dir.clone(),
+        }
+    }
+
+    fn operations(&self) -> &[ObjectReport] {
+        match self {
+            Self::S3(report) => &report.operations,
+            Self::LocalZipToS3(report) => &report.operations,
+            Self::Local(report) => &report.operations,
+        }
+    }
+
+    fn diagnostics_line(&self) -> Option<String> {
+        match self {
+            Self::S3(report) => report.diagnostics.as_ref().map(diagnostics_line),
+            Self::Local(report) => report.diagnostics.as_ref().map(|diagnostics| {
+                format!(
+                    "Source: {} GET attempts, {} blocks fetched, {} waits, {:.2}x amplification",
+                    diagnostics.source.source_get_attempts,
+                    diagnostics.source.fetched_blocks,
+                    diagnostics.source.block_waits,
+                    diagnostics.source.source_amplification
+                )
+            }),
+            Self::LocalZipToS3(_) => None,
+        }
+    }
+}
+
+fn zip_transcript(
+    report: &ZipCommandReport,
     report_destination: &ReportDestination,
-    upload_elapsed: Duration,
+    zip_elapsed: Duration,
 ) -> Transcript {
+    let mut counts = vec![plural(report.files(), "file", "files")];
+    let directories = report.directories();
+    if directories > 0 {
+        counts.push(plural(directories, "directory", "directories"));
+    }
     let mut details = vec![
         format!(
             "{}, {} uncompressed, {} ZIP",
-            plural(report.files, "file", "files"),
-            format_bytes(report.uncompressed_bytes),
-            format_bytes(report.zip_bytes)
+            counts.join(", "),
+            format_bytes(report.uncompressed_bytes()),
+            format_bytes(report.zip_bytes())
         ),
-        report.destination.uri(),
+        report.destination(),
     ];
     match report_destination {
         ReportDestination::None => {}
         ReportDestination::JsonFile(path) => details.push(format!("Report: {path}")),
-        ReportDestination::Human => details.extend(upload_report_details(report, upload_elapsed)),
+        ReportDestination::Human => details.extend(zip_report_details(report, zip_elapsed)),
     }
 
-    Transcript::success("Upload complete", details)
+    Transcript::success("Zip complete", details)
 }
 
-fn extract_transcript(report: &SyncReport, report_destination: &ReportDestination) -> Transcript {
-    let summary = &report.summary;
+fn unzip_transcript(
+    report: &UnzipCommandReport,
+    report_destination: &ReportDestination,
+) -> Transcript {
+    let summary = report.summary();
     let mut details = if summary.uploaded_new == 0
         && summary.uploaded_changed == 0
         && summary.deleted_extra == 0
@@ -622,22 +955,24 @@ fn extract_transcript(report: &SyncReport, report_destination: &ReportDestinatio
     {
         vec![format!(
             "{} unchanged",
-            plural(summary.skipped_unchanged, "file", "files")
+            plural(summary.skipped_unchanged, "entry", "entries")
         )]
     } else {
         vec![format!(
             "{}: {} new, {} changed, {} unchanged",
-            plural(summary.zip_files, "file", "files"),
+            plural(summary.zip_files, "entry", "entries"),
             summary.uploaded_new,
             summary.uploaded_changed,
             summary.skipped_unchanged
         )]
     };
 
-    details.push(format!(
-        "Destination: {} listed",
-        plural(summary.destination_objects, "object", "objects")
-    ));
+    if summary.destination_objects > 0 {
+        details.push(format!(
+            "Destination: {} listed",
+            plural(summary.destination_objects, "object", "objects")
+        ));
+    }
     if summary.deleted_extra > 0 {
         details.push(format!(
             "Deleted: {} extra",
@@ -657,64 +992,64 @@ fn extract_transcript(report: &SyncReport, report_destination: &ReportDestinatio
     if summary.errors > 0 {
         details.push(format!(
             "Errors: {}",
-            plural(summary.errors, "object", "objects")
+            plural(summary.errors, "entry", "entries")
         ));
     }
-    if let Some(diagnostics) = &report.diagnostics {
-        details.push(diagnostics_line(diagnostics));
+    if let Some(line) = report.diagnostics_line() {
+        details.push(line);
     }
     match report_destination {
         ReportDestination::None => {}
         ReportDestination::JsonFile(path) => details.push(format!("Report: {path}")),
-        ReportDestination::Human => details.extend(extract_report_details(report)),
+        ReportDestination::Human => details.extend(unzip_report_details(report)),
     }
 
     if summary.errors > 0 {
-        Transcript::error("Extract completed with errors", details)
+        Transcript::error("Unzip completed with errors", details)
     } else if summary.conditional_conflicts > 0 {
-        Transcript::notice("Extract completed with conflicts", details)
+        Transcript::notice("Unzip completed with conflicts", details)
     } else if summary.uploaded_new == 0
         && summary.uploaded_changed == 0
         && summary.deleted_extra == 0
     {
         Transcript::success("Up to date", details)
     } else {
-        Transcript::success("Extract complete", details)
+        Transcript::success("Unzip complete", details)
     }
 }
 
-fn upload_report_details(report: &UploadReport, upload_elapsed: Duration) -> Vec<String> {
+fn zip_report_details(report: &ZipCommandReport, zip_elapsed: Duration) -> Vec<String> {
     vec![
         "Report:".to_string(),
-        format!("  Source: {}", report.source_dir),
-        format!("  Destination: {}", report.destination.uri()),
-        format!("  Files: {}", plural(report.files, "file", "files")),
+        format!("  Source: {}", report.source()),
+        format!("  Destination: {}", report.destination()),
+        format!("  Files: {}", plural(report.files(), "file", "files")),
+        format!(
+            "  Directories: {}",
+            plural(report.directories(), "directory", "directories")
+        ),
         format!(
             "  Uncompressed: {}",
-            format_bytes(report.uncompressed_bytes)
+            format_bytes(report.uncompressed_bytes())
         ),
-        format!("  ZIP: {}", format_bytes(report.zip_bytes)),
-        format!("  Wall time: {}", format_elapsed(upload_elapsed)),
+        format!("  ZIP: {}", format_bytes(report.zip_bytes())),
+        format!("  Wall time: {}", format_elapsed(zip_elapsed)),
         format!(
-            "  Upload speed: {}",
-            format_upload_speed(report.zip_bytes, upload_elapsed)
+            "  Zip speed: {}",
+            format_upload_speed(report.zip_bytes(), zip_elapsed)
         ),
     ]
 }
 
-fn extract_report_details(report: &SyncReport) -> Vec<String> {
-    let summary = &report.summary;
+fn unzip_report_details(report: &UnzipCommandReport) -> Vec<String> {
+    let summary = report.summary();
     let mut details = vec![
         "Report:".to_string(),
-        format!("  Source: {}", report.source.uri()),
-        format!("  Destination: {}", report.destination.uri()),
+        format!("  Source: {}", report.source()),
+        format!("  Destination: {}", report.destination()),
         format!(
-            "  ZIP files: {}",
-            plural(summary.zip_files, "file", "files")
-        ),
-        format!(
-            "  Destination listed: {}",
-            plural(summary.destination_objects, "object", "objects")
+            "  ZIP entries: {}",
+            plural(summary.zip_files, "entry", "entries")
         ),
         format!(
             "  Operations: {} new, {} changed, {} unchanged, {} deleted",
@@ -725,17 +1060,23 @@ fn extract_report_details(report: &SyncReport) -> Vec<String> {
         ),
     ];
 
+    if summary.destination_objects > 0 {
+        details.push(format!(
+            "  Destination listed: {}",
+            plural(summary.destination_objects, "object", "objects")
+        ));
+    }
     if summary.conditional_conflicts > 0 || summary.errors > 0 {
         details.push(format!(
             "  Issues: {} conflicts, {} errors",
             summary.conditional_conflicts, summary.errors
         ));
     }
-    if let Some(diagnostics) = &report.diagnostics {
-        details.push(format!("  {}", diagnostics_line(diagnostics)));
+    if let Some(line) = report.diagnostics_line() {
+        details.push(format!("  {line}"));
     }
 
-    details.extend(operation_report_details(&report.operations));
+    details.extend(operation_report_details(report.operations()));
     details
 }
 
@@ -1089,14 +1430,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_extract_subcommand() {
+    fn parses_unzip_subcommand() {
         let matches = cli()
             .try_get_matches_from([
                 "s3-unspool",
                 "--quiet",
                 "--color",
                 "never",
-                "extract",
+                "unzip",
                 "--delete-extra",
                 "--ignore-catalog",
                 "s3://source-bucket/archive.zip",
@@ -1110,8 +1451,8 @@ mod tests {
             Some("never")
         );
 
-        let Some(("extract", extract)) = matches.subcommand() else {
-            panic!("expected extract subcommand");
+        let Some(("unzip", extract)) = matches.subcommand() else {
+            panic!("expected unzip subcommand");
         };
         assert!(extract.get_flag("delete-extra"));
         assert!(extract.get_flag("ignore-catalog"));
@@ -1122,45 +1463,130 @@ mod tests {
     }
 
     #[test]
-    fn parses_upload_subcommand() {
+    fn parses_zip_subcommand() {
         let matches = cli()
             .try_get_matches_from([
                 "s3-unspool",
-                "upload",
+                "zip",
                 "/tmp/site",
                 "s3://destination-bucket/site.zip",
             ])
             .unwrap();
 
-        let Some(("upload", upload)) = matches.subcommand() else {
-            panic!("expected upload subcommand");
+        let Some(("zip", upload)) = matches.subcommand() else {
+            panic!("expected zip subcommand");
         };
         assert_eq!(
-            upload.get_one::<PathBuf>("source-dir"),
-            Some(&PathBuf::from("/tmp/site"))
+            upload.get_one::<String>("source").map(String::as_str),
+            Some("/tmp/site")
         );
         assert_eq!(
-            upload
-                .get_one::<String>("destination-zip")
-                .map(String::as_str),
+            upload.get_one::<String>("destination").map(String::as_str),
             Some("s3://destination-bucket/site.zip")
         );
     }
 
     #[test]
-    fn parses_bare_report_as_stdout_for_extract() {
+    fn parses_all_zip_endpoint_combinations() {
+        for (source, destination) in [
+            ("/tmp/site", "/tmp/site.zip"),
+            ("/tmp/site", "s3://bucket/site.zip"),
+            ("s3://bucket/site/", "/tmp/site.zip"),
+            ("s3://bucket/site/", "s3://bucket/site.zip"),
+        ] {
+            let matches = cli()
+                .try_get_matches_from(["s3-unspool", "zip", source, destination])
+                .unwrap();
+            let Some(("zip", zip)) = matches.subcommand() else {
+                panic!("expected zip subcommand");
+            };
+            assert_eq!(
+                zip.get_one::<String>("source").map(String::as_str),
+                Some(source)
+            );
+            assert_eq!(
+                zip.get_one::<String>("destination").map(String::as_str),
+                Some(destination)
+            );
+        }
+    }
+
+    #[test]
+    fn parses_all_unzip_endpoint_combinations() {
+        for (source, destination) in [
+            ("/tmp/site.zip", "/tmp/site"),
+            ("/tmp/site.zip", "s3://bucket/site/"),
+            ("s3://bucket/site.zip", "/tmp/site"),
+            ("s3://bucket/site.zip", "s3://bucket/site/"),
+        ] {
+            let matches = cli()
+                .try_get_matches_from(["s3-unspool", "unzip", source, destination])
+                .unwrap();
+            let Some(("unzip", unzip)) = matches.subcommand() else {
+                panic!("expected unzip subcommand");
+            };
+            assert_eq!(
+                unzip.get_one::<String>("source").map(String::as_str),
+                Some(source)
+            );
+            assert_eq!(
+                unzip.get_one::<String>("destination").map(String::as_str),
+                Some(destination)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_file_uri_endpoint_values() {
+        assert!(parse_tree_source("file:///tmp/site").is_err());
+        assert!(parse_zip_source("file:///tmp/site.zip").is_err());
+        assert!(parse_tree_destination("file:///tmp/site").is_err());
+        assert!(parse_zip_destination("file:///tmp/site.zip").is_err());
+    }
+
+    #[test]
+    fn rejects_delete_extra_for_bucket_root_destination() {
+        let destination = parse_tree_destination("s3://bucket").unwrap();
+
+        let err = validate_delete_extra_destination(true, &destination).unwrap_err();
+
+        assert!(err.to_string().contains("non-empty"));
+    }
+
+    #[test]
+    fn rejects_delete_extra_for_local_destination() {
+        let destination = parse_tree_destination("/tmp/site").unwrap();
+
+        let err = validate_delete_extra_destination(true, &destination).unwrap_err();
+
+        assert!(err.to_string().contains("s3://"));
+    }
+
+    #[test]
+    fn rejects_diagnostics_for_local_zip_sources() {
+        let source = parse_zip_source("/tmp/site.zip").unwrap();
+
+        let err = validate_diagnostics_source(true, &source).unwrap_err();
+
+        assert!(err.to_string().contains("s3:// ZIP sources"));
+        let source = parse_zip_source("s3://bucket/site.zip").unwrap();
+        validate_diagnostics_source(true, &source).unwrap();
+    }
+
+    #[test]
+    fn parses_bare_report_as_stdout_for_unzip() {
         let matches = cli()
             .try_get_matches_from([
                 "s3-unspool",
-                "extract",
+                "unzip",
                 "--report",
                 "s3://source-bucket/archive.zip",
                 "s3://destination-bucket/prefix/",
             ])
             .unwrap();
 
-        let Some(("extract", extract)) = matches.subcommand() else {
-            panic!("expected extract subcommand");
+        let Some(("unzip", extract)) = matches.subcommand() else {
+            panic!("expected unzip subcommand");
         };
         assert_eq!(
             extract.get_one::<String>("report").map(String::as_str),
@@ -1173,19 +1599,19 @@ mod tests {
     }
 
     #[test]
-    fn parses_report_path_for_extract() {
+    fn parses_report_path_for_unzip() {
         let matches = cli()
             .try_get_matches_from([
                 "s3-unspool",
-                "extract",
+                "unzip",
                 "--report=report.json",
                 "s3://source-bucket/archive.zip",
                 "s3://destination-bucket/prefix/",
             ])
             .unwrap();
 
-        let Some(("extract", extract)) = matches.subcommand() else {
-            panic!("expected extract subcommand");
+        let Some(("unzip", extract)) = matches.subcommand() else {
+            panic!("expected unzip subcommand");
         };
         assert_eq!(
             extract.get_one::<String>("report").map(String::as_str),
@@ -1194,19 +1620,19 @@ mod tests {
     }
 
     #[test]
-    fn parses_report_path_after_extract_positionals() {
+    fn parses_report_path_after_unzip_positionals() {
         let matches = cli()
             .try_get_matches_from([
                 "s3-unspool",
-                "extract",
+                "unzip",
                 "s3://source-bucket/archive.zip",
                 "s3://destination-bucket/prefix/",
                 "--report=report.json",
             ])
             .unwrap();
 
-        let Some(("extract", extract)) = matches.subcommand() else {
-            panic!("expected extract subcommand");
+        let Some(("unzip", extract)) = matches.subcommand() else {
+            panic!("expected unzip subcommand");
         };
         assert_eq!(
             extract.get_one::<String>("report").map(String::as_str),
@@ -1219,7 +1645,7 @@ mod tests {
         let matches = cli()
             .try_get_matches_from([
                 "s3-unspool",
-                "extract",
+                "unzip",
                 "--report",
                 "--concurrency=32",
                 "s3://source-bucket/archive.zip",
@@ -1227,8 +1653,8 @@ mod tests {
             ])
             .unwrap();
 
-        let Some(("extract", extract)) = matches.subcommand() else {
-            panic!("expected extract subcommand");
+        let Some(("unzip", extract)) = matches.subcommand() else {
+            panic!("expected unzip subcommand");
         };
         assert_eq!(
             extract.get_one::<String>("report").map(String::as_str),
@@ -1242,44 +1668,44 @@ mod tests {
     }
 
     #[test]
-    fn parses_bare_report_as_stdout_for_upload() {
+    fn parses_bare_report_as_stdout_for_zip() {
         let matches = cli()
             .try_get_matches_from([
                 "s3-unspool",
-                "upload",
+                "zip",
                 "--report",
                 "/tmp/site",
                 "s3://destination-bucket/site.zip",
             ])
             .unwrap();
 
-        let Some(("upload", upload)) = matches.subcommand() else {
-            panic!("expected upload subcommand");
+        let Some(("zip", upload)) = matches.subcommand() else {
+            panic!("expected zip subcommand");
         };
         assert_eq!(
             upload.get_one::<String>("report").map(String::as_str),
             Some("-")
         );
         assert_eq!(
-            upload.get_one::<PathBuf>("source-dir"),
-            Some(&PathBuf::from("/tmp/site"))
+            upload.get_one::<String>("source").map(String::as_str),
+            Some("/tmp/site")
         );
     }
 
     #[test]
-    fn parses_report_dash_as_stdout_for_upload() {
+    fn parses_report_dash_as_stdout_for_zip() {
         let matches = cli()
             .try_get_matches_from([
                 "s3-unspool",
-                "upload",
+                "zip",
                 "--report=-",
                 "/tmp/site",
                 "s3://destination-bucket/site.zip",
             ])
             .unwrap();
 
-        let Some(("upload", upload)) = matches.subcommand() else {
-            panic!("expected upload subcommand");
+        let Some(("zip", upload)) = matches.subcommand() else {
+            panic!("expected zip subcommand");
         };
         assert_eq!(
             upload.get_one::<String>("report").map(String::as_str),
@@ -1288,19 +1714,19 @@ mod tests {
     }
 
     #[test]
-    fn parses_report_path_for_upload() {
+    fn parses_report_path_for_zip() {
         let matches = cli()
             .try_get_matches_from([
                 "s3-unspool",
-                "upload",
+                "zip",
                 "--report=report.json",
                 "/tmp/site",
                 "s3://destination-bucket/site.zip",
             ])
             .unwrap();
 
-        let Some(("upload", upload)) = matches.subcommand() else {
-            panic!("expected upload subcommand");
+        let Some(("zip", upload)) = matches.subcommand() else {
+            panic!("expected zip subcommand");
         };
         assert_eq!(
             upload.get_one::<String>("report").map(String::as_str),
@@ -1309,48 +1735,53 @@ mod tests {
     }
 
     #[test]
-    fn renders_upload_transcript() {
+    fn renders_zip_transcript() {
         let report = UploadReport {
             source_dir: "./site".to_string(),
             destination: S3Object::parse("s3://bucket/site.zip").unwrap(),
             files: 2,
+            directories: 0,
             uncompressed_bytes: 1536,
             zip_bytes: 768,
         };
 
-        let transcript = upload_transcript(
-            &report,
+        let transcript = zip_transcript(
+            &ZipCommandReport::Upload(report),
             &ReportDestination::JsonFile("report.json".to_string()),
             Duration::from_secs(2),
         );
 
         assert_eq!(
             transcript.render(Theme { color: false }),
-            "✓ Upload complete\n  └ 2 files, 1.5 KiB uncompressed, 768 B ZIP\n    s3://bucket/site.zip\n    Report: report.json"
+            "✓ Zip complete\n  └ 2 files, 1.5 KiB uncompressed, 768 B ZIP\n    s3://bucket/site.zip\n    Report: report.json"
         );
     }
 
     #[test]
-    fn renders_upload_transcript_with_human_report() {
+    fn renders_zip_transcript_with_human_report() {
         let report = UploadReport {
             source_dir: "./site".to_string(),
             destination: S3Object::parse("s3://bucket/site.zip").unwrap(),
             files: 2,
+            directories: 1,
             uncompressed_bytes: 4 * 1024 * 1024,
             zip_bytes: 3 * 1024 * 1024,
         };
 
-        let transcript =
-            upload_transcript(&report, &ReportDestination::Human, Duration::from_secs(2));
+        let transcript = zip_transcript(
+            &ZipCommandReport::Upload(report),
+            &ReportDestination::Human,
+            Duration::from_secs(2),
+        );
 
         assert_eq!(
             transcript.render(Theme { color: false }),
-            "✓ Upload complete\n  └ 2 files, 4.0 MiB uncompressed, 3.0 MiB ZIP\n    s3://bucket/site.zip\n    Report:\n      Source: ./site\n      Destination: s3://bucket/site.zip\n      Files: 2 files\n      Uncompressed: 4.0 MiB\n      ZIP: 3.0 MiB\n      Wall time: 00:02\n      Upload speed: 1.50 MiB/s"
+            "✓ Zip complete\n  └ 2 files, 1 directory, 4.0 MiB uncompressed, 3.0 MiB ZIP\n    s3://bucket/site.zip\n    Report:\n      Source: ./site\n      Destination: s3://bucket/site.zip\n      Files: 2 files\n      Directories: 1 directory\n      Uncompressed: 4.0 MiB\n      ZIP: 3.0 MiB\n      Wall time: 00:02\n      Zip speed: 1.50 MiB/s"
         );
     }
 
     #[test]
-    fn renders_up_to_date_extract_transcript() {
+    fn renders_up_to_date_unzip_transcript() {
         let report = SyncReport {
             source: S3Object::parse("s3://bucket/site.zip").unwrap(),
             destination: S3Prefix::parse("s3://bucket/www/").unwrap(),
@@ -1364,16 +1795,17 @@ mod tests {
             operations: Vec::new(),
         };
 
-        let transcript = extract_transcript(&report, &ReportDestination::None);
+        let transcript =
+            unzip_transcript(&UnzipCommandReport::S3(report), &ReportDestination::None);
 
         assert_eq!(
             transcript.render(Theme { color: false }),
-            "✓ Up to date\n  └ 10 files unchanged\n    Destination: 10 objects listed"
+            "✓ Up to date\n  └ 10 entries unchanged\n    Destination: 10 objects listed"
         );
     }
 
     #[test]
-    fn renders_changed_extract_transcript_with_diagnostics() {
+    fn renders_changed_unzip_transcript_with_diagnostics() {
         let report = SyncReport {
             source: S3Object::parse("s3://bucket/site.zip").unwrap(),
             destination: S3Prefix::parse("s3://bucket/www/").unwrap(),
@@ -1428,19 +1860,19 @@ mod tests {
             operations: Vec::new(),
         };
 
-        let transcript = extract_transcript(
-            &report,
+        let transcript = unzip_transcript(
+            &UnzipCommandReport::S3(report),
             &ReportDestination::JsonFile("report.json".to_string()),
         );
 
         assert_eq!(
             transcript.render(Theme { color: false }),
-            "✓ Extract complete\n  └ 10 files: 1 new, 2 changed, 7 unchanged\n    Destination: 12 objects listed\n    Deleted: 1 object extra\n    Source: 3 GET attempts, 2 blocks fetched, 1 waits, 1.25x amplification\n    Report: report.json"
+            "✓ Unzip complete\n  └ 10 entries: 1 new, 2 changed, 7 unchanged\n    Destination: 12 objects listed\n    Deleted: 1 object extra\n    Source: 3 GET attempts, 2 blocks fetched, 1 waits, 1.25x amplification\n    Report: report.json"
         );
     }
 
     #[test]
-    fn renders_extract_transcript_with_human_report() {
+    fn renders_unzip_transcript_with_human_report() {
         let report = SyncReport {
             source: S3Object::parse("s3://bucket/site.zip").unwrap(),
             destination: S3Prefix::parse("s3://bucket/www/").unwrap(),
@@ -1484,16 +1916,17 @@ mod tests {
             ],
         };
 
-        let transcript = extract_transcript(&report, &ReportDestination::Human);
+        let transcript =
+            unzip_transcript(&UnzipCommandReport::S3(report), &ReportDestination::Human);
 
         assert_eq!(
             transcript.render(Theme { color: false }),
-            "✓ Extract complete\n  └ 3 files: 1 new, 1 changed, 1 unchanged\n    Destination: 2 objects listed\n    Report:\n      Source: s3://bucket/site.zip\n      Destination: s3://bucket/www/\n      ZIP files: 3 files\n      Destination listed: 2 objects\n      Operations: 1 new, 1 changed, 1 unchanged, 0 deleted\n      Objects:\n        uploaded new: www/a.txt (10 B)\n        uploaded changed: www/b.txt (20 B)"
+            "✓ Unzip complete\n  └ 3 entries: 1 new, 1 changed, 1 unchanged\n    Destination: 2 objects listed\n    Report:\n      Source: s3://bucket/site.zip\n      Destination: s3://bucket/www/\n      ZIP entries: 3 entries\n      Operations: 1 new, 1 changed, 1 unchanged, 0 deleted\n      Destination listed: 2 objects\n      Objects:\n        uploaded new: www/a.txt (10 B)\n        uploaded changed: www/b.txt (20 B)"
         );
     }
 
     #[test]
-    fn renders_conflict_extract_transcript() {
+    fn renders_conflict_unzip_transcript() {
         let report = SyncReport {
             source: S3Object::parse("s3://bucket/site.zip").unwrap(),
             destination: S3Prefix::parse("s3://bucket/www/").unwrap(),
@@ -1509,11 +1942,12 @@ mod tests {
             operations: Vec::new(),
         };
 
-        let transcript = extract_transcript(&report, &ReportDestination::None);
+        let transcript =
+            unzip_transcript(&UnzipCommandReport::S3(report), &ReportDestination::None);
 
         assert_eq!(
             transcript.render(Theme { color: false }),
-            "! Extract completed with conflicts\n  └ 3 files: 0 new, 1 changed, 1 unchanged\n    Destination: 3 objects listed\n    Conflicts: 1 conditional write"
+            "! Unzip completed with conflicts\n  └ 3 entries: 0 new, 1 changed, 1 unchanged\n    Destination: 3 objects listed\n    Conflicts: 1 conditional write"
         );
     }
 

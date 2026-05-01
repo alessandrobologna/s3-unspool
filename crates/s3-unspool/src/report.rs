@@ -14,16 +14,57 @@ pub struct UploadReport {
     pub destination: S3Object,
     /// Number of regular files included in the ZIP.
     pub files: usize,
+    /// Number of preserved directory entries included in the ZIP.
+    #[serde(default)]
+    pub directories: usize,
     /// Total uncompressed payload bytes.
     pub uncompressed_bytes: u64,
     /// Total uploaded ZIP object bytes.
     pub zip_bytes: u64,
 }
 
+/// Summary returned by [`crate::zip_s3_prefix_to_s3`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct S3PrefixUploadReport {
+    /// Source prefix that was uploaded.
+    pub source: S3Prefix,
+    /// Destination ZIP object.
+    pub destination: S3Object,
+    /// Number of regular source objects included as ZIP file entries.
+    pub files: usize,
+    /// Number of zero-byte trailing-slash source objects included as ZIP directories.
+    pub directories: usize,
+    /// Total number of ZIP entries written, excluding the embedded catalog.
+    pub entries: usize,
+    /// Total uncompressed payload bytes across regular file entries.
+    pub uncompressed_bytes: u64,
+    /// Total uploaded ZIP object bytes.
+    pub zip_bytes: u64,
+}
+
+/// Summary returned by local ZIP creation helpers.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LocalZipReport {
+    /// Source tree that was zipped.
+    pub source: String,
+    /// Destination ZIP file path.
+    pub destination_zip: String,
+    /// Number of regular file entries included in the ZIP.
+    pub files: usize,
+    /// Number of preserved directory entries included in the ZIP.
+    pub directories: usize,
+    /// Total number of ZIP entries written, excluding the embedded catalog.
+    pub entries: usize,
+    /// Total uncompressed payload bytes across regular file entries.
+    pub uncompressed_bytes: u64,
+    /// Size of the generated ZIP file.
+    pub zip_bytes: u64,
+}
+
 /// Aggregate counters for an extract run.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SyncSummary {
-    /// Number of file entries found in the source ZIP, excluding the embedded catalog.
+    /// Number of source ZIP entries found, excluding the embedded catalog.
     pub zip_files: usize,
     /// Number of destination objects listed before extraction.
     pub destination_objects: usize,
@@ -64,6 +105,49 @@ impl SyncReport {
     }
 }
 
+/// Full report returned when extracting a local ZIP into an S3 prefix.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LocalZipToS3Report {
+    /// Source ZIP file path.
+    pub source_zip: String,
+    /// Destination prefix.
+    pub destination: S3Prefix,
+    /// Aggregate extract counters.
+    pub summary: SyncSummary,
+    /// Per-entry operation records.
+    pub operations: Vec<ObjectReport>,
+}
+
+impl LocalZipToS3Report {
+    /// Returns `true` when one or more entry operations failed.
+    pub fn has_errors(&self) -> bool {
+        self.summary.errors > 0
+    }
+}
+
+/// Full report returned when extracting a ZIP into a local directory.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LocalUnzipReport {
+    /// Source ZIP object URI or local file path.
+    pub source_zip: String,
+    /// Destination local directory.
+    pub destination_dir: String,
+    /// Aggregate extract counters.
+    pub summary: SyncSummary,
+    /// Optional source scheduler diagnostics for S3 ZIP sources.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<LocalUnzipDiagnostics>,
+    /// Per-entry operation records.
+    pub operations: Vec<ObjectReport>,
+}
+
+impl LocalUnzipReport {
+    /// Returns `true` when one or more entry operations failed.
+    pub fn has_errors(&self) -> bool {
+        self.summary.errors > 0
+    }
+}
+
 /// Effective extract settings and aggregate diagnostics.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyncDiagnostics {
@@ -85,6 +169,23 @@ pub struct SyncDiagnostics {
     pub source: SourceDiagnostics,
     /// Aggregate destination `PutObject` counters.
     pub put: PutDiagnostics,
+}
+
+/// Effective local unzip settings and aggregate source diagnostics.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LocalUnzipDiagnostics {
+    /// Effective entry concurrency.
+    pub concurrency: usize,
+    /// Effective source block size in bytes.
+    pub source_block_size: usize,
+    /// Effective source block merge gap in bytes.
+    pub source_block_merge_gap: usize,
+    /// Effective source ranged `GetObject` concurrency.
+    pub source_get_concurrency: usize,
+    /// Effective source block window capacity in bytes.
+    pub source_window_capacity: usize,
+    /// Aggregate source scheduler counters.
+    pub source: SourceDiagnostics,
 }
 
 /// Source scheduler and ranged `GetObject` counters.
@@ -193,7 +294,7 @@ pub enum OperationStatus {
 pub struct ObjectReport {
     /// Operation status.
     pub status: OperationStatus,
-    /// Destination object key.
+    /// Destination object key or local path.
     pub key: String,
     /// Source ZIP path when the operation corresponds to a ZIP entry.
     #[serde(skip_serializing_if = "Option::is_none")]

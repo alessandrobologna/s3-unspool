@@ -24,14 +24,20 @@ use crate::range::{
 };
 use crate::report::summarize;
 use crate::s3_uri::{join_destination_key, normalize_etag};
-use crate::upload::{UploadEntry, collect_upload_entries, upload_zip_path, write_upload_zip};
+use crate::upload::{
+    UploadEntry, UploadEntryKind, UploadEntrySource, collect_upload_entries, s3_prefix_zip_path,
+    upload_zip_path, write_upload_zip,
+};
 use crate::zip_manifest::{
     ManifestBuild, ManifestEntry, apply_embedded_catalog, build_manifest_entries,
-    count_zip_file_entries, normalize_zip_file_path,
+    build_manifest_entries_with_size_limit, count_zip_file_entries, normalize_zip_entry_path,
+    normalize_zip_file_path,
 };
 use crate::{
-    Error, ObjectReport, OperationStatus, PutRetryPolicy, S3Object, S3Prefix, SyncOptions,
-    SyncReport, SyncSummary, UploadProgress, UploadProgressHandler,
+    Error, LocalUnzipOptions, LocalZipOptions, ObjectReport, OperationStatus, PutRetryPolicy,
+    S3Object, S3Prefix, S3PrefixLocalZipOptions, SyncOptions, SyncReport, SyncSummary,
+    UploadProgress, UploadProgressHandler, unzip_file_to_local, zip_directory_to_file,
+    zip_s3_prefix_to_file,
 };
 
 #[test]
@@ -230,6 +236,9 @@ fn normalizes_safe_zip_file_paths() {
         Some("a/b.txt".to_string())
     );
     assert_eq!(normalize_zip_file_path("dir/").unwrap(), None);
+    let directory = normalize_zip_entry_path("dir/").unwrap();
+    assert_eq!(directory.path, "dir/");
+    assert!(directory.is_directory);
 }
 
 #[test]
@@ -252,6 +261,7 @@ async fn collects_and_writes_upload_zip_entries() {
     tokio::fs::create_dir_all(root.join("nested"))
         .await
         .unwrap();
+    tokio::fs::create_dir_all(root.join("empty")).await.unwrap();
     tokio::fs::write(root.join("b.txt"), b"bravo")
         .await
         .unwrap();
@@ -265,7 +275,7 @@ async fn collects_and_writes_upload_zip_entries() {
             .iter()
             .map(|entry| entry.zip_path.as_str())
             .collect::<Vec<_>>(),
-        vec!["b.txt", "nested/a.txt"]
+        vec!["b.txt", "empty/", "nested/a.txt"]
     );
 
     let mut data = Vec::new();
@@ -287,22 +297,30 @@ async fn collects_and_writes_upload_zip_entries() {
         .await
         .unwrap();
     let zip_entries = zip.file().entries().to_vec();
-    assert_eq!(zip_entries.len(), 3);
+    assert_eq!(zip_entries.len(), 4);
     assert_eq!(zip_entries[0].filename().as_str().unwrap(), "b.txt");
-    assert_eq!(zip_entries[1].filename().as_str().unwrap(), "nested/a.txt");
+    assert_eq!(zip_entries[1].filename().as_str().unwrap(), "empty/");
+    assert_eq!(zip_entries[2].filename().as_str().unwrap(), "nested/a.txt");
     assert_eq!(
-        zip_entries[2].filename().as_str().unwrap(),
+        zip_entries[3].filename().as_str().unwrap(),
         EMBEDDED_CATALOG_PATH
     );
 
-    let mut nested = zip.reader_with_entry(1).await.unwrap();
+    let mut directory = zip.reader_with_entry(1).await.unwrap();
+    let mut directory_bytes = Vec::new();
+    FuturesAsyncReadExt::read_to_end(&mut directory, &mut directory_bytes)
+        .await
+        .unwrap();
+    assert!(directory_bytes.is_empty());
+
+    let mut nested = zip.reader_with_entry(2).await.unwrap();
     let mut nested_bytes = Vec::new();
     FuturesAsyncReadExt::read_to_end(&mut nested, &mut nested_bytes)
         .await
         .unwrap();
     assert_eq!(nested_bytes, b"alpha");
 
-    let mut catalog_reader = zip.reader_with_entry(2).await.unwrap();
+    let mut catalog_reader = zip.reader_with_entry(3).await.unwrap();
     let mut catalog_bytes = Vec::new();
     FuturesAsyncReadExt::read_to_end(&mut catalog_reader, &mut catalog_bytes)
         .await
@@ -318,14 +336,14 @@ async fn collects_and_writes_upload_zip_entries() {
 async fn upload_zip_rejects_uncompressed_size_overflow() {
     let entries = vec![
         UploadEntry {
-            path: PathBuf::from("missing-a.txt"),
             zip_path: "a.txt".to_string(),
             size: u64::MAX,
+            source: UploadEntrySource::LocalFile(PathBuf::from("missing-a.txt")),
         },
         UploadEntry {
-            path: PathBuf::from("missing-b.txt"),
             zip_path: "b.txt".to_string(),
             size: 1,
+            source: UploadEntrySource::LocalFile(PathBuf::from("missing-b.txt")),
         },
     ];
     let mut data = Vec::new();
@@ -434,6 +452,349 @@ async fn upload_zip_progress_uses_measured_file_bytes() {
 }
 
 #[tokio::test]
+async fn zips_local_directory_to_local_zip_with_empty_directories() {
+    let root = unique_temp_dir("zip-local-source");
+    let output_dir = unique_temp_dir("zip-local-output");
+    let destination_zip = output_dir.join("site.zip");
+    tokio::fs::create_dir_all(root.join("empty")).await.unwrap();
+    tokio::fs::create_dir_all(root.join("nested"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(&output_dir).await.unwrap();
+    tokio::fs::write(root.join("nested").join("a.txt"), b"alpha")
+        .await
+        .unwrap();
+
+    let report = zip_directory_to_file(LocalZipOptions::new(&root, &destination_zip))
+        .await
+        .unwrap();
+
+    assert_eq!(report.files, 1);
+    assert_eq!(report.directories, 1);
+    assert!(report.zip_bytes > 0);
+    let data = tokio::fs::read(&destination_zip).await.unwrap();
+    let zip = async_zip::base::read::mem::ZipFileReader::new(data)
+        .await
+        .unwrap();
+    let names = zip
+        .file()
+        .entries()
+        .iter()
+        .map(|entry| entry.filename().as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"empty/".to_string()));
+    assert!(names.contains(&"nested/a.txt".to_string()));
+    assert!(names.contains(&EMBEDDED_CATALOG_PATH.to_string()));
+
+    tokio::fs::remove_dir_all(root).await.unwrap();
+    tokio::fs::remove_dir_all(output_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn local_zip_rejects_destination_inside_source_tree() {
+    let root = unique_temp_dir("zip-local-destination-inside-source");
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    tokio::fs::write(root.join("a.txt"), b"alpha")
+        .await
+        .unwrap();
+    tokio::fs::write(root.join("site.zip"), b"previous archive")
+        .await
+        .unwrap();
+
+    let err = zip_directory_to_file(LocalZipOptions::new(&root, root.join("site.zip")))
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("must not be inside source"));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn unzips_local_zip_to_local_directory_and_overwrites_files() {
+    let source_root = unique_temp_dir("unzip-local-source");
+    let zip_dir = unique_temp_dir("unzip-local-zip");
+    let destination = unique_temp_dir("unzip-local-destination");
+    let source_zip = zip_dir.join("site.zip");
+    tokio::fs::create_dir_all(source_root.join("empty"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(source_root.join("nested"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(&zip_dir).await.unwrap();
+    tokio::fs::create_dir_all(destination.join("nested"))
+        .await
+        .unwrap();
+    tokio::fs::write(source_root.join("nested").join("a.txt"), b"alpha")
+        .await
+        .unwrap();
+    tokio::fs::write(destination.join("nested").join("a.txt"), b"old")
+        .await
+        .unwrap();
+    zip_directory_to_file(LocalZipOptions::new(&source_root, &source_zip))
+        .await
+        .unwrap();
+
+    let report = unzip_file_to_local(LocalUnzipOptions::new(&source_zip, &destination))
+        .await
+        .unwrap();
+
+    assert_eq!(report.summary.zip_files, 2);
+    assert_eq!(report.summary.uploaded_changed, 1);
+    assert_eq!(report.summary.uploaded_new, 1);
+    assert_eq!(
+        tokio::fs::read(destination.join("nested").join("a.txt"))
+            .await
+            .unwrap(),
+        b"alpha"
+    );
+    assert!(
+        tokio::fs::metadata(destination.join("empty"))
+            .await
+            .unwrap()
+            .is_dir()
+    );
+
+    tokio::fs::remove_dir_all(source_root).await.unwrap();
+    tokio::fs::remove_dir_all(zip_dir).await.unwrap();
+    tokio::fs::remove_dir_all(destination).await.unwrap();
+}
+
+#[tokio::test]
+async fn local_unzip_creates_shared_missing_parent_concurrently() {
+    let zip_dir = unique_temp_dir("unzip-shared-parent-zip");
+    let destination = unique_temp_dir("unzip-shared-parent-destination");
+    let source_zip = zip_dir.join("site.zip");
+    tokio::fs::create_dir_all(&zip_dir).await.unwrap();
+    tokio::fs::create_dir_all(&destination).await.unwrap();
+    let entries = (0..128)
+        .map(|index| {
+            (
+                format!("nested/file-{index}.txt"),
+                Compression::Stored,
+                b"body".as_slice(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let borrowed_entries = entries
+        .iter()
+        .map(|(path, compression, data)| (path.as_str(), *compression, *data))
+        .collect::<Vec<_>>();
+    let zip_bytes = test_zip(&borrowed_entries).await;
+    tokio::fs::write(&source_zip, zip_bytes).await.unwrap();
+    let mut options = LocalUnzipOptions::new(&source_zip, &destination);
+    options.concurrency = 64;
+
+    let report = unzip_file_to_local(options).await.unwrap();
+
+    assert_eq!(report.summary.errors, 0);
+    assert_eq!(report.summary.uploaded_new, 128);
+    for index in 0..128 {
+        assert_eq!(
+            tokio::fs::read(destination.join("nested").join(format!("file-{index}.txt")))
+                .await
+                .unwrap(),
+            b"body"
+        );
+    }
+    tokio::fs::remove_dir_all(zip_dir).await.unwrap();
+    tokio::fs::remove_dir_all(destination).await.unwrap();
+}
+
+#[tokio::test]
+async fn local_unzip_rejects_windows_reserved_path_components() {
+    let zip_dir = unique_temp_dir("unzip-windows-path-zip");
+    let destination = unique_temp_dir("unzip-windows-path-destination");
+    let source_zip = zip_dir.join("site.zip");
+    tokio::fs::create_dir_all(&zip_dir).await.unwrap();
+    tokio::fs::create_dir_all(&destination).await.unwrap();
+    let zip_bytes = test_zip(&[(
+        "nested/name:stream.txt",
+        Compression::Stored,
+        b"body".as_slice(),
+    )])
+    .await;
+    tokio::fs::write(&source_zip, zip_bytes).await.unwrap();
+
+    let err = unzip_file_to_local(LocalUnzipOptions::new(&source_zip, &destination))
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("unsafe local path component"));
+    assert!(
+        tokio::fs::metadata(destination.join("nested"))
+            .await
+            .is_err()
+    );
+    tokio::fs::remove_dir_all(zip_dir).await.unwrap();
+    tokio::fs::remove_dir_all(destination).await.unwrap();
+}
+
+#[tokio::test]
+async fn local_unzip_rejects_source_archive_overwrite() {
+    let root = unique_temp_dir("unzip-source-overwrite");
+    let source_zip = root.join("site.zip");
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let zip_bytes = test_zip(&[("site.zip", Compression::Stored, b"oops".as_slice())]).await;
+    let zip_len = zip_bytes.len() as u64;
+    tokio::fs::write(&source_zip, zip_bytes).await.unwrap();
+
+    let err = unzip_file_to_local(LocalUnzipOptions::new(&source_zip, &root))
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("source archive"));
+    assert_eq!(
+        tokio::fs::metadata(&source_zip).await.unwrap().len(),
+        zip_len
+    );
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn local_unzip_rejects_file_directory_destination_collision() {
+    let zip_dir = unique_temp_dir("unzip-local-collision-zip");
+    let destination = unique_temp_dir("unzip-local-collision-destination");
+    let source_zip = zip_dir.join("site.zip");
+    tokio::fs::create_dir_all(&zip_dir).await.unwrap();
+    tokio::fs::create_dir_all(&destination).await.unwrap();
+    let zip_bytes = test_zip(&[
+        ("same", Compression::Stored, b"file".as_slice()),
+        ("same/", Compression::Stored, b"".as_slice()),
+    ])
+    .await;
+    tokio::fs::write(&source_zip, zip_bytes).await.unwrap();
+
+    let err = unzip_file_to_local(LocalUnzipOptions::new(&source_zip, &destination))
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("same local destination path"));
+    assert!(tokio::fs::metadata(destination.join("same")).await.is_err());
+    tokio::fs::remove_dir_all(zip_dir).await.unwrap();
+    tokio::fs::remove_dir_all(destination).await.unwrap();
+}
+
+#[tokio::test]
+async fn local_unzip_rejects_file_parent_destination_collision() {
+    let zip_dir = unique_temp_dir("unzip-local-parent-collision-zip");
+    let destination = unique_temp_dir("unzip-local-parent-collision-destination");
+    let source_zip = zip_dir.join("site.zip");
+    tokio::fs::create_dir_all(&zip_dir).await.unwrap();
+    tokio::fs::create_dir_all(&destination).await.unwrap();
+    let zip_bytes = test_zip(&[
+        ("same", Compression::Stored, b"file".as_slice()),
+        ("same/child.txt", Compression::Stored, b"child".as_slice()),
+    ])
+    .await;
+    tokio::fs::write(&source_zip, zip_bytes).await.unwrap();
+
+    let err = unzip_file_to_local(LocalUnzipOptions::new(&source_zip, &destination))
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("same local destination path"));
+    assert!(tokio::fs::metadata(destination.join("same")).await.is_err());
+    tokio::fs::remove_dir_all(zip_dir).await.unwrap();
+    tokio::fs::remove_dir_all(destination).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_unzip_rejects_destination_symlink() {
+    let source_root = unique_temp_dir("unzip-symlink-source");
+    let zip_dir = unique_temp_dir("unzip-symlink-zip");
+    let target = unique_temp_dir("unzip-symlink-target");
+    let link = unique_temp_dir("unzip-symlink-link");
+    let source_zip = zip_dir.join("site.zip");
+    tokio::fs::create_dir_all(&source_root).await.unwrap();
+    tokio::fs::create_dir_all(&zip_dir).await.unwrap();
+    tokio::fs::create_dir_all(&target).await.unwrap();
+    tokio::fs::write(source_root.join("a.txt"), b"alpha")
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    zip_directory_to_file(LocalZipOptions::new(&source_root, &source_zip))
+        .await
+        .unwrap();
+
+    let err = unzip_file_to_local(LocalUnzipOptions::new(&source_zip, &link))
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("symbolic link"));
+    tokio::fs::remove_dir_all(source_root).await.unwrap();
+    tokio::fs::remove_dir_all(zip_dir).await.unwrap();
+    tokio::fs::remove_dir_all(target).await.unwrap();
+    tokio::fs::remove_file(link).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_unzip_rejects_destination_parent_symlink() {
+    let source_root = unique_temp_dir("unzip-parent-symlink-source");
+    let zip_dir = unique_temp_dir("unzip-parent-symlink-zip");
+    let target = unique_temp_dir("unzip-parent-symlink-target");
+    let link = unique_temp_dir("unzip-parent-symlink-link");
+    let source_zip = zip_dir.join("site.zip");
+    tokio::fs::create_dir_all(&source_root).await.unwrap();
+    tokio::fs::create_dir_all(&zip_dir).await.unwrap();
+    tokio::fs::create_dir_all(&target).await.unwrap();
+    tokio::fs::write(source_root.join("a.txt"), b"alpha")
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    zip_directory_to_file(LocalZipOptions::new(&source_root, &source_zip))
+        .await
+        .unwrap();
+
+    let err = unzip_file_to_local(LocalUnzipOptions::new(&source_zip, link.join("out")))
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("symbolic link"));
+    tokio::fs::remove_dir_all(source_root).await.unwrap();
+    tokio::fs::remove_dir_all(zip_dir).await.unwrap();
+    tokio::fs::remove_dir_all(target).await.unwrap();
+    tokio::fs::remove_file(link).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_unzip_rejects_existing_destination_under_symlinked_parent() {
+    let source_root = unique_temp_dir("unzip-existing-parent-symlink-source");
+    let zip_dir = unique_temp_dir("unzip-existing-parent-symlink-zip");
+    let target = unique_temp_dir("unzip-existing-parent-symlink-target");
+    let link = unique_temp_dir("unzip-existing-parent-symlink-link");
+    let source_zip = zip_dir.join("site.zip");
+    tokio::fs::create_dir_all(&source_root).await.unwrap();
+    tokio::fs::create_dir_all(&zip_dir).await.unwrap();
+    tokio::fs::create_dir_all(target.join("extract-here"))
+        .await
+        .unwrap();
+    tokio::fs::write(source_root.join("a.txt"), b"alpha")
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    zip_directory_to_file(LocalZipOptions::new(&source_root, &source_zip))
+        .await
+        .unwrap();
+
+    let err = unzip_file_to_local(LocalUnzipOptions::new(
+        &source_zip,
+        link.join("extract-here"),
+    ))
+    .await
+    .unwrap_err();
+
+    assert!(err.to_string().contains("symbolic link"));
+    tokio::fs::remove_dir_all(source_root).await.unwrap();
+    tokio::fs::remove_dir_all(zip_dir).await.unwrap();
+    tokio::fs::remove_dir_all(target).await.unwrap();
+    tokio::fs::remove_file(link).await.unwrap();
+}
+
+#[tokio::test]
 async fn upload_rejects_reserved_catalog_path() {
     let root = unique_temp_dir("zip-upload-reserved");
     tokio::fs::create_dir_all(root.join(".s3-unspool"))
@@ -449,6 +810,60 @@ async fn upload_rejects_reserved_catalog_path() {
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
 
+#[test]
+fn s3_prefix_zip_path_preserves_directory_marker_contract() {
+    let source = S3Prefix::parse("s3://bucket/foo/").unwrap();
+
+    assert_eq!(
+        s3_prefix_zip_path(&source, "foo/bar/", 0).unwrap(),
+        Some(("bar/".to_string(), UploadEntryKind::Directory))
+    );
+    assert_eq!(
+        s3_prefix_zip_path(&source, "foo/empty.txt", 0).unwrap(),
+        Some(("empty.txt".to_string(), UploadEntryKind::File))
+    );
+    assert_eq!(s3_prefix_zip_path(&source, "foo/", 0).unwrap(), None);
+
+    let err = s3_prefix_zip_path(&source, "foo/bar/", 1).unwrap_err();
+    assert!(err.to_string().contains("zero-byte directory markers"));
+
+    let err = s3_prefix_zip_path(&source, "foo/../escape.txt", 0).unwrap_err();
+    assert!(err.to_string().contains("relative path component"));
+}
+
+#[tokio::test]
+async fn s3_prefix_upload_zip_writes_directory_markers() {
+    let entries = vec![UploadEntry {
+        zip_path: "empty/".to_string(),
+        size: 0,
+        source: UploadEntrySource::Directory,
+    }];
+
+    let mut data = Vec::new();
+    let catalog_entries = write_upload_zip(&mut data, &entries, true, None)
+        .await
+        .unwrap();
+
+    assert!(catalog_entries.is_empty());
+    let zip = async_zip::base::read::mem::ZipFileReader::new(data)
+        .await
+        .unwrap();
+    let zip_entries = zip.file().entries().to_vec();
+    assert_eq!(zip_entries.len(), 2);
+    assert_eq!(zip_entries[0].filename().as_str().unwrap(), "empty/");
+    assert_eq!(
+        zip_entries[1].filename().as_str().unwrap(),
+        EMBEDDED_CATALOG_PATH
+    );
+
+    let mut directory = zip.reader_with_entry(0).await.unwrap();
+    let mut directory_bytes = Vec::new();
+    FuturesAsyncReadExt::read_to_end(&mut directory, &mut directory_bytes)
+        .await
+        .unwrap();
+    assert!(directory_bytes.is_empty());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn upload_rejects_symlinked_root_directory() {
@@ -462,6 +877,122 @@ async fn upload_rejects_symlinked_root_directory() {
     assert!(err.to_string().contains("symbolic links"));
     tokio::fs::remove_file(link).await.unwrap();
     tokio::fs::remove_dir_all(target).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_zip_rejects_symlinked_destination_parent() {
+    let source = unique_temp_dir("zip-local-parent-symlink-source");
+    let target = unique_temp_dir("zip-local-parent-symlink-target");
+    let link = unique_temp_dir("zip-local-parent-symlink-link");
+    tokio::fs::create_dir_all(&source).await.unwrap();
+    tokio::fs::create_dir_all(&target).await.unwrap();
+    tokio::fs::write(source.join("a.txt"), b"alpha")
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let err = zip_directory_to_file(LocalZipOptions::new(&source, link.join("site.zip")))
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("symbolic link"));
+    assert!(tokio::fs::metadata(target.join("site.zip")).await.is_err());
+    tokio::fs::remove_dir_all(source).await.unwrap();
+    tokio::fs::remove_dir_all(target).await.unwrap();
+    tokio::fs::remove_file(link).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_zip_rejects_symlinked_destination_ancestor() {
+    let source = unique_temp_dir("zip-local-ancestor-symlink-source");
+    let target = unique_temp_dir("zip-local-ancestor-symlink-target");
+    let link = unique_temp_dir("zip-local-ancestor-symlink-link");
+    tokio::fs::create_dir_all(&source).await.unwrap();
+    tokio::fs::create_dir_all(target.join("nested"))
+        .await
+        .unwrap();
+    tokio::fs::write(source.join("a.txt"), b"alpha")
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let err = zip_directory_to_file(LocalZipOptions::new(&source, link.join("nested/site.zip")))
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("symbolic link"));
+    assert!(
+        tokio::fs::metadata(target.join("nested/site.zip"))
+            .await
+            .is_err()
+    );
+    tokio::fs::remove_dir_all(source).await.unwrap();
+    tokio::fs::remove_dir_all(target).await.unwrap();
+    tokio::fs::remove_file(link).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn s3_prefix_local_zip_rejects_symlinked_destination_parent_before_s3() {
+    let target = unique_temp_dir("zip-s3-parent-symlink-target");
+    let link = unique_temp_dir("zip-s3-parent-symlink-link");
+    tokio::fs::create_dir_all(&target).await.unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(1),
+        zip_s3_prefix_to_file(
+            &dummy_s3_client(),
+            S3PrefixLocalZipOptions::new(
+                S3Prefix::parse("s3://bucket/source/").unwrap(),
+                link.join("site.zip"),
+            ),
+        ),
+    )
+    .await
+    .expect("local path validation should run before any S3 request")
+    .unwrap_err();
+
+    assert!(err.to_string().contains("symbolic link"));
+    assert!(tokio::fs::metadata(target.join("site.zip")).await.is_err());
+    tokio::fs::remove_dir_all(target).await.unwrap();
+    tokio::fs::remove_file(link).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn s3_prefix_local_zip_rejects_symlinked_destination_ancestor_before_s3() {
+    let target = unique_temp_dir("zip-s3-ancestor-symlink-target");
+    let link = unique_temp_dir("zip-s3-ancestor-symlink-link");
+    tokio::fs::create_dir_all(target.join("nested"))
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(1),
+        zip_s3_prefix_to_file(
+            &dummy_s3_client(),
+            S3PrefixLocalZipOptions::new(
+                S3Prefix::parse("s3://bucket/source/").unwrap(),
+                link.join("nested/site.zip"),
+            ),
+        ),
+    )
+    .await
+    .expect("local path validation should run before any S3 request")
+    .unwrap_err();
+
+    assert!(err.to_string().contains("symbolic link"));
+    assert!(
+        tokio::fs::metadata(target.join("nested/site.zip"))
+            .await
+            .is_err()
+    );
+    tokio::fs::remove_dir_all(target).await.unwrap();
+    tokio::fs::remove_file(link).await.unwrap();
 }
 
 #[test]
@@ -894,10 +1425,11 @@ async fn builds_manifest_from_stored_and_deflated_entries() {
         catalog_index: manifest.catalog_index,
     };
 
-    assert_eq!(manifest.entries.len(), 2);
+    assert_eq!(manifest.entries.len(), 3);
     assert_eq!(manifest.entries[0].zip_path, "a.txt");
     assert_eq!(manifest.entries[0].key, "prefix/a.txt");
     assert_eq!(manifest.entries[0].size, 5);
+    assert!(!manifest.entries[0].is_directory);
     assert_eq!(
         manifest.entries[0].catalog_md5.as_deref(),
         Some("2c1743a391305fbf367df8e4f069f9f9")
@@ -905,7 +1437,16 @@ async fn builds_manifest_from_stored_and_deflated_entries() {
     assert_eq!(manifest.entries[1].zip_path, "nested/b.txt");
     assert_eq!(manifest.entries[1].key, "prefix/nested/b.txt");
     assert_eq!(manifest.entries[1].size, 5);
+    assert!(!manifest.entries[1].is_directory);
     assert_eq!(manifest.entries[1].catalog_md5, None);
+    assert_eq!(manifest.entries[2].zip_path, "nested/");
+    assert_eq!(manifest.entries[2].key, "prefix/nested/");
+    assert_eq!(manifest.entries[2].size, 0);
+    assert_eq!(
+        manifest.entries[2].source_span_start,
+        manifest.entries[2].source_span_end
+    );
+    assert!(manifest.entries[2].is_directory);
 
     let stored = reader.file().entries();
     assert_eq!(
@@ -926,6 +1467,59 @@ async fn builds_manifest_from_stored_and_deflated_entries() {
     );
     assert!(manifest.entries[0].source_span_start < manifest.entries[0].source_span_end);
     assert!(manifest.entries[1].source_span_start < manifest.entries[1].source_span_end);
+}
+
+#[tokio::test]
+async fn manifest_rejects_directory_entries_with_nonzero_crc() {
+    let data = test_zip(&[("nested/", Compression::Stored, b"".as_slice())]).await;
+    let data = set_central_crc32(data, "nested/", 1);
+    let source_len = data.len() as u64;
+    let reader = async_zip::base::read::mem::ZipFileReader::new(data)
+        .await
+        .unwrap();
+    let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
+
+    let err =
+        build_manifest_entries(reader.file().entries(), &destination, source_len).unwrap_err();
+
+    assert!(matches!(
+        err,
+        Error::InvalidZipEntry { ref path, ref reason }
+            if path == "nested/" && reason.contains("zero CRC32")
+    ));
+}
+
+#[tokio::test]
+async fn manifest_size_limit_can_be_disabled_for_local_unzip() {
+    let data = test_zip(&[("large.txt", Compression::Stored, b"alpha".as_slice())]).await;
+    let source_len = data.len() as u64;
+    let reader = async_zip::base::read::mem::ZipFileReader::new(data)
+        .await
+        .unwrap();
+    let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
+
+    let err = build_manifest_entries_with_size_limit(
+        reader.file().entries(),
+        &destination,
+        source_len,
+        Some(4),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::EntryTooLarge { ref path, size } if path == "large.txt" && size == 5)
+    );
+
+    let manifest = build_manifest_entries_with_size_limit(
+        reader.file().entries(),
+        &destination,
+        source_len,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(manifest.entries.len(), 1);
+    assert_eq!(manifest.entries[0].zip_path, "large.txt");
+    assert_eq!(manifest.entries[0].size, 5);
 }
 
 #[tokio::test]
@@ -1501,6 +2095,27 @@ fn set_catalog_central_compressed_size(mut data: Vec<u8>, size: u32) -> Vec<u8> 
     data
 }
 
+fn set_central_crc32(mut data: Vec<u8>, path: &str, crc32: u32) -> Vec<u8> {
+    let mut index = 0;
+    while index + 46 <= data.len() {
+        if data[index..index + 4] == [0x50, 0x4b, 0x01, 0x02] {
+            let name_len = u16::from_le_bytes([data[index + 28], data[index + 29]]) as usize;
+            let extra_len = u16::from_le_bytes([data[index + 30], data[index + 31]]) as usize;
+            let comment_len = u16::from_le_bytes([data[index + 32], data[index + 33]]) as usize;
+            let name_start = index + 46;
+            let name_end = name_start + name_len;
+            if name_end <= data.len() && &data[name_start..name_end] == path.as_bytes() {
+                data[index + 16..index + 20].copy_from_slice(&crc32.to_le_bytes());
+                return data;
+            }
+            index = name_end + extra_len + comment_len;
+        } else {
+            index += 1;
+        }
+    }
+    panic!("central directory entry for {path} not found");
+}
+
 fn set_catalog_central_size(data: &mut [u8], field_offset: usize, size: u32) {
     let mut index = 0;
     while index + 46 <= data.len() {
@@ -1537,6 +2152,7 @@ fn manifest_entry(path: &str, size: u64) -> ManifestEntry {
         compression: Compression::Stored,
         crc32: 0,
         catalog_md5: None,
+        is_directory: false,
     }
 }
 
@@ -1587,6 +2203,7 @@ fn manifest_entry_with_span(
         compression: Compression::Stored,
         crc32: 0,
         catalog_md5: None,
+        is_directory: false,
     }
 }
 
