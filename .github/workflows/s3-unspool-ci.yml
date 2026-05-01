@@ -10,6 +10,9 @@ on:
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/s3-unspool/**"
+      - "crates/s3-unspool-cli/**"
+      - "dist-workspace.toml"
+      - "rust-toolchain.toml"
 
 permissions: {}
 
@@ -46,11 +49,20 @@ jobs:
       - name: Run crate tests
         run: cargo test -p s3-unspool
 
+      - name: Run CLI tests
+        run: cargo test -p s3-unspool-cli
+
       - name: Run clippy
         run: cargo clippy -p s3-unspool --all-targets -- -D warnings
+
+      - name: Run CLI clippy
+        run: cargo clippy -p s3-unspool-cli --all-targets -- -D warnings
 
       - name: Build crate documentation
         run: cargo doc -p s3-unspool --no-deps
 
       - name: Verify crate package
         run: cargo package -p s3-unspool
+
+      - name: Verify CLI package manifest
+        run: cargo package -p s3-unspool-cli --list
