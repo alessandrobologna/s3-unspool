@@ -136,6 +136,8 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$PUBLISHING" = "true" ]; then
+            # For GitHub hosting, cargo-dist create renders release hosting URLs;
+            # the actual GitHub Release is created later in the announce job.
             dist host --steps=create --tag="$TAG" --output-format=json > plan-dist-manifest.json
           else
             dist plan --output-format=json > plan-dist-manifest.json
@@ -361,12 +363,12 @@ jobs:
           path: target/distrib/
           merge-multiple: true
 
-      - name: Stage artifacts
+      - name: Render release metadata
         id: host
         shell: bash
         run: |
           set -euo pipefail
-          dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release --output-format=json > dist-manifest.json
+          dist host ${{ needs.plan.outputs.tag-flag }} --steps=check --output-format=json > dist-manifest.json
           cat dist-manifest.json
           manifest="$(jq -c '.' dist-manifest.json)"
           echo "manifest=${manifest}" >> "$GITHUB_OUTPUT"
