@@ -733,54 +733,57 @@ async fn reject_local_zip_destination_parent_symlink_chain(destination_zip: &Pat
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut current = parent;
+    let mut current = Some(parent);
 
-    loop {
-        if current.as_os_str().is_empty() {
+    while let Some(path) = current {
+        if path.as_os_str().is_empty() {
             break;
         }
 
-        match tokio::fs::symlink_metadata(current).await {
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(metadata)
+                if metadata.file_type().is_symlink() && is_platform_path_alias_symlink(path) => {}
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(invalid_local_path(
-                    current,
+                    path,
                     "destination path component cannot be a symbolic link".to_string(),
                 ));
             }
-            Ok(metadata) if metadata.is_dir() => {
-                if current == parent {
-                    return Ok(());
-                }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(invalid_local_path(
+                    path,
+                    "destination path component exists and is not a directory".to_string(),
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Err(invalid_local_path(
                     parent,
                     "destination directory does not exist".to_string(),
                 ));
             }
-            Ok(_) => {
-                return Err(invalid_local_path(
-                    current,
-                    "destination path component exists and is not a directory".to_string(),
-                ));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
                 return Err(invalid_local_path(
-                    current,
+                    path,
                     format!("cannot inspect destination path component: {err}"),
                 ));
             }
         }
 
-        let Some(parent) = current.parent() else {
-            break;
-        };
-        current = parent;
+        current = path.parent();
     }
 
-    Err(invalid_local_path(
-        parent,
-        "destination directory does not exist".to_string(),
-    ))
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn is_platform_path_alias_symlink(path: &Path) -> bool {
+    matches!(path.to_str(), Some("/var") | Some("/tmp") | Some("/etc"))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn is_platform_path_alias_symlink(_path: &Path) -> bool {
+    false
 }
 
 async fn reject_existing_local_zip_destination_symlink_or_directory(

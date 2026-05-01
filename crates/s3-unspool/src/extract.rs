@@ -46,7 +46,9 @@ use crate::report::{
 };
 use crate::s3_uri::{S3Prefix, normalize_etag};
 use crate::source::head_source;
-use crate::upload::{invalid_local_path, replace_temp_file, temp_sibling_path};
+use crate::upload::{
+    invalid_local_path, is_platform_path_alias_symlink, replace_temp_file, temp_sibling_path,
+};
 use crate::zip_manifest::{
     ManifestEntry, load_zip_manifest, normalize_zip_entry_path, validate_crc32_value,
 };
@@ -1735,7 +1737,10 @@ async fn create_destination_directory_no_symlink(destination: &Path) -> Result<(
                 "destination directory cannot be a symbolic link".to_string(),
             ));
         }
-        Ok(metadata) if metadata.is_dir() => return Ok(()),
+        Ok(metadata) if metadata.is_dir() => {
+            validate_existing_directory_chain_no_symlink(destination).await?;
+            return Ok(());
+        }
         Ok(_) => {
             return Err(invalid_local_path(
                 destination,
@@ -1765,7 +1770,10 @@ async fn create_destination_directory_no_symlink(destination: &Path) -> Result<(
                     "destination path component cannot be a symbolic link".to_string(),
                 ));
             }
-            Ok(metadata) if metadata.is_dir() => break,
+            Ok(metadata) if metadata.is_dir() => {
+                validate_existing_directory_chain_no_symlink(parent).await?;
+                break;
+            }
             Ok(_) => {
                 return Err(invalid_local_path(
                     parent,
@@ -1789,6 +1797,42 @@ async fn create_destination_directory_no_symlink(destination: &Path) -> Result<(
         ensure_directory_component(&path).await?;
     }
 
+    Ok(())
+}
+
+async fn validate_existing_directory_chain_no_symlink(path: &Path) -> Result<()> {
+    let mut current = Some(path);
+    while let Some(path) = current {
+        if path.as_os_str().is_empty() {
+            break;
+        }
+
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(metadata)
+                if metadata.file_type().is_symlink() && is_platform_path_alias_symlink(path) => {}
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(invalid_local_path(
+                    path,
+                    "destination path component cannot be a symbolic link".to_string(),
+                ));
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(invalid_local_path(
+                    path,
+                    "destination path component exists and is not a directory".to_string(),
+                ));
+            }
+            Err(err) => {
+                return Err(invalid_local_path(
+                    path,
+                    format!("cannot inspect destination path component: {err}"),
+                ));
+            }
+        }
+
+        current = path.parent();
+    }
     Ok(())
 }
 

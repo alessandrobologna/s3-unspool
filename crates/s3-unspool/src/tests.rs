@@ -759,6 +759,41 @@ async fn local_unzip_rejects_destination_parent_symlink() {
     tokio::fs::remove_file(link).await.unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn local_unzip_rejects_existing_destination_under_symlinked_parent() {
+    let source_root = unique_temp_dir("unzip-existing-parent-symlink-source");
+    let zip_dir = unique_temp_dir("unzip-existing-parent-symlink-zip");
+    let target = unique_temp_dir("unzip-existing-parent-symlink-target");
+    let link = unique_temp_dir("unzip-existing-parent-symlink-link");
+    let source_zip = zip_dir.join("site.zip");
+    tokio::fs::create_dir_all(&source_root).await.unwrap();
+    tokio::fs::create_dir_all(&zip_dir).await.unwrap();
+    tokio::fs::create_dir_all(target.join("extract-here"))
+        .await
+        .unwrap();
+    tokio::fs::write(source_root.join("a.txt"), b"alpha")
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    zip_directory_to_file(LocalZipOptions::new(&source_root, &source_zip))
+        .await
+        .unwrap();
+
+    let err = unzip_file_to_local(LocalUnzipOptions::new(
+        &source_zip,
+        link.join("extract-here"),
+    ))
+    .await
+    .unwrap_err();
+
+    assert!(err.to_string().contains("symbolic link"));
+    tokio::fs::remove_dir_all(source_root).await.unwrap();
+    tokio::fs::remove_dir_all(zip_dir).await.unwrap();
+    tokio::fs::remove_dir_all(target).await.unwrap();
+    tokio::fs::remove_file(link).await.unwrap();
+}
+
 #[tokio::test]
 async fn upload_rejects_reserved_catalog_path() {
     let root = unique_temp_dir("zip-upload-reserved");
@@ -870,6 +905,36 @@ async fn local_zip_rejects_symlinked_destination_parent() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn local_zip_rejects_symlinked_destination_ancestor() {
+    let source = unique_temp_dir("zip-local-ancestor-symlink-source");
+    let target = unique_temp_dir("zip-local-ancestor-symlink-target");
+    let link = unique_temp_dir("zip-local-ancestor-symlink-link");
+    tokio::fs::create_dir_all(&source).await.unwrap();
+    tokio::fs::create_dir_all(target.join("nested"))
+        .await
+        .unwrap();
+    tokio::fs::write(source.join("a.txt"), b"alpha")
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let err = zip_directory_to_file(LocalZipOptions::new(&source, link.join("nested/site.zip")))
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("symbolic link"));
+    assert!(
+        tokio::fs::metadata(target.join("nested/site.zip"))
+            .await
+            .is_err()
+    );
+    tokio::fs::remove_dir_all(source).await.unwrap();
+    tokio::fs::remove_dir_all(target).await.unwrap();
+    tokio::fs::remove_file(link).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn s3_prefix_local_zip_rejects_symlinked_destination_parent_before_s3() {
     let target = unique_temp_dir("zip-s3-parent-symlink-target");
     let link = unique_temp_dir("zip-s3-parent-symlink-link");
@@ -892,6 +957,40 @@ async fn s3_prefix_local_zip_rejects_symlinked_destination_parent_before_s3() {
 
     assert!(err.to_string().contains("symbolic link"));
     assert!(tokio::fs::metadata(target.join("site.zip")).await.is_err());
+    tokio::fs::remove_dir_all(target).await.unwrap();
+    tokio::fs::remove_file(link).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn s3_prefix_local_zip_rejects_symlinked_destination_ancestor_before_s3() {
+    let target = unique_temp_dir("zip-s3-ancestor-symlink-target");
+    let link = unique_temp_dir("zip-s3-ancestor-symlink-link");
+    tokio::fs::create_dir_all(target.join("nested"))
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(1),
+        zip_s3_prefix_to_file(
+            &dummy_s3_client(),
+            S3PrefixLocalZipOptions::new(
+                S3Prefix::parse("s3://bucket/source/").unwrap(),
+                link.join("nested/site.zip"),
+            ),
+        ),
+    )
+    .await
+    .expect("local path validation should run before any S3 request")
+    .unwrap_err();
+
+    assert!(err.to_string().contains("symbolic link"));
+    assert!(
+        tokio::fs::metadata(target.join("nested/site.zip"))
+            .await
+            .is_err()
+    );
     tokio::fs::remove_dir_all(target).await.unwrap();
     tokio::fs::remove_file(link).await.unwrap();
 }
