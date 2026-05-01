@@ -118,7 +118,7 @@ jobs:
         run: |
           set -euo pipefail
           rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
-          cargo install cargo-dist --locked --version "$DIST_VERSION"
+          cargo install cargo-dist --locked --version "$DIST_VERSION" --force
 
       - name: Cache dist
         if: ${{ steps.release.outputs.publishing == 'true' }}
@@ -225,18 +225,12 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
-      - name: Install Rust non-interactively if not already installed
-        if: ${{ matrix.container }}
+      - name: Install dist
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v cargo >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          fi
-
-      - name: Install dist
-        run: ${{ matrix.install_dist.run }}
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          cargo install cargo-dist --locked --version "$DIST_VERSION" --force
 
       - name: Fetch local artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
@@ -460,7 +454,14 @@ jobs:
           set -euo pipefail
           check_absent() {
             crate="$1"
-            status="$(curl -L -sS -o response.json -w "%{http_code}" \
+            status="$(curl -L -sS \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --retry 3 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              -o response.json \
+              -w "%{http_code}" \
               -H "User-Agent: alessandrobologna/s3-unspool release workflow" \
               "https://crates.io/api/v1/crates/${crate}/${VERSION}")"
             if [ "$status" = "200" ]; then
@@ -498,7 +499,14 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in {1..30}; do
-            status="$(curl -L -sS -o response.json -w "%{http_code}" \
+            status="$(curl -L -sS \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --retry 3 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              -o response.json \
+              -w "%{http_code}" \
               -H "User-Agent: alessandrobologna/s3-unspool release workflow" \
               "https://crates.io/api/v1/crates/s3-unspool/${VERSION}")"
             if [ "$status" = "200" ]; then
