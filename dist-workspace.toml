@@ -1,0 +1,19 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+allow-dirty = ["ci"]
+cargo-dist-version = "0.31.0"
+ci = "github"
+installers = []
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"]
+hosting = "github"
+packages = ["s3-unspool-cli"]
+github-release = "announce"
+publish-prereleases = true
+pr-run-mode = "plan"
+
+[dist.github-action-commits]
+"actions/checkout" = "de0fac2e4500dabe0009e67214ff5f5447ce83dd"
+"actions/upload-artifact" = "b7c566a772e6b6bfb58ed0dc250532a479d7789f"
+"actions/download-artifact" = "37930b1c2abaa49bbe596cd826c3c89aef350131"

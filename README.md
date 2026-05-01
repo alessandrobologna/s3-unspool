@@ -91,8 +91,19 @@ cargo add s3-unspool
 ```
 
 The published crate contains the library API. The CLI and Lambda code in this
-repository are development and benchmark tools, not separate published
-artifacts.
+repository are packaged separately: the CLI is available as the pre-release
+`s3-unspool-cli` crate, and the Lambda package remains a development and
+benchmark tool.
+
+Install the CLI with `cargo-binstall` when prebuilt GitHub Release artifacts are
+available:
+
+```sh
+cargo binstall s3-unspool-cli --version 0.1.0-beta.3
+```
+
+The CLI crate name is `s3-unspool-cli`, but the installed command is
+`s3-unspool`.
 
 ## Quick Start
 
@@ -337,8 +348,12 @@ and upload sources cannot contain a file at that path.
 
 ## Command-Line Testing
 
-The repository includes a CLI for trying the same zip and unzip flows from a
-terminal. Build it from a checkout:
+The CLI runs the same zip and unzip flows from a terminal. Install the
+pre-release binary with `cargo-binstall`, or build it from a checkout:
+
+```sh
+cargo binstall s3-unspool-cli --version 0.1.0-beta.3
+```
 
 ```sh
 cargo build --release -p s3-unspool-cli --bin s3-unspool
@@ -611,13 +626,13 @@ with a known mix of file sizes and compressibility.
 | Path | Purpose |
 | --- | --- |
 | `crates/s3-unspool` | Published Rust library crate |
-| `crates/s3-unspool-cli` | Repository CLI for testing and reports |
+| `crates/s3-unspool-cli` | Published pre-release CLI crate; installs `s3-unspool` |
 | `lambda/s3-unspool-lambda` | SAM/Cargo Lambda benchmark harness |
 | `scripts/` | Fixture generation and benchmark helpers |
 | `docs/` | Architecture notes and generated benchmark chart assets |
 
-The CLI and Lambda packages are repository tools. The published crate is
-`s3-unspool`.
+The Lambda package is repository tooling. The published packages are
+`s3-unspool` for the library and `s3-unspool-cli` for the command-line binary.
 
 ## Versioning
 
@@ -626,16 +641,16 @@ identifiers such as `0.1.0-alpha.1`, `0.1.0-beta.1`, or `0.1.0-rc.1`.
 Consumers opt into a pre-release explicitly:
 
 ```sh
-cargo add s3-unspool@0.1.0-beta.2
+cargo add s3-unspool@0.1.0-beta.3
 ```
 
 Releases are published by the manual `Publish s3-unspool` GitHub Actions
-workflow. The workflow reads the version from `crates/s3-unspool/Cargo.toml`,
-publishes with crates.io Trusted Publishing, and creates the matching
-`v<version>` git tag only after `cargo publish` succeeds. Configure the
-`s3-unspool` crate on crates.io to trust this repository's
-`publish-s3-unspool.yml` workflow and the `release` GitHub environment before
-running it.
+workflow. The workflow keeps `s3-unspool` and `s3-unspool-cli` in lockstep,
+builds `cargo-dist` CLI archives for GitHub Releases, publishes the library
+crate first, waits for registry propagation, publishes the CLI crate, and only
+then creates the matching `v<version>` GitHub Release. Configure both crates on
+crates.io to trust this repository's `publish-s3-unspool.yml` workflow and the
+`release` GitHub environment before running it.
 
 ## Assumptions and Limits
 
