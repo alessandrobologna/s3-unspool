@@ -203,7 +203,7 @@ pub fn adaptive_source_window_capacity(
 /// Options for zipping a local directory and uploading it as an S3 object.
 #[derive(Clone)]
 pub struct UploadOptions {
-    /// Local directory whose regular files should be included recursively.
+    /// Local directory whose regular files and empty directories should be included recursively.
     pub source_dir: PathBuf,
     /// Destination ZIP object.
     pub destination: S3Object,
@@ -221,6 +221,204 @@ pub struct UploadOptions {
     pub progress: Option<UploadProgressHandler>,
 }
 
+/// Options for zipping a local directory to a local ZIP file.
+#[derive(Clone)]
+pub struct LocalZipOptions {
+    /// Local directory whose regular files and empty directories should be included recursively.
+    pub source_dir: PathBuf,
+    /// Destination ZIP file path.
+    pub destination_zip: PathBuf,
+    /// Include the embedded update catalog at [`crate::EMBEDDED_CATALOG_PATH`].
+    pub include_catalog: bool,
+    /// Optional progress callback invoked during upload preparation and ZIP streaming.
+    pub progress: Option<UploadProgressHandler>,
+}
+
+/// Options for zipping an S3 prefix and uploading it as an S3 ZIP object.
+#[derive(Clone)]
+pub struct S3PrefixUploadOptions {
+    /// Source prefix whose objects should be included recursively.
+    pub source: S3Prefix,
+    /// Destination ZIP object.
+    pub destination: S3Object,
+    /// Include the embedded update catalog at [`crate::EMBEDDED_CATALOG_PATH`].
+    pub include_catalog: bool,
+    /// Buffer size used when streaming the ZIP body to S3.
+    ///
+    /// Must be greater than zero and no larger than 16 MiB.
+    pub body_chunk_size: usize,
+    /// Capacity of the in-memory pipe between ZIP production and S3 upload.
+    ///
+    /// Must be greater than zero and no larger than 64 MiB.
+    pub pipe_capacity: usize,
+    /// Optional progress callback invoked during source listing and ZIP streaming.
+    pub progress: Option<UploadProgressHandler>,
+}
+
+/// Options for zipping an S3 prefix to a local ZIP file.
+#[derive(Clone)]
+pub struct S3PrefixLocalZipOptions {
+    /// Source prefix whose objects should be included recursively.
+    pub source: S3Prefix,
+    /// Destination ZIP file path.
+    pub destination_zip: PathBuf,
+    /// Include the embedded update catalog at [`crate::EMBEDDED_CATALOG_PATH`].
+    pub include_catalog: bool,
+    /// Optional progress callback invoked during source listing and ZIP streaming.
+    pub progress: Option<UploadProgressHandler>,
+}
+
+/// Options for extracting a local ZIP file into an S3 prefix.
+#[derive(Clone)]
+pub struct LocalZipSyncOptions {
+    /// Source ZIP file path.
+    pub source_zip: PathBuf,
+    /// Destination prefix that receives ZIP entries.
+    pub destination: S3Prefix,
+    /// Delete destination objects under the prefix that are not present in the ZIP.
+    ///
+    /// This option requires a non-empty destination prefix so a bucket root is
+    /// never treated as a sync deletion scope.
+    pub delete_extra: bool,
+    /// Ignore the embedded update catalog even when the ZIP contains one.
+    pub ignore_embedded_catalog: bool,
+    /// Collect one operation record per processed object in the returned report.
+    pub collect_operations: bool,
+    /// Maximum number of ZIP entries processed concurrently.
+    pub concurrency: usize,
+    /// Buffer size used when streaming entry bodies to S3.
+    pub body_chunk_size: usize,
+    /// Capacity of the in-memory pipe between decompression and S3 upload.
+    pub pipe_capacity: usize,
+}
+
+/// Options for extracting an S3 ZIP object into a local directory.
+#[derive(Clone)]
+pub struct S3ZipLocalUnzipOptions {
+    /// Source ZIP object.
+    pub source: S3Object,
+    /// Destination local directory.
+    pub destination_dir: PathBuf,
+    /// Collect source scheduler diagnostics in the returned report.
+    pub collect_diagnostics: bool,
+    /// Ignore the embedded update catalog even when the ZIP contains one.
+    pub ignore_embedded_catalog: bool,
+    /// Collect one operation record per processed entry in the returned report.
+    pub collect_operations: bool,
+    /// Maximum number of ZIP entries processed concurrently.
+    pub concurrency: usize,
+    /// Maximum size for planned source ZIP blocks.
+    pub source_block_size: usize,
+    /// Maximum gap that can be read while coalescing adjacent source spans.
+    pub source_block_merge_gap: usize,
+    /// Maximum number of ranged source `GetObject` requests in flight.
+    pub source_get_concurrency: usize,
+    /// Maximum bytes held by the planned source block window.
+    pub source_window_capacity: usize,
+    /// Available memory budget, in MiB, used to derive the source block window.
+    pub source_window_memory_budget_mb: Option<u64>,
+}
+
+/// Options for extracting a local ZIP file into a local directory.
+#[derive(Clone)]
+pub struct LocalUnzipOptions {
+    /// Source ZIP file path.
+    pub source_zip: PathBuf,
+    /// Destination local directory.
+    pub destination_dir: PathBuf,
+    /// Ignore the embedded update catalog even when the ZIP contains one.
+    pub ignore_embedded_catalog: bool,
+    /// Collect one operation record per processed entry in the returned report.
+    pub collect_operations: bool,
+    /// Maximum number of ZIP entries processed concurrently.
+    pub concurrency: usize,
+}
+
+impl S3PrefixUploadOptions {
+    /// Creates upload options for an S3 source prefix and destination object.
+    pub fn new(source: S3Prefix, destination: S3Object) -> Self {
+        Self {
+            source,
+            destination,
+            include_catalog: true,
+            body_chunk_size: DEFAULT_BODY_CHUNK_SIZE,
+            pipe_capacity: DEFAULT_PIPE_CAPACITY,
+            progress: None,
+        }
+    }
+}
+
+impl LocalZipOptions {
+    /// Creates options for a local source directory and local destination ZIP.
+    pub fn new(source_dir: impl Into<PathBuf>, destination_zip: impl Into<PathBuf>) -> Self {
+        Self {
+            source_dir: source_dir.into(),
+            destination_zip: destination_zip.into(),
+            include_catalog: true,
+            progress: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for LocalZipOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalZipOptions")
+            .field("source_dir", &self.source_dir)
+            .field("destination_zip", &self.destination_zip)
+            .field("include_catalog", &self.include_catalog)
+            .field(
+                "progress",
+                &self.progress.as_ref().map(|_| "UploadProgressHandler"),
+            )
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for S3PrefixUploadOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("S3PrefixUploadOptions")
+            .field("source", &self.source)
+            .field("destination", &self.destination)
+            .field("include_catalog", &self.include_catalog)
+            .field("body_chunk_size", &self.body_chunk_size)
+            .field("pipe_capacity", &self.pipe_capacity)
+            .field(
+                "progress",
+                &self.progress.as_ref().map(|_| "UploadProgressHandler"),
+            )
+            .finish()
+    }
+}
+
+impl S3PrefixLocalZipOptions {
+    /// Creates options for an S3 source prefix and local destination ZIP.
+    pub fn new(source: S3Prefix, destination_zip: impl Into<PathBuf>) -> Self {
+        Self {
+            source,
+            destination_zip: destination_zip.into(),
+            include_catalog: true,
+            progress: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for S3PrefixLocalZipOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("S3PrefixLocalZipOptions")
+            .field("source", &self.source)
+            .field("destination_zip", &self.destination_zip)
+            .field("include_catalog", &self.include_catalog)
+            .field(
+                "progress",
+                &self.progress.as_ref().map(|_| "UploadProgressHandler"),
+            )
+            .finish()
+    }
+}
+
 impl UploadOptions {
     /// Creates upload options for a local source directory and destination object.
     pub fn new(source_dir: impl Into<PathBuf>, destination: S3Object) -> Self {
@@ -232,6 +430,105 @@ impl UploadOptions {
             pipe_capacity: DEFAULT_PIPE_CAPACITY,
             progress: None,
         }
+    }
+}
+
+impl LocalZipSyncOptions {
+    /// Creates extract options for a local source ZIP file and destination prefix.
+    pub fn new(source_zip: impl Into<PathBuf>, destination: S3Prefix) -> Self {
+        Self {
+            source_zip: source_zip.into(),
+            destination,
+            delete_extra: false,
+            ignore_embedded_catalog: false,
+            collect_operations: true,
+            concurrency: DEFAULT_CONCURRENCY,
+            body_chunk_size: DEFAULT_BODY_CHUNK_SIZE,
+            pipe_capacity: DEFAULT_PIPE_CAPACITY,
+        }
+    }
+}
+
+impl std::fmt::Debug for LocalZipSyncOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalZipSyncOptions")
+            .field("source_zip", &self.source_zip)
+            .field("destination", &self.destination)
+            .field("delete_extra", &self.delete_extra)
+            .field("ignore_embedded_catalog", &self.ignore_embedded_catalog)
+            .field("collect_operations", &self.collect_operations)
+            .field("concurrency", &self.concurrency)
+            .field("body_chunk_size", &self.body_chunk_size)
+            .field("pipe_capacity", &self.pipe_capacity)
+            .finish()
+    }
+}
+
+impl S3ZipLocalUnzipOptions {
+    /// Creates extract options for a source ZIP object and local destination directory.
+    pub fn new(source: S3Object, destination_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            source,
+            destination_dir: destination_dir.into(),
+            collect_diagnostics: false,
+            ignore_embedded_catalog: false,
+            collect_operations: true,
+            concurrency: DEFAULT_CONCURRENCY,
+            source_block_size: DEFAULT_SOURCE_BLOCK_SIZE,
+            source_block_merge_gap: DEFAULT_SOURCE_BLOCK_MERGE_GAP,
+            source_get_concurrency: DEFAULT_SOURCE_GET_CONCURRENCY,
+            source_window_capacity: DEFAULT_SOURCE_WINDOW_CAPACITY,
+            source_window_memory_budget_mb: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for S3ZipLocalUnzipOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("S3ZipLocalUnzipOptions")
+            .field("source", &self.source)
+            .field("destination_dir", &self.destination_dir)
+            .field("collect_diagnostics", &self.collect_diagnostics)
+            .field("ignore_embedded_catalog", &self.ignore_embedded_catalog)
+            .field("collect_operations", &self.collect_operations)
+            .field("concurrency", &self.concurrency)
+            .field("source_block_size", &self.source_block_size)
+            .field("source_block_merge_gap", &self.source_block_merge_gap)
+            .field("source_get_concurrency", &self.source_get_concurrency)
+            .field("source_window_capacity", &self.source_window_capacity)
+            .field(
+                "source_window_memory_budget_mb",
+                &self.source_window_memory_budget_mb,
+            )
+            .finish()
+    }
+}
+
+impl LocalUnzipOptions {
+    /// Creates extract options for a source ZIP file and local destination directory.
+    pub fn new(source_zip: impl Into<PathBuf>, destination_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            source_zip: source_zip.into(),
+            destination_dir: destination_dir.into(),
+            ignore_embedded_catalog: false,
+            collect_operations: true,
+            concurrency: DEFAULT_CONCURRENCY,
+        }
+    }
+}
+
+impl std::fmt::Debug for LocalUnzipOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalUnzipOptions")
+            .field("source_zip", &self.source_zip)
+            .field("destination_dir", &self.destination_dir)
+            .field("ignore_embedded_catalog", &self.ignore_embedded_catalog)
+            .field("collect_operations", &self.collect_operations)
+            .field("concurrency", &self.concurrency)
+            .finish()
     }
 }
 
@@ -284,35 +581,35 @@ impl std::fmt::Debug for UploadProgressHandler {
 /// Progress event emitted while preparing and streaming an upload ZIP.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UploadProgress {
-    /// The source directory has been scanned and the total file count is known.
+    /// The source has been scanned and the total entry count is known.
     Planned {
-        /// Total number of files that will be included in the ZIP.
+        /// Total number of files and preserved directory entries included in the ZIP.
         total_files: usize,
         /// Total uncompressed bytes across all files.
         total_bytes: u64,
     },
-    /// A file has started streaming into the ZIP writer.
+    /// A file or preserved directory entry has started streaming into the ZIP writer.
     FileStarted {
-        /// One-based index of the file currently being streamed.
+        /// One-based index of the entry currently being streamed.
         current_file: usize,
-        /// Total number of files that will be included in the ZIP.
+        /// Total number of files and preserved directory entries included in the ZIP.
         total_files: usize,
-        /// Number of files that have finished streaming into the ZIP.
+        /// Number of entries that have finished streaming into the ZIP.
         processed_files: usize,
         /// Uncompressed bytes that have finished streaming into the ZIP.
         processed_bytes: u64,
         /// Total uncompressed bytes across all files.
         total_bytes: u64,
-        /// ZIP path of the file that just started.
+        /// ZIP path of the entry that just started.
         path: String,
     },
     /// A file is still streaming and byte progress has advanced.
     FileProgress {
-        /// One-based index of the file currently being streamed.
+        /// One-based index of the entry currently being streamed.
         current_file: usize,
-        /// Total number of files that will be included in the ZIP.
+        /// Total number of files and preserved directory entries included in the ZIP.
         total_files: usize,
-        /// Number of files that have finished streaming into the ZIP.
+        /// Number of entries that have finished streaming into the ZIP.
         processed_files: usize,
         /// Uncompressed bytes that have streamed into the ZIP producer so far.
         processed_bytes: u64,
@@ -321,17 +618,17 @@ pub enum UploadProgress {
         /// ZIP path of the file currently being streamed.
         path: String,
     },
-    /// One file has finished streaming into the ZIP writer.
+    /// One file or preserved directory entry has finished streaming into the ZIP writer.
     FileFinished {
-        /// Number of files that have finished streaming into the ZIP.
+        /// Number of entries that have finished streaming into the ZIP.
         processed_files: usize,
-        /// Total number of files that will be included in the ZIP.
+        /// Total number of files and preserved directory entries included in the ZIP.
         total_files: usize,
         /// Uncompressed bytes that have finished streaming into the ZIP.
         processed_bytes: u64,
         /// Total uncompressed bytes across all files.
         total_bytes: u64,
-        /// ZIP path of the file that just finished.
+        /// ZIP path of the entry that just finished.
         path: String,
     },
     /// ZIP production has finished writing into the upload pipe.
@@ -339,7 +636,7 @@ pub enum UploadProgress {
     /// S3 multipart upload completion may still be in progress when this event
     /// is emitted.
     Finished {
-        /// Total number of files included in the ZIP.
+        /// Total number of files and preserved directory entries included in the ZIP.
         total_files: usize,
         /// Total uncompressed bytes across all files.
         total_bytes: u64,

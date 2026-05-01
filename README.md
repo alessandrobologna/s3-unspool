@@ -19,19 +19,20 @@ lists the destination prefix once, skips unchanged files when a catalog is
 available, and writes missing or changed files with conditional `PutObject`
 requests.
 
-The crate also includes an upload helper that streams a local directory into a
-cataloged ZIP object in S3. ZIPs produced by that helper can be extracted later
-without decompressing unchanged entries.
+The crate also includes zip helpers that stream either a local directory or an
+existing S3 prefix into a cataloged local or S3 ZIP. ZIPs produced by those
+helpers can be extracted later without decompressing unchanged entries.
 
 ## At a Glance
 
 | Capability | What happens |
 | --- | --- |
-| Full extract | Stream a ZIP object from S3 into an S3 prefix without local archive storage. |
+| Full unzip | Stream a ZIP from local disk or S3 into a local directory or S3 prefix. |
 | Incremental extract | Skip unchanged files before decompression when the ZIP contains the embedded catalog. |
 | Safe overwrite | Use `If-None-Match` for new keys and `If-Match` for changed keys. |
 | Destination scan | Use one `ListObjectsV2` pass; no per-object destination `HeadObject` calls. |
-| Upload helper | Stream a local directory into a cataloged ZIP object with multipart upload. |
+| Zip helpers | Stream a local directory or existing S3 prefix into a cataloged local or S3 ZIP. |
+| Directory markers | Preserve ZIP directory entries and zero-byte S3 folder marker objects for round trips. |
 | Large archive support | Plan source byte ranges and keep only a bounded source block window in memory. |
 
 Use `s3-unspool` when you need to deploy or synchronize many files from a ZIP
@@ -96,8 +97,8 @@ artifacts.
 ## Quick Start
 
 Create an AWS S3 client with the normal AWS SDK configuration. The two core
-library operations are extracting an existing S3 ZIP into an S3 prefix and
-uploading a local directory as a cataloged ZIP for fast future extracts.
+library operations are unzipping an existing ZIP into an S3 prefix and zipping a
+local directory or S3 prefix as a cataloged ZIP for fast future extracts.
 
 ### Extract an S3 ZIP to a Destination Prefix
 
@@ -137,7 +138,8 @@ same ZIP object.
 
 Use `upload_directory_zip_to_s3` when you want `s3-unspool` to create the source
 ZIP. Uploads stream the ZIP into S3 with multipart upload and include the
-embedded catalog by default.
+embedded catalog by default. Empty local directories are written as ZIP
+directory entries so a later extract can recreate them as S3 marker objects.
 
 ```rust
 use aws_config::BehaviorVersion;
@@ -166,6 +168,42 @@ async fn main() -> s3_unspool::Result<()> {
 
 `UploadOptions::include_catalog` is `true` by default. Set it to `false` only
 when you need a plain ZIP without the update-skip catalog.
+
+### Upload an S3 Prefix as a Cataloged ZIP
+
+Use `zip_s3_prefix_to_s3` when the source files already live in S3 and you want
+to snapshot them into a ZIP object without downloading them locally. Source
+objects are streamed with `GetObject`, and the destination ZIP is written with
+multipart upload.
+
+```rust
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::Client;
+use s3_unspool::{S3Object, S3Prefix, S3PrefixUploadOptions, zip_s3_prefix_to_s3};
+
+#[tokio::main]
+async fn main() -> s3_unspool::Result<()> {
+    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let client = Client::new(&config);
+
+    let upload = S3PrefixUploadOptions::new(
+        S3Prefix::parse("s3://my-bucket/www/")?,
+        S3Object::parse("s3://my-bucket/releases/site.zip")?,
+    );
+    let report = zip_s3_prefix_to_s3(&client, upload).await?;
+
+    println!(
+        "uploaded {} files and {} directories into {} bytes",
+        report.files, report.directories, report.zip_bytes
+    );
+
+    Ok(())
+}
+```
+
+The destination ZIP object cannot be inside the listed source prefix. That
+prevents an existing archive from being accidentally included in the new
+archive.
 
 ### Source and Destination Clients
 
@@ -236,6 +274,21 @@ Library callers that prefer all-or-nothing behavior can set
 observed conditional conflict returns an error and the run stops before
 deleting extra destination objects.
 
+### Directory Marker Policy
+
+ZIP directory entries and S3 folder marker objects are preserved explicitly:
+
+- A ZIP directory entry such as `assets/empty/` extracts to a zero-byte S3
+  object with the same trailing-slash key.
+- An empty local directory uploads as a ZIP directory entry.
+- A zero-byte S3 object whose key ends in `/` uploads as a ZIP directory entry.
+- A zero-byte S3 object whose key does not end in `/` uploads as a regular file
+  entry.
+- A nonzero S3 object whose key ends in `/` is rejected as ambiguous.
+
+This policy makes empty directories round-trip through ZIP -> S3 -> ZIP instead
+of disappearing silently.
+
 ## Required S3 Permissions
 
 Extraction needs:
@@ -247,6 +300,14 @@ Extraction needs:
 | Destination prefix | `s3:PutObject` | Write missing and changed objects. |
 | Destination prefix | `s3:GetObject` | Authorize conditional overwrites with `If-Match`. |
 | Destination prefix | `s3:DeleteObject` | Only needed when `delete_extra` is enabled. |
+
+S3-prefix upload needs:
+
+| Scope | Permission | Why |
+| --- | --- | --- |
+| Source bucket | `s3:ListBucket` | List source keys, sizes, and ETags. |
+| Source prefix | `s3:GetObject` | Stream each source object into the ZIP. |
+| Destination ZIP object | `s3:PutObject`, `s3:AbortMultipartUpload` | Write the generated ZIP with multipart upload and clean up failed uploads. |
 
 The destination `s3:GetObject` permission is required even though
 `s3-unspool` does not issue per-file destination `HeadObject` requests or read
@@ -276,8 +337,8 @@ and upload sources cannot contain a file at that path.
 
 ## Command-Line Testing
 
-The repository includes a CLI for trying the same upload and extract flows from
-a terminal. Build it from a checkout:
+The repository includes a CLI for trying the same zip and unzip flows from a
+terminal. Build it from a checkout:
 
 ```sh
 cargo build --release -p s3-unspool-cli --bin s3-unspool
@@ -287,21 +348,34 @@ During development, commands can be run through Cargo:
 
 ```sh
 cargo run -p s3-unspool-cli -- \
-  upload ./site s3://my-bucket/releases/site.zip
+  zip ./site s3://my-bucket/releases/site.zip
 
 cargo run -p s3-unspool-cli -- \
-  extract s3://my-bucket/releases/site.zip s3://my-bucket/www/
+  unzip s3://my-bucket/releases/site.zip s3://my-bucket/www/
 ```
 
 The built binary is `./target/release/s3-unspool`:
 
 ```sh
-./target/release/s3-unspool extract \
+./target/release/s3-unspool unzip \
   s3://my-bucket/releases/site.zip \
   s3://my-bucket/www/
 ```
 
-Useful extract options:
+Supported endpoint combinations:
+
+```sh
+s3-unspool zip   ./site                  ./site.zip
+s3-unspool zip   ./site                  s3://my-bucket/site.zip
+s3-unspool zip   s3://my-bucket/www/     ./site.zip
+s3-unspool zip   s3://my-bucket/www/     s3://my-bucket/site.zip
+s3-unspool unzip ./site.zip              ./site
+s3-unspool unzip ./site.zip              s3://my-bucket/www/
+s3-unspool unzip s3://my-bucket/site.zip ./site
+s3-unspool unzip s3://my-bucket/site.zip s3://my-bucket/www/
+```
+
+Useful unzip options:
 
 - `--delete-extra`: delete destination objects under the prefix that are not in
   the ZIP.
@@ -309,8 +383,9 @@ Useful extract options:
   default is `64`.
 - `--report`: add a formatted operation report to the CLI transcript.
 - `--report=PATH`: write the JSON operation report to a file.
-- `--diagnostics`: add source scheduler, ranged `GetObject`, block cache, and
-  destination `PutObject` retry counters to the JSON report.
+- `--diagnostics`: for `s3://` ZIP sources, add source scheduler, ranged
+  `GetObject`, block cache, and, when unzipping to S3, destination `PutObject`
+  retry counters to the JSON report.
 - `--ignore-catalog`: ignore `.s3-unspool/catalog.v1.json` and compare existing
   destination objects by extracting and hashing each ZIP entry.
 
@@ -321,11 +396,11 @@ Global CLI options:
 
 ## CLI Output and Reports
 
-Interactive upload and extract commands show a single-line spinner with elapsed
+Interactive zip and unzip commands show a single-line spinner with elapsed
 time and progress where available:
 
 ```text
-• Uploading 00:03 [█████▍            ] 30% 18 MiB/512 MiB file 42/1000
+• Zipping 00:03 [█████▍            ] 30% 18 MiB/512 MiB file 42/1000
 ```
 
 The spinner is written to stderr, clears itself before the final summary, and is
@@ -334,7 +409,7 @@ disabled by `--quiet` or non-interactive output.
 Use bare `--report` to expand the final human-readable transcript:
 
 ```sh
-s3-unspool extract \
+s3-unspool unzip \
   --diagnostics \
   --report \
   s3://my-bucket/releases/site.zip \
@@ -344,25 +419,26 @@ s3-unspool extract \
 Use `--report=PATH` when you want JSON for automation:
 
 ```sh
-s3-unspool extract \
+s3-unspool unzip \
   --report=report.json \
   s3://my-bucket/releases/site.zip \
   s3://my-bucket/www/
 ```
 
-Formatted upload reports contain the source directory, destination ZIP object,
-file count, uncompressed bytes, uploaded ZIP bytes, wall time, and upload speed
+Formatted zip reports contain the source tree, destination ZIP, file and
+directory counts, uncompressed bytes, ZIP bytes, wall time, and zip speed
 in MiB/s.
 
-Extract reports contain:
+Unzip reports contain:
 
 - `summary`: totals for uploaded, skipped, conflicted, deleted, and errored
   objects.
 - `operations`: one record per relevant object.
-- `diagnostics`: optional source scheduler, block cache, and failed/retried
-  `PutObject` counters when diagnostics are enabled.
+- `diagnostics`: optional source scheduler and block cache counters when
+  diagnostics are enabled for `s3://` ZIP sources, plus failed/retried
+  `PutObject` counters when the destination is S3.
 
-Example extract summary:
+Example unzip summary:
 
 ```json
 {
@@ -517,14 +593,14 @@ scripts/mutate-fixture.py ./tmp/fixture ./tmp/fixture-10pct \
   --clean
 ```
 
-Upload and extract the fixtures:
+Zip and unzip the fixtures:
 
 ```sh
-s3-unspool upload ./tmp/fixture s3://my-bucket/fixtures/fixture.zip
-s3-unspool extract s3://my-bucket/fixtures/fixture.zip s3://my-bucket/fixture-out/
+s3-unspool zip ./tmp/fixture s3://my-bucket/fixtures/fixture.zip
+s3-unspool unzip s3://my-bucket/fixtures/fixture.zip s3://my-bucket/fixture-out/
 
-s3-unspool upload ./tmp/fixture-10pct s3://my-bucket/fixtures/fixture-10pct.zip
-s3-unspool extract s3://my-bucket/fixtures/fixture-10pct.zip s3://my-bucket/fixture-out/
+s3-unspool zip ./tmp/fixture-10pct s3://my-bucket/fixtures/fixture-10pct.zip
+s3-unspool unzip s3://my-bucket/fixtures/fixture-10pct.zip s3://my-bucket/fixture-out/
 ```
 
 Use these scripts to compare full deploys, no-op deploys, and update deploys
@@ -565,14 +641,17 @@ running it.
 
 - The crate is built for Rust 1.95 and edition 2024.
 - ZIP extraction supports Stored and Deflate entries.
-- Upload sources must be local directories.
-- Upload includes regular files recursively.
+- Local zip sources must be local directories and include regular files plus
+  empty directories recursively.
+- S3-prefix zip sources include regular objects and zero-byte trailing-slash
+  directory marker objects recursively.
 - Symbolic links and other special files are rejected.
-- Upload paths must be UTF-8 and cannot contain backslashes.
+- Zip source paths must be UTF-8 and cannot contain backslashes.
 - ZIP entry paths must be relative UTF-8 paths with no absolute roots, `..`,
   empty components, Windows drive prefixes, or backslashes.
-- Upload sources cannot contain `.s3-unspool/catalog.v1.json`.
-- Source ZIP uploads use S3 multipart upload so the archive can be streamed once
+- Zip sources cannot contain `.s3-unspool/catalog.v1.json`.
+- S3-prefix zip rejects nonzero objects whose keys end in `/`.
+- S3 ZIP destinations use S3 multipart upload so the archive can be streamed once
   without precomputing its final compressed size.
 - Destination objects are assumed to be written by this tool or by equivalent
   single-part `PutObject` writes.

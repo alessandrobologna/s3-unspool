@@ -13,6 +13,12 @@ use crate::error::{Error, Result};
 use crate::range::{S3RangeReader, SourceClient};
 use crate::s3_uri::S3Prefix;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ZipEntryPath {
+    pub(crate) path: String,
+    pub(crate) is_directory: bool,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ManifestEntry {
     /// Local-file-header offset used to seek directly to this ZIP entry.
@@ -28,6 +34,7 @@ pub(crate) struct ManifestEntry {
     pub(crate) compression: Compression,
     pub(crate) crc32: u32,
     pub(crate) catalog_md5: Option<String>,
+    pub(crate) is_directory: bool,
 }
 
 #[derive(Clone)]
@@ -46,11 +53,17 @@ pub(crate) async fn load_zip_manifest(
     destination: &S3Prefix,
     ignore_embedded_catalog: bool,
     source_block_size: usize,
+    entry_size_limit: Option<u64>,
 ) -> Result<ZipManifest> {
     let reader = S3RangeReader::new(Arc::clone(&source), source_block_size);
     let reader = ZipFileReader::with_tokio(reader).await?;
     let zip_file = reader.file().clone();
-    let build = build_manifest_entries(zip_file.entries(), destination, source.len)?;
+    let build = build_manifest_entries_with_size_limit(
+        zip_file.entries(),
+        destination,
+        source.len,
+        entry_size_limit,
+    )?;
     let catalog = if ignore_embedded_catalog {
         HashMap::new()
     } else {
@@ -66,10 +79,25 @@ pub(crate) async fn load_zip_manifest(
     Ok(ZipManifest { entries })
 }
 
+#[cfg(test)]
 pub(crate) fn build_manifest_entries(
     entries: &[StoredZipEntry],
     destination: &S3Prefix,
     source_len: u64,
+) -> Result<ManifestBuild> {
+    build_manifest_entries_with_size_limit(
+        entries,
+        destination,
+        source_len,
+        Some(S3_SINGLE_PUT_LIMIT),
+    )
+}
+
+pub(crate) fn build_manifest_entries_with_size_limit(
+    entries: &[StoredZipEntry],
+    destination: &S3Prefix,
+    source_len: u64,
+    entry_size_limit: Option<u64>,
 ) -> Result<ManifestBuild> {
     let mut seen = HashSet::new();
     let mut manifest = Vec::new();
@@ -81,16 +109,16 @@ pub(crate) fn build_manifest_entries(
     source_offsets.sort_unstable();
 
     for (index, stored) in entries.iter().enumerate() {
-        let Some(zip_path) = stored_zip_file_path(stored)? else {
-            continue;
-        };
+        let zip_entry_path = stored_zip_entry_path(stored)?;
+        let zip_path = zip_entry_path.path;
+        let is_directory = zip_entry_path.is_directory;
 
-        if zip_path == EMBEDDED_CATALOG_PATH {
+        if !is_directory && zip_path == EMBEDDED_CATALOG_PATH {
             catalog_index = Some(index);
             continue;
         }
 
-        validate_stored_file_entry(stored, &zip_path)?;
+        validate_stored_entry(stored, &zip_path, is_directory, entry_size_limit)?;
         if !seen.insert(zip_path.clone()) {
             return Err(Error::DuplicateZipPath(zip_path));
         }
@@ -121,6 +149,22 @@ pub(crate) fn build_manifest_entries(
                 ),
             });
         }
+        if is_directory {
+            manifest.push(ManifestEntry {
+                source_offset: source_span_start,
+                source_span_start,
+                source_span_end: source_span_start,
+                zip_path,
+                key,
+                size,
+                compressed_size: stored.compressed_size(),
+                compression: stored.compression(),
+                crc32: stored.crc32(),
+                catalog_md5: None,
+                is_directory,
+            });
+            continue;
+        }
         let source_span_end = next_source_offset(&source_offsets, source_span_start)
             .unwrap_or(payload_span_end)
             .min(payload_span_end);
@@ -143,6 +187,7 @@ pub(crate) fn build_manifest_entries(
             compression: stored.compression(),
             crc32: stored.crc32(),
             catalog_md5: None,
+            is_directory,
         });
     }
 
@@ -158,15 +203,17 @@ pub(crate) fn count_zip_file_entries(entries: &[StoredZipEntry]) -> Result<usize
     let mut count = 0_usize;
 
     for stored in entries {
-        let Some(zip_path) = stored_zip_file_path(stored)? else {
+        let zip_entry_path = stored_zip_entry_path(stored)?;
+        if zip_entry_path.is_directory {
             continue;
         };
+        let zip_path = zip_entry_path.path;
 
         if zip_path == EMBEDDED_CATALOG_PATH {
             continue;
         }
 
-        validate_stored_file_entry(stored, &zip_path)?;
+        validate_stored_entry(stored, &zip_path, false, Some(S3_SINGLE_PUT_LIMIT))?;
         if !seen.insert(zip_path.clone()) {
             return Err(Error::DuplicateZipPath(zip_path));
         }
@@ -176,7 +223,7 @@ pub(crate) fn count_zip_file_entries(entries: &[StoredZipEntry]) -> Result<usize
     Ok(count)
 }
 
-fn stored_zip_file_path(stored: &StoredZipEntry) -> Result<Option<String>> {
+fn stored_zip_entry_path(stored: &StoredZipEntry) -> Result<ZipEntryPath> {
     let raw_path = stored
         .filename()
         .as_str()
@@ -185,10 +232,31 @@ fn stored_zip_file_path(stored: &StoredZipEntry) -> Result<Option<String>> {
             reason: err.to_string(),
         })?;
 
-    normalize_zip_file_path(raw_path)
+    normalize_zip_entry_path(raw_path)
 }
 
-fn validate_stored_file_entry(stored: &StoredZipEntry, zip_path: &str) -> Result<()> {
+fn validate_stored_entry(
+    stored: &StoredZipEntry,
+    zip_path: &str,
+    is_directory: bool,
+    entry_size_limit: Option<u64>,
+) -> Result<()> {
+    if is_directory {
+        if stored.uncompressed_size() != 0 || stored.compressed_size() != 0 {
+            return Err(Error::InvalidZipEntry {
+                path: zip_path.to_string(),
+                reason: "directory entries must be zero length".to_string(),
+            });
+        }
+        if stored.crc32() != 0 {
+            return Err(Error::InvalidZipEntry {
+                path: zip_path.to_string(),
+                reason: "directory entries must have a zero CRC32".to_string(),
+            });
+        }
+        return Ok(());
+    }
+
     match stored.compression() {
         Compression::Stored | Compression::Deflate => {}
         other => {
@@ -200,7 +268,9 @@ fn validate_stored_file_entry(stored: &StoredZipEntry, zip_path: &str) -> Result
     }
 
     let size = stored.uncompressed_size();
-    if size > S3_SINGLE_PUT_LIMIT {
+    if let Some(limit) = entry_size_limit
+        && size > limit
+    {
         return Err(Error::EntryTooLarge {
             path: zip_path.to_string(),
             size,
@@ -308,6 +378,15 @@ pub(crate) fn next_source_offset(sorted_offsets: &[u64], offset: u64) -> Option<
 }
 
 pub(crate) fn normalize_zip_file_path(raw_path: &str) -> Result<Option<String>> {
+    let entry_path = normalize_zip_entry_path(raw_path)?;
+    if entry_path.is_directory {
+        Ok(None)
+    } else {
+        Ok(Some(entry_path.path))
+    }
+}
+
+pub(crate) fn normalize_zip_entry_path(raw_path: &str) -> Result<ZipEntryPath> {
     if raw_path.is_empty() {
         return Err(Error::InvalidZipEntry {
             path: raw_path.to_string(),
@@ -364,9 +443,15 @@ pub(crate) fn normalize_zip_file_path(raw_path: &str) -> Result<Option<String>> 
     }
 
     if is_directory {
-        Ok(None)
+        Ok(ZipEntryPath {
+            path: format!("{trimmed}/"),
+            is_directory: true,
+        })
     } else {
-        Ok(Some(trimmed.to_string()))
+        Ok(ZipEntryPath {
+            path: trimmed.to_string(),
+            is_directory: false,
+        })
     }
 }
 

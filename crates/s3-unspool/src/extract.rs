@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use async_zip::tokio::read::fs::ZipFileReader;
+use async_zip::{Compression, StoredZipEntry};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::put_object::PutObjectError;
@@ -16,26 +19,37 @@ use futures_util::stream::{self, StreamExt};
 use http_body::Frame;
 use http_body_util::StreamBody;
 use md5::{Digest, Md5};
+use tokio::io::AsyncRead;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
 
+use crate::catalog::{EmbeddedCatalog, catalog_md5_by_path};
+use crate::constants::{EMBEDDED_CATALOG_MAX_BYTES, EMBEDDED_CATALOG_PATH};
 use crate::constants::{MAX_BODY_CHUNK_SIZE, MAX_PIPE_CAPACITY};
 use crate::entry_reader::{EntryReader, entry_reader};
 use crate::error::{Error, Result, aws_error_context, aws_error_message};
-use crate::options::{PutRetryPolicy, RetryJitter, SyncOptions, adaptive_source_window_capacity};
+use crate::options::{
+    LocalUnzipOptions, LocalZipSyncOptions, PutRetryPolicy, RetryJitter, S3ZipLocalUnzipOptions,
+    SyncOptions, adaptive_source_window_capacity,
+};
 use crate::range::{
     BlockStore, SourceClient, SourceDiagnosticsCollector, plan_source_blocks,
     start_source_scheduler,
 };
 use crate::report::{
-    ObjectReport, OperationStatus, PutDiagnostics, PutRetryDiagnostics, SyncDiagnostics,
-    SyncReport, SyncSummary, summarize_operation,
+    LocalUnzipDiagnostics, LocalUnzipReport, LocalZipToS3Report, ObjectReport, OperationStatus,
+    PutDiagnostics, PutRetryDiagnostics, SyncDiagnostics, SyncReport, SyncSummary,
+    summarize_operation,
 };
 use crate::s3_uri::{S3Prefix, normalize_etag};
 use crate::source::head_source;
-use crate::zip_manifest::{ManifestEntry, load_zip_manifest, validate_crc32_value};
+use crate::upload::{invalid_local_path, replace_temp_file, temp_sibling_path};
+use crate::zip_manifest::{
+    ManifestEntry, load_zip_manifest, normalize_zip_entry_path, validate_crc32_value,
+};
 
 const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const PUT_OBJECT_PRODUCER_ERROR_GRACE: Duration = Duration::from_millis(25);
@@ -380,6 +394,7 @@ pub async fn sync_zip_to_s3_with_clients(
         &options.destination,
         options.ignore_embedded_catalog,
         options.source_block_size,
+        Some(crate::constants::S3_SINGLE_PUT_LIMIT),
     )
     .await?;
     resolve_source_window_capacity(&mut options, source_head.len, manifest.entries.len());
@@ -619,6 +634,1530 @@ pub async fn sync_zip_to_s3_with_clients(
     Ok(report)
 }
 
+/// Extracts a local ZIP file into an S3 prefix.
+///
+/// Entries are streamed from the local ZIP file and written to S3 with
+/// conditional `PutObject` requests after listing the destination prefix.
+pub async fn unzip_file_to_s3(
+    client: &Client,
+    options: LocalZipSyncOptions,
+) -> Result<LocalZipToS3Report> {
+    validate_local_zip_sync_options(&options)?;
+    let reader = open_local_zip_reader(&options.source_zip).await?;
+    let source_len = tokio::fs::metadata(&options.source_zip).await?.len();
+    let mut entries = local_zip_entries_for_s3(
+        reader.file().entries(),
+        &options.destination,
+        source_len,
+        true,
+    )?;
+    if !options.ignore_embedded_catalog {
+        let catalog = load_local_embedded_catalog(&reader, entries.catalog_index).await;
+        apply_local_catalog(&mut entries.entries, catalog);
+    }
+
+    let destination_objects = list_destination(client, &options.destination).await?;
+    let expected_keys = options.delete_extra.then(|| {
+        entries
+            .entries
+            .iter()
+            .map(|entry| entry.destination.clone())
+            .collect::<HashSet<_>>()
+    });
+    let total_entries = entries.entries.len();
+    let mut summary = SyncSummary {
+        zip_files: total_entries,
+        destination_objects: destination_objects.len(),
+        ..SyncSummary::default()
+    };
+    let mut operations = Vec::new();
+
+    let mut stream = stream::iter(entries.entries)
+        .map(|entry| {
+            unzip_local_entry_to_s3(client, &reader, entry, &destination_objects, &options)
+        })
+        .buffer_unordered(options.concurrency);
+
+    while let Some(operation) = stream.next().await {
+        summarize_operation(&mut summary, &operation);
+        if options.collect_operations {
+            operations.push(operation);
+        }
+    }
+    drop(stream);
+
+    if options.delete_extra {
+        let expected_keys = expected_keys.expect("delete-extra expected keys are prepared");
+        let extras = destination_objects
+            .keys()
+            .filter(|key| !expected_keys.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for operation in delete_extra_objects(client, &options.destination, extras).await {
+            summarize_operation(&mut summary, &operation);
+            if options.collect_operations {
+                operations.push(operation);
+            }
+        }
+    }
+
+    Ok(LocalZipToS3Report {
+        source_zip: options.source_zip.display().to_string(),
+        destination: options.destination,
+        summary,
+        operations,
+    })
+}
+
+/// Extracts an S3 ZIP object into a local directory.
+///
+/// Existing local files are overwritten, ZIP directory entries are created as
+/// local directories, and extra local files are left untouched.
+pub async fn unzip_s3_zip_to_local(
+    client: &Client,
+    mut options: S3ZipLocalUnzipOptions,
+) -> Result<LocalUnzipReport> {
+    validate_s3_zip_local_unzip_options(&options)?;
+    let destination_root = prepare_local_destination_root(&options.destination_dir).await?;
+    let started = Instant::now();
+    let source_head = head_source(client, &options.source).await?;
+    let diagnostics = options
+        .collect_diagnostics
+        .then(|| Arc::new(SourceDiagnosticsCollector::new(source_head.len)));
+    let source = Arc::new(SourceClient {
+        client: client.clone(),
+        bucket: options.source.bucket.clone(),
+        key: options.source.key.clone(),
+        len: source_head.len,
+        etag: source_head.etag,
+        diagnostics: diagnostics.clone(),
+    });
+    let local_destination = S3Prefix {
+        bucket: "__local__".to_string(),
+        prefix: String::new(),
+    };
+    let manifest = load_zip_manifest(
+        Arc::clone(&source),
+        &local_destination,
+        options.ignore_embedded_catalog,
+        options.source_block_size,
+        None,
+    )
+    .await?;
+    resolve_s3_zip_local_window_capacity(&mut options, source_head.len, manifest.entries.len());
+    validate_s3_zip_local_source_range_options(&options, source_head.len)?;
+
+    let entries = manifest.entries;
+    validate_local_destination_zip_paths(entries.iter().map(|entry| entry.zip_path.as_str()))?;
+    let destination_case_insensitive =
+        destination_uses_case_insensitive_paths(&destination_root).await?;
+    validate_local_destination_path_collisions(
+        entries
+            .iter()
+            .map(|entry| (entry.zip_path.as_str(), entry.is_directory)),
+        destination_case_insensitive,
+    )?;
+    let total_entries = entries.len();
+    let progress = Arc::new(ExtractProgress::new(total_entries));
+    let sync_options = local_unzip_source_sync_options(&options);
+    let (store, scheduler) = start_source_phase(
+        Arc::clone(&source),
+        &entries,
+        &sync_options,
+        source_head.len,
+        diagnostics.clone(),
+    );
+    let mut summary = SyncSummary {
+        zip_files: total_entries,
+        ..SyncSummary::default()
+    };
+    let mut operations = if options.collect_operations {
+        Vec::with_capacity(entries.len())
+    } else {
+        Vec::new()
+    };
+    let mut stream = stream::iter(entries)
+        .map(|entry| {
+            let store = Arc::clone(&store);
+            let destination_root = destination_root.clone();
+            async move { unzip_s3_entry_to_local(store, entry, destination_root).await }
+        })
+        .buffer_unordered(options.concurrency);
+
+    while let Some(operation) = stream.next().await {
+        progress.record_operation(&operation);
+        summarize_operation(&mut summary, &operation);
+        if options.collect_operations {
+            operations.push(operation);
+        }
+    }
+    let _ = scheduler.await;
+
+    progress.log_progress(
+        diagnostics.as_deref(),
+        None,
+        started.elapsed(),
+        "local unzip completed",
+    );
+
+    Ok(LocalUnzipReport {
+        source_zip: options.source.uri(),
+        destination_dir: options.destination_dir.display().to_string(),
+        summary,
+        diagnostics: diagnostics.map(|diagnostics| LocalUnzipDiagnostics {
+            concurrency: options.concurrency,
+            source_block_size: options.source_block_size,
+            source_block_merge_gap: options.source_block_merge_gap,
+            source_get_concurrency: options.source_get_concurrency,
+            source_window_capacity: options.source_window_capacity,
+            source: diagnostics.snapshot(),
+        }),
+        operations,
+    })
+}
+
+/// Extracts a local ZIP file into a local directory.
+///
+/// Existing local files are overwritten, ZIP directory entries are created as
+/// local directories, and extra local files are left untouched.
+pub async fn unzip_file_to_local(options: LocalUnzipOptions) -> Result<LocalUnzipReport> {
+    validate_local_unzip_options(&options)?;
+    let destination_root = prepare_local_destination_root(&options.destination_dir).await?;
+    let reader = open_local_zip_reader(&options.source_zip).await?;
+    let source_len = tokio::fs::metadata(&options.source_zip).await?.len();
+    let entries = local_zip_entries_for_local(reader.file().entries(), source_len, false)?.entries;
+    validate_local_destination_zip_paths(entries.iter().map(|entry| entry.zip_path.as_str()))?;
+    let destination_case_insensitive =
+        destination_uses_case_insensitive_paths(&destination_root).await?;
+    validate_local_destination_path_collisions(
+        entries
+            .iter()
+            .map(|entry| (entry.zip_path.as_str(), entry.is_directory)),
+        destination_case_insensitive,
+    )?;
+    reject_local_unzip_source_archive_target(&options.source_zip, &destination_root, &entries)
+        .await?;
+    let total_entries = entries.len();
+    let mut summary = SyncSummary {
+        zip_files: total_entries,
+        ..SyncSummary::default()
+    };
+    let mut operations = Vec::new();
+
+    let mut stream = stream::iter(entries)
+        .map(|entry| unzip_local_entry_to_local(&reader, entry, &destination_root))
+        .buffer_unordered(options.concurrency);
+
+    while let Some(operation) = stream.next().await {
+        summarize_operation(&mut summary, &operation);
+        if options.collect_operations {
+            operations.push(operation);
+        }
+    }
+    drop(stream);
+
+    Ok(LocalUnzipReport {
+        source_zip: options.source_zip.display().to_string(),
+        destination_dir: options.destination_dir.display().to_string(),
+        summary,
+        diagnostics: None,
+        operations,
+    })
+}
+
+type LocalZipReader = ZipFileReader;
+
+#[derive(Clone, Debug)]
+struct LocalZipEntry {
+    index: usize,
+    zip_path: String,
+    destination: String,
+    size: u64,
+    compressed_size: u64,
+    compression: Compression,
+    crc32: u32,
+    catalog_md5: Option<String>,
+    is_directory: bool,
+}
+
+struct LocalZipEntries {
+    entries: Vec<LocalZipEntry>,
+    catalog_index: Option<usize>,
+}
+
+async fn open_local_zip_reader(path: &Path) -> Result<LocalZipReader> {
+    ZipFileReader::new(path)
+        .await
+        .map_err(|err| invalid_local_path(path, format!("cannot open ZIP file: {err}")))
+}
+
+fn local_zip_entries_for_s3(
+    stored_entries: &[StoredZipEntry],
+    destination: &S3Prefix,
+    source_len: u64,
+    enforce_s3_limit: bool,
+) -> Result<LocalZipEntries> {
+    local_zip_entries(stored_entries, source_len, enforce_s3_limit, |zip_path| {
+        destination.join_key(zip_path)
+    })
+}
+
+fn local_zip_entries_for_local(
+    stored_entries: &[StoredZipEntry],
+    source_len: u64,
+    enforce_s3_limit: bool,
+) -> Result<LocalZipEntries> {
+    local_zip_entries(stored_entries, source_len, enforce_s3_limit, str::to_string)
+}
+
+fn local_zip_entries(
+    stored_entries: &[StoredZipEntry],
+    source_len: u64,
+    enforce_s3_limit: bool,
+    destination: impl Fn(&str) -> String,
+) -> Result<LocalZipEntries> {
+    let mut seen = HashSet::new();
+    let mut entries = Vec::new();
+    let mut catalog_index = None;
+
+    for (index, stored) in stored_entries.iter().enumerate() {
+        let raw_path = stored
+            .filename()
+            .as_str()
+            .map_err(|err| Error::InvalidZipEntry {
+                path: format!("{:?}", stored.filename().as_bytes()),
+                reason: err.to_string(),
+            })?;
+        let zip_entry_path = normalize_zip_entry_path(raw_path)?;
+        let zip_path = zip_entry_path.path;
+        let is_directory = zip_entry_path.is_directory;
+
+        if !is_directory && zip_path == EMBEDDED_CATALOG_PATH {
+            catalog_index = Some(index);
+            continue;
+        }
+
+        validate_local_stored_entry(
+            stored,
+            &zip_path,
+            is_directory,
+            enforce_s3_limit,
+            source_len,
+        )?;
+        if !seen.insert(zip_path.clone()) {
+            return Err(Error::DuplicateZipPath(zip_path));
+        }
+
+        entries.push(LocalZipEntry {
+            index,
+            destination: destination(&zip_path),
+            zip_path,
+            size: stored.uncompressed_size(),
+            compressed_size: stored.compressed_size(),
+            compression: stored.compression(),
+            crc32: stored.crc32(),
+            catalog_md5: None,
+            is_directory,
+        });
+    }
+
+    Ok(LocalZipEntries {
+        entries,
+        catalog_index,
+    })
+}
+
+fn validate_local_stored_entry(
+    stored: &StoredZipEntry,
+    zip_path: &str,
+    is_directory: bool,
+    enforce_s3_limit: bool,
+    source_len: u64,
+) -> Result<()> {
+    let source_span_end = stored
+        .header_offset()
+        .checked_add(stored.header_size())
+        .and_then(|offset| offset.checked_add(stored.compressed_size()))
+        .ok_or_else(|| Error::InvalidZipEntry {
+            path: zip_path.to_string(),
+            reason: "central directory entry source span overflowed".to_string(),
+        })?;
+    if source_span_end > source_len {
+        return Err(Error::InvalidZipEntry {
+            path: zip_path.to_string(),
+            reason: format!(
+                "central directory entry source span ends at {source_span_end}, beyond source ZIP length {source_len}"
+            ),
+        });
+    }
+
+    if is_directory {
+        if stored.uncompressed_size() != 0 || stored.compressed_size() != 0 {
+            return Err(Error::InvalidZipEntry {
+                path: zip_path.to_string(),
+                reason: "directory entries must be zero length".to_string(),
+            });
+        }
+        if stored.crc32() != 0 {
+            return Err(Error::InvalidZipEntry {
+                path: zip_path.to_string(),
+                reason: "directory entries must have a zero CRC32".to_string(),
+            });
+        }
+        return Ok(());
+    }
+
+    match stored.compression() {
+        Compression::Stored | Compression::Deflate => {}
+        other => {
+            return Err(Error::InvalidZipEntry {
+                path: zip_path.to_string(),
+                reason: format!("unsupported compression method {other:?}"),
+            });
+        }
+    }
+
+    if enforce_s3_limit && stored.uncompressed_size() > crate::constants::S3_SINGLE_PUT_LIMIT {
+        return Err(Error::EntryTooLarge {
+            path: zip_path.to_string(),
+            size: stored.uncompressed_size(),
+        });
+    }
+
+    Ok(())
+}
+
+async fn load_local_embedded_catalog(
+    reader: &LocalZipReader,
+    catalog_index: Option<usize>,
+) -> HashMap<String, String> {
+    let Some(catalog_index) = catalog_index else {
+        return HashMap::new();
+    };
+    let Some(catalog_entry) = reader.file().entries().get(catalog_index) else {
+        tracing::warn!(catalog_index, "local embedded catalog index is missing");
+        return HashMap::new();
+    };
+    let catalog_size = catalog_entry.uncompressed_size();
+    let catalog_compressed_size = catalog_entry.compressed_size();
+    if catalog_size > EMBEDDED_CATALOG_MAX_BYTES
+        || catalog_compressed_size > EMBEDDED_CATALOG_MAX_BYTES
+    {
+        tracing::warn!(
+            catalog_size,
+            catalog_compressed_size,
+            max_bytes = EMBEDDED_CATALOG_MAX_BYTES,
+            "local embedded catalog exceeded size limit"
+        );
+        return HashMap::new();
+    }
+    let expected_crc32 = catalog_entry.crc32();
+
+    let mut catalog_reader = match reader.reader_without_entry(catalog_index).await {
+        Ok(reader) => reader,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to open local embedded catalog");
+            return HashMap::new();
+        }
+    };
+    let mut catalog_bytes = Vec::new();
+    {
+        let mut limited_reader = futures_lite::io::AsyncReadExt::take(
+            &mut catalog_reader,
+            EMBEDDED_CATALOG_MAX_BYTES + 1,
+        );
+        if let Err(err) =
+            futures_lite::io::AsyncReadExt::read_to_end(&mut limited_reader, &mut catalog_bytes)
+                .await
+        {
+            tracing::warn!(error = %err, "failed to read local embedded catalog");
+            return HashMap::new();
+        }
+    }
+    if catalog_bytes.len() > EMBEDDED_CATALOG_MAX_BYTES as usize {
+        tracing::warn!(
+            read_bytes = catalog_bytes.len(),
+            max_bytes = EMBEDDED_CATALOG_MAX_BYTES,
+            "local embedded catalog exceeded size limit"
+        );
+        return HashMap::new();
+    }
+    if let Err(err) = validate_crc32_value(expected_crc32, catalog_reader.compute_hash()) {
+        tracing::warn!(error = %err, "local embedded catalog CRC validation failed");
+        return HashMap::new();
+    }
+    match serde_json::from_slice::<EmbeddedCatalog>(&catalog_bytes) {
+        Ok(catalog) => catalog_md5_by_path(catalog),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to parse local embedded catalog");
+            HashMap::new()
+        }
+    }
+}
+
+fn apply_local_catalog(entries: &mut [LocalZipEntry], catalog: HashMap<String, String>) {
+    if catalog.is_empty() {
+        return;
+    }
+    for entry in entries {
+        entry.catalog_md5 = catalog.get(&entry.zip_path).cloned();
+    }
+}
+
+async fn unzip_local_entry_to_s3(
+    client: &Client,
+    reader: &LocalZipReader,
+    entry: LocalZipEntry,
+    destination_objects: &HashMap<String, DestinationObject>,
+    options: &LocalZipSyncOptions,
+) -> ObjectReport {
+    let existing = destination_objects.get(&entry.destination);
+    if entry.is_directory {
+        return put_local_directory_marker(client, entry, existing, options).await;
+    }
+
+    let destination_etag = existing.and_then(|destination| destination.etag.clone());
+    if let (Some(catalog_md5), Some(destination_etag)) =
+        (entry.catalog_md5.as_ref(), destination_etag.as_ref())
+        && normalize_etag(destination_etag).as_ref() == Some(catalog_md5)
+        && existing.and_then(|destination| destination.size) == Some(entry.size)
+    {
+        return ObjectReport {
+            status: OperationStatus::SkippedUnchanged,
+            key: entry.destination,
+            zip_path: Some(entry.zip_path),
+            size: Some(entry.size),
+            md5: Some(catalog_md5.clone()),
+            destination_etag: Some(destination_etag.clone()),
+            message: None,
+        };
+    }
+
+    let entry_reader = match reader.reader_without_entry(entry.index).await {
+        Ok(reader) => reader.compat(),
+        Err(err) => {
+            return local_entry_error(&entry, destination_etag, err.to_string());
+        }
+    };
+
+    if let Some(destination) = existing
+        && let Some(destination_etag) = &destination.etag
+        && let Some(destination_md5) =
+            comparable_destination_md5(destination, destination_etag, &local_manifest_entry(&entry))
+    {
+        match digest_local_reader(entry_reader, &entry).await {
+            Ok(digest) if digest.md5 == destination_md5 => {
+                return ObjectReport {
+                    status: OperationStatus::SkippedUnchanged,
+                    key: entry.destination,
+                    zip_path: Some(entry.zip_path),
+                    size: Some(digest.bytes),
+                    md5: Some(digest.md5),
+                    destination_etag: Some(destination_etag.clone()),
+                    message: None,
+                };
+            }
+            Ok(_) => {}
+            Err(err) => {
+                return local_entry_error(&entry, Some(destination_etag.clone()), err.to_string());
+            }
+        }
+
+        let entry_reader = match reader.reader_without_entry(entry.index).await {
+            Ok(reader) => reader.compat(),
+            Err(err) => {
+                return local_entry_error(&entry, Some(destination_etag.clone()), err.to_string());
+            }
+        };
+        return put_local_file_entry_to_s3(
+            client,
+            entry_reader,
+            entry,
+            PutCondition::IfMatch(destination_etag.clone()),
+            Some(destination_etag.clone()),
+            options,
+        )
+        .await;
+    }
+
+    let condition = destination_etag
+        .clone()
+        .map(PutCondition::IfMatch)
+        .unwrap_or(PutCondition::IfNoneMatch);
+    put_local_file_entry_to_s3(
+        client,
+        entry_reader,
+        entry,
+        condition,
+        destination_etag,
+        options,
+    )
+    .await
+}
+
+async fn put_local_directory_marker(
+    client: &Client,
+    entry: LocalZipEntry,
+    existing: Option<&DestinationObject>,
+    options: &LocalZipSyncOptions,
+) -> ObjectReport {
+    if let Some(existing) = existing {
+        return match existing.size {
+            Some(0) => ObjectReport {
+                status: OperationStatus::SkippedUnchanged,
+                key: entry.destination,
+                zip_path: Some(entry.zip_path),
+                size: Some(0),
+                md5: Some(empty_md5()),
+                destination_etag: existing.etag.clone(),
+                message: None,
+            },
+            Some(size) => local_directory_marker_error(
+                entry,
+                existing.etag.clone(),
+                format!("destination directory marker key exists with nonzero size {size}"),
+            ),
+            None => local_directory_marker_error(
+                entry,
+                existing.etag.clone(),
+                "destination directory marker was listed without a size".to_string(),
+            ),
+        };
+    }
+
+    let mut request = client
+        .put_object()
+        .bucket(&options.destination.bucket)
+        .key(&entry.destination)
+        .content_length(0)
+        .body(ByteStream::from_static(b""));
+    request = request.if_none_match("*");
+    match request.send().await {
+        Ok(_) => ObjectReport {
+            status: OperationStatus::UploadedNew,
+            key: entry.destination,
+            zip_path: Some(entry.zip_path),
+            size: Some(0),
+            md5: Some(empty_md5()),
+            destination_etag: None,
+            message: None,
+        },
+        Err(err) if is_conditional_put_conflict(&err) => ObjectReport {
+            status: OperationStatus::ConditionalConflict,
+            key: entry.destination,
+            zip_path: Some(entry.zip_path),
+            size: Some(0),
+            md5: Some(empty_md5()),
+            destination_etag: None,
+            message: Some(aws_error_context(&err)),
+        },
+        Err(err) => ObjectReport {
+            status: OperationStatus::Error,
+            key: entry.destination,
+            zip_path: Some(entry.zip_path),
+            size: Some(0),
+            md5: None,
+            destination_etag: None,
+            message: Some(aws_error_context(&err)),
+        },
+    }
+}
+
+fn local_directory_marker_error(
+    entry: LocalZipEntry,
+    destination_etag: Option<String>,
+    message: String,
+) -> ObjectReport {
+    ObjectReport {
+        status: OperationStatus::Error,
+        key: entry.destination,
+        zip_path: Some(entry.zip_path),
+        size: Some(0),
+        md5: None,
+        destination_etag,
+        message: Some(message),
+    }
+}
+
+async fn put_local_file_entry_to_s3<R>(
+    client: &Client,
+    entry_reader: R,
+    entry: LocalZipEntry,
+    condition: PutCondition,
+    destination_etag: Option<String>,
+    options: &LocalZipSyncOptions,
+) -> ObjectReport
+where
+    R: AsyncRead + Send + Unpin + 'static,
+{
+    if entry.size == 0 {
+        let digest = match digest_local_reader(entry_reader, &entry).await {
+            Ok(digest) => digest,
+            Err(err) => return local_entry_error(&entry, destination_etag, err.to_string()),
+        };
+        let mut request = client
+            .put_object()
+            .bucket(&options.destination.bucket)
+            .key(&entry.destination)
+            .content_length(0)
+            .body(ByteStream::from_static(b""));
+        request = match &condition {
+            PutCondition::IfNoneMatch => request.if_none_match("*"),
+            PutCondition::IfMatch(etag) => request.if_match(etag),
+        };
+
+        return match request.send().await {
+            Ok(_) => ObjectReport {
+                status: if destination_etag.is_some() {
+                    OperationStatus::UploadedChanged
+                } else {
+                    OperationStatus::UploadedNew
+                },
+                key: entry.destination,
+                zip_path: Some(entry.zip_path),
+                size: Some(digest.bytes),
+                md5: Some(digest.md5),
+                destination_etag,
+                message: None,
+            },
+            Err(err) if is_conditional_put_conflict(&err) => ObjectReport {
+                status: OperationStatus::ConditionalConflict,
+                key: entry.destination,
+                zip_path: Some(entry.zip_path),
+                size: Some(entry.size),
+                md5: Some(digest.md5),
+                destination_etag,
+                message: Some(aws_error_context(&err)),
+            },
+            Err(err) => local_entry_error(&entry, destination_etag, aws_error_context(&err)),
+        };
+    }
+
+    let (writer, reader) = tokio::io::duplex(options.pipe_capacity);
+    let producer_entry = entry.clone();
+    let mut producer = AbortOnDropJoinHandle::new(tokio::spawn(async move {
+        write_local_entry_to_pipe(writer, entry_reader, producer_entry).await
+    }));
+
+    let stream = ReaderStream::with_capacity(reader, options.body_chunk_size).map_ok(Frame::data);
+    let body = ByteStream::new(SdkBody::from_body_1_x(StreamBody::new(stream)));
+    let content_length = match i64::try_from(entry.size) {
+        Ok(length) => length,
+        Err(_) => {
+            producer.abort();
+            return local_entry_error(
+                &entry,
+                destination_etag,
+                "entry size does not fit S3 content length".to_string(),
+            );
+        }
+    };
+    let mut request = client
+        .put_object()
+        .bucket(&options.destination.bucket)
+        .key(&entry.destination)
+        .content_length(content_length)
+        .body(body);
+    request = match &condition {
+        PutCondition::IfNoneMatch => request.if_none_match("*"),
+        PutCondition::IfMatch(etag) => request.if_match(etag),
+    };
+
+    match request.send().await {
+        Ok(_) => match producer.join().await {
+            Ok(Ok(digest)) => ObjectReport {
+                status: if destination_etag.is_some() {
+                    OperationStatus::UploadedChanged
+                } else {
+                    OperationStatus::UploadedNew
+                },
+                key: entry.destination,
+                zip_path: Some(entry.zip_path),
+                size: Some(digest.bytes),
+                md5: Some(digest.md5),
+                destination_etag,
+                message: None,
+            },
+            Ok(Err(err)) => local_entry_error(&entry, destination_etag, err.to_string()),
+            Err(err) => local_entry_error(&entry, destination_etag, err.to_string()),
+        },
+        Err(err) if is_conditional_put_conflict(&err) => {
+            producer.abort();
+            let _ = producer.join().await;
+            ObjectReport {
+                status: OperationStatus::ConditionalConflict,
+                key: entry.destination,
+                zip_path: Some(entry.zip_path),
+                size: Some(entry.size),
+                md5: entry.catalog_md5,
+                destination_etag,
+                message: Some(aws_error_context(&err)),
+            }
+        }
+        Err(err) => {
+            producer.abort();
+            let _ = producer.join().await;
+            local_entry_error(&entry, destination_etag, aws_error_context(&err))
+        }
+    }
+}
+
+async fn unzip_local_entry_to_local(
+    reader: &LocalZipReader,
+    entry: LocalZipEntry,
+    destination_root: &Path,
+) -> ObjectReport {
+    if entry.is_directory {
+        return create_local_directory_entry(destination_root, &entry).await;
+    }
+
+    let existed = local_destination_exists(destination_root, &entry).await;
+    let entry_reader = match reader.reader_without_entry(entry.index).await {
+        Ok(reader) => reader.compat(),
+        Err(err) => {
+            return local_destination_error(destination_root, &entry, err.to_string());
+        }
+    };
+    write_reader_to_local_destination(destination_root, &entry, entry_reader, existed).await
+}
+
+async fn unzip_s3_entry_to_local(
+    store: Arc<BlockStore>,
+    entry: ManifestEntry,
+    destination_root: PathBuf,
+) -> ObjectReport {
+    let local_entry = local_entry_from_manifest(&entry);
+    if entry.is_directory {
+        return create_local_directory_entry(&destination_root, &local_entry).await;
+    }
+
+    let existed = local_destination_exists(&destination_root, &local_entry).await;
+    let reader = match entry_reader(store, &entry).await {
+        Ok(reader) => reader,
+        Err(err) => {
+            return local_destination_error(&destination_root, &local_entry, err.to_string());
+        }
+    };
+    write_reader_to_local_destination(&destination_root, &local_entry, reader, existed).await
+}
+
+async fn create_local_directory_entry(
+    destination_root: &Path,
+    entry: &LocalZipEntry,
+) -> ObjectReport {
+    let destination = local_destination_path(destination_root, &entry.zip_path);
+    let existed = path_is_directory(&destination).await;
+    let result = create_directory_no_symlink(destination_root, &entry.zip_path).await;
+    match result {
+        Ok(()) => ObjectReport {
+            status: if existed {
+                OperationStatus::SkippedUnchanged
+            } else {
+                OperationStatus::UploadedNew
+            },
+            key: destination.display().to_string(),
+            zip_path: Some(entry.zip_path.clone()),
+            size: Some(0),
+            md5: Some(empty_md5()),
+            destination_etag: None,
+            message: None,
+        },
+        Err(err) => local_destination_error(destination_root, entry, err.to_string()),
+    }
+}
+
+async fn write_reader_to_local_destination<R>(
+    destination_root: &Path,
+    entry: &LocalZipEntry,
+    reader: R,
+    existed: bool,
+) -> ObjectReport
+where
+    R: AsyncRead + Unpin,
+{
+    let destination = local_destination_path(destination_root, &entry.zip_path);
+    let result = async {
+        create_parent_dirs_for_file(destination_root, &entry.zip_path).await?;
+        reject_existing_symlink_or_directory(&destination).await?;
+        let temp_path = temp_sibling_path(&destination)?;
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .await
+            .map_err(|err| invalid_local_path(&temp_path, format!("cannot create file: {err}")))?;
+        let digest = match write_local_entry_to_file(file, reader, entry).await {
+            Ok(digest) => digest,
+            Err(err) => {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return Err(err);
+            }
+        };
+        replace_temp_file(&temp_path, &destination, "completed file").await?;
+        Ok(digest)
+    }
+    .await;
+
+    match result {
+        Ok(digest) => ObjectReport {
+            status: if existed {
+                OperationStatus::UploadedChanged
+            } else {
+                OperationStatus::UploadedNew
+            },
+            key: destination.display().to_string(),
+            zip_path: Some(entry.zip_path.clone()),
+            size: Some(digest.bytes),
+            md5: Some(digest.md5),
+            destination_etag: None,
+            message: None,
+        },
+        Err(err) => local_destination_error(destination_root, entry, err.to_string()),
+    }
+}
+
+async fn write_local_entry_to_pipe<R>(
+    writer: DuplexStream,
+    reader: R,
+    entry: LocalZipEntry,
+) -> Result<ExtractDigest>
+where
+    R: AsyncRead + Unpin,
+{
+    write_local_entry_to_writer(writer, reader, &entry).await
+}
+
+async fn write_local_entry_to_file<R>(
+    file: tokio::fs::File,
+    reader: R,
+    entry: &LocalZipEntry,
+) -> Result<ExtractDigest>
+where
+    R: AsyncRead + Unpin,
+{
+    write_local_entry_to_writer(file, reader, entry).await
+}
+
+async fn write_local_entry_to_writer<W, R>(
+    mut writer: W,
+    mut reader: R,
+    entry: &LocalZipEntry,
+) -> Result<ExtractDigest>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let mut hasher = Md5::new();
+    let mut crc32 = Crc32Hasher::new();
+    let mut bytes = 0_u64;
+    const BUFFER_SIZE: usize = 64 * 1024;
+    let mut buffer = vec![0_u8; BUFFER_SIZE];
+    let mut pending = vec![0_u8; BUFFER_SIZE];
+    let mut pending_len = 0;
+
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let next_bytes = bytes.saturating_add(read as u64);
+        validate_local_extracted_size_not_exceeded(entry, next_bytes)?;
+        if pending_len != 0 {
+            writer.write_all(&pending[..pending_len]).await?;
+        }
+        hasher.update(&buffer[..read]);
+        crc32.update(&buffer[..read]);
+        std::mem::swap(&mut pending, &mut buffer);
+        pending_len = read;
+        bytes = next_bytes;
+    }
+
+    validate_local_extracted_size(entry, bytes)?;
+    validate_crc32_value(entry.crc32, crc32.finalize())?;
+    if pending_len != 0 {
+        writer.write_all(&pending[..pending_len]).await?;
+    }
+    writer.shutdown().await?;
+    Ok(ExtractDigest {
+        bytes,
+        md5: hex::encode(hasher.finalize()),
+    })
+}
+
+async fn digest_local_reader<R>(reader: R, entry: &LocalZipEntry) -> Result<ExtractDigest>
+where
+    R: AsyncRead + Unpin,
+{
+    write_local_entry_to_writer(tokio::io::sink(), reader, entry).await
+}
+
+fn validate_local_extracted_size(entry: &LocalZipEntry, bytes: u64) -> Result<()> {
+    if bytes == entry.size {
+        Ok(())
+    } else {
+        Err(Error::InvalidZipEntry {
+            path: entry.zip_path.clone(),
+            reason: format!(
+                "entry produced {bytes} bytes but central directory declared {} bytes",
+                entry.size
+            ),
+        })
+    }
+}
+
+fn validate_local_extracted_size_not_exceeded(entry: &LocalZipEntry, bytes: u64) -> Result<()> {
+    if bytes <= entry.size {
+        Ok(())
+    } else {
+        validate_local_extracted_size(entry, bytes)
+    }
+}
+
+fn local_entry_error(
+    entry: &LocalZipEntry,
+    destination_etag: Option<String>,
+    message: String,
+) -> ObjectReport {
+    ObjectReport {
+        status: OperationStatus::Error,
+        key: entry.destination.clone(),
+        zip_path: Some(entry.zip_path.clone()),
+        size: Some(entry.size),
+        md5: entry.catalog_md5.clone(),
+        destination_etag,
+        message: Some(message),
+    }
+}
+
+fn local_destination_error(
+    destination_root: &Path,
+    entry: &LocalZipEntry,
+    message: String,
+) -> ObjectReport {
+    ObjectReport {
+        status: OperationStatus::Error,
+        key: local_destination_path(destination_root, &entry.zip_path)
+            .display()
+            .to_string(),
+        zip_path: Some(entry.zip_path.clone()),
+        size: Some(entry.size),
+        md5: entry.catalog_md5.clone(),
+        destination_etag: None,
+        message: Some(message),
+    }
+}
+
+fn local_entry_from_manifest(entry: &ManifestEntry) -> LocalZipEntry {
+    LocalZipEntry {
+        index: 0,
+        zip_path: entry.zip_path.clone(),
+        destination: entry.zip_path.clone(),
+        size: entry.size,
+        compressed_size: entry.compressed_size,
+        compression: entry.compression,
+        crc32: entry.crc32,
+        catalog_md5: entry.catalog_md5.clone(),
+        is_directory: entry.is_directory,
+    }
+}
+
+fn local_manifest_entry(entry: &LocalZipEntry) -> ManifestEntry {
+    ManifestEntry {
+        source_offset: 0,
+        source_span_start: 0,
+        source_span_end: entry.compressed_size,
+        zip_path: entry.zip_path.clone(),
+        key: entry.destination.clone(),
+        size: entry.size,
+        compressed_size: entry.compressed_size,
+        compression: entry.compression,
+        crc32: entry.crc32,
+        catalog_md5: entry.catalog_md5.clone(),
+        is_directory: entry.is_directory,
+    }
+}
+
+async fn prepare_local_destination_root(destination: &Path) -> Result<PathBuf> {
+    create_destination_directory_no_symlink(destination).await?;
+    Ok(destination.to_path_buf())
+}
+
+async fn destination_uses_case_insensitive_paths(root: &Path) -> Result<bool> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let probe_name = format!(".s3-unspool-case-probe-{}-{nanos}-a", std::process::id());
+    let probe_path = root.join(&probe_name);
+    let alternate_path = root.join(probe_name.to_ascii_uppercase());
+
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe_path)
+        .await
+        .map_err(|err| {
+            invalid_local_path(
+                &probe_path,
+                format!("cannot create case-sensitivity probe: {err}"),
+            )
+        })?;
+    drop(file);
+
+    let result = match tokio::fs::symlink_metadata(&alternate_path).await {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(invalid_local_path(
+            &alternate_path,
+            format!("cannot inspect case-sensitivity probe: {err}"),
+        )),
+    };
+    let cleanup = tokio::fs::remove_file(&probe_path).await;
+
+    match (result, cleanup) {
+        (Ok(case_insensitive), Ok(())) => Ok(case_insensitive),
+        (Ok(case_insensitive), Err(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(case_insensitive)
+        }
+        (Ok(_), Err(err)) => Err(invalid_local_path(
+            &probe_path,
+            format!("cannot remove case-sensitivity probe: {err}"),
+        )),
+        (Err(err), _) => Err(err),
+    }
+}
+
+async fn create_destination_directory_no_symlink(destination: &Path) -> Result<()> {
+    match tokio::fs::symlink_metadata(destination).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(invalid_local_path(
+                destination,
+                "destination directory cannot be a symbolic link".to_string(),
+            ));
+        }
+        Ok(metadata) if metadata.is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(invalid_local_path(
+                destination,
+                "destination must be a directory".to_string(),
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(invalid_local_path(
+                destination,
+                format!("cannot inspect destination directory: {err}"),
+            ));
+        }
+    }
+
+    let mut missing = vec![destination.to_path_buf()];
+    let mut current = destination;
+    while let Some(parent) = current.parent() {
+        if parent.as_os_str().is_empty() {
+            break;
+        }
+
+        match tokio::fs::symlink_metadata(parent).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(invalid_local_path(
+                    parent,
+                    "destination path component cannot be a symbolic link".to_string(),
+                ));
+            }
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => {
+                return Err(invalid_local_path(
+                    parent,
+                    "destination path component exists and is not a directory".to_string(),
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(parent.to_path_buf());
+                current = parent;
+            }
+            Err(err) => {
+                return Err(invalid_local_path(
+                    parent,
+                    format!("cannot inspect destination path component: {err}"),
+                ));
+            }
+        }
+    }
+
+    for path in missing.into_iter().rev() {
+        ensure_directory_component(&path).await?;
+    }
+
+    Ok(())
+}
+
+fn local_destination_path(root: &Path, zip_path: &str) -> PathBuf {
+    let mut path = root.to_path_buf();
+    for component in zip_path.trim_end_matches('/').split('/') {
+        if !component.is_empty() {
+            path.push(component);
+        }
+    }
+    path
+}
+
+fn validate_local_destination_path_collisions<'a>(
+    entries: impl IntoIterator<Item = (&'a str, bool)>,
+    case_insensitive: bool,
+) -> Result<()> {
+    let mut destinations = HashMap::<String, (String, bool)>::new();
+    for (zip_path, is_directory) in entries {
+        let local_path = zip_path.trim_end_matches('/').to_string();
+        let destination_key = normalize_local_collision_key(&local_path, case_insensitive);
+        if let Some((previous, _)) =
+            destinations.insert(destination_key, (zip_path.to_string(), is_directory))
+        {
+            return Err(Error::InvalidZipEntry {
+                path: zip_path.to_string(),
+                reason: format!(
+                    "maps to the same local destination path as ZIP entry `{previous}`"
+                ),
+            });
+        }
+    }
+
+    let file_destinations = destinations
+        .iter()
+        .filter(|(_, (_, is_directory))| !is_directory)
+        .map(|(local_path, (zip_path, _))| (local_path.as_str(), zip_path.as_str()))
+        .collect::<HashMap<_, _>>();
+    for (local_path, (zip_path, _)) in &destinations {
+        let mut ancestor = String::new();
+        let mut components = local_path.split('/').peekable();
+        while let Some(component) = components.next() {
+            if components.peek().is_none() {
+                break;
+            }
+            if !ancestor.is_empty() {
+                ancestor.push('/');
+            }
+            ancestor.push_str(component);
+            if let Some(file_zip_path) = file_destinations.get(ancestor.as_str()) {
+                return Err(Error::InvalidZipEntry {
+                    path: zip_path.clone(),
+                    reason: format!(
+                        "maps under the same local destination path as file ZIP entry `{file_zip_path}`"
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_local_destination_zip_paths<'a>(
+    zip_paths: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    for zip_path in zip_paths {
+        for component in zip_path.trim_end_matches('/').split('/') {
+            validate_local_destination_component(zip_path, component)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_local_destination_component(zip_path: &str, component: &str) -> Result<()> {
+    let has_windows_reserved_character = component
+        .chars()
+        .any(|character| matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*'));
+    let has_control_character = component.chars().any(|character| character.is_control());
+    let has_reserved_suffix = component.ends_with([' ', '.']);
+    let stem = component
+        .split_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(component)
+        .trim_end_matches([' ', '.']);
+    let upper_stem = stem.to_ascii_uppercase();
+    let is_reserved_device_name = matches!(
+        upper_stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || is_numbered_windows_device_name(&upper_stem, "COM")
+        || is_numbered_windows_device_name(&upper_stem, "LPT");
+
+    if has_windows_reserved_character
+        || has_control_character
+        || has_reserved_suffix
+        || is_reserved_device_name
+    {
+        Err(Error::InvalidZipEntry {
+            path: zip_path.to_string(),
+            reason: format!("unsafe local path component `{component}`"),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn is_numbered_windows_device_name(value: &str, prefix: &str) -> bool {
+    let Some(suffix) = value.strip_prefix(prefix) else {
+        return false;
+    };
+    matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+}
+
+fn normalize_local_collision_key(path: &str, case_insensitive: bool) -> String {
+    if case_insensitive {
+        path.to_lowercase()
+    } else {
+        path.to_string()
+    }
+}
+
+async fn reject_local_unzip_source_archive_target(
+    source_zip: &Path,
+    destination_root: &Path,
+    entries: &[LocalZipEntry],
+) -> Result<()> {
+    let source_zip = tokio::fs::canonicalize(source_zip).await.map_err(|err| {
+        invalid_local_path(source_zip, format!("cannot inspect source ZIP: {err}"))
+    })?;
+
+    for entry in entries {
+        let destination = local_destination_path(destination_root, &entry.zip_path);
+        match tokio::fs::canonicalize(&destination).await {
+            Ok(destination) if destination == source_zip => {
+                return Err(invalid_local_path(
+                    &destination,
+                    format!(
+                        "ZIP entry `{}` would overwrite the source archive {}",
+                        entry.zip_path,
+                        source_zip.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(invalid_local_path(
+                    &destination,
+                    format!("cannot inspect destination path: {err}"),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn local_destination_exists(root: &Path, entry: &LocalZipEntry) -> bool {
+    tokio::fs::symlink_metadata(local_destination_path(root, &entry.zip_path))
+        .await
+        .is_ok()
+}
+
+async fn path_is_directory(path: &Path) -> bool {
+    tokio::fs::symlink_metadata(path)
+        .await
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+}
+
+async fn create_directory_no_symlink(root: &Path, zip_path: &str) -> Result<()> {
+    let mut current = root.to_path_buf();
+    for component in zip_path.trim_end_matches('/').split('/') {
+        if component.is_empty() {
+            continue;
+        }
+        current.push(component);
+        ensure_directory_component(&current).await?;
+    }
+    Ok(())
+}
+
+async fn create_parent_dirs_for_file(root: &Path, zip_path: &str) -> Result<()> {
+    let Some((parent, _file_name)) = zip_path.rsplit_once('/') else {
+        return Ok(());
+    };
+    create_directory_no_symlink(root, parent).await
+}
+
+async fn ensure_directory_component(path: &Path) -> Result<()> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(invalid_local_path(
+            path,
+            "destination path component cannot be a symbolic link".to_string(),
+        )),
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(invalid_local_path(
+            path,
+            "destination path component exists and is not a directory".to_string(),
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            create_directory_component(path).await
+        }
+        Err(err) => Err(invalid_local_path(
+            path,
+            format!("cannot inspect destination path component: {err}"),
+        )),
+    }
+}
+
+async fn create_directory_component(path: &Path) -> Result<()> {
+    match tokio::fs::create_dir(path).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            match tokio::fs::symlink_metadata(path).await {
+                Ok(metadata) if metadata.file_type().is_symlink() => Err(invalid_local_path(
+                    path,
+                    "destination path component cannot be a symbolic link".to_string(),
+                )),
+                Ok(metadata) if metadata.is_dir() => Ok(()),
+                Ok(_) => Err(invalid_local_path(
+                    path,
+                    "destination path component exists and is not a directory".to_string(),
+                )),
+                Err(err) => Err(invalid_local_path(
+                    path,
+                    format!("cannot inspect destination path component after create race: {err}"),
+                )),
+            }
+        }
+        Err(err) => Err(invalid_local_path(
+            path,
+            format!("cannot create directory: {err}"),
+        )),
+    }
+}
+
+async fn reject_existing_symlink_or_directory(path: &Path) -> Result<()> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(invalid_local_path(
+            path,
+            "destination file cannot be a symbolic link".to_string(),
+        )),
+        Ok(metadata) if metadata.is_dir() => Err(invalid_local_path(
+            path,
+            "destination file path is a directory".to_string(),
+        )),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(invalid_local_path(
+            path,
+            format!("cannot inspect destination file: {err}"),
+        )),
+    }
+}
+
+fn validate_local_zip_sync_options(options: &LocalZipSyncOptions) -> Result<()> {
+    validate_upload_stream_options(options.body_chunk_size, options.pipe_capacity)?;
+    if options.delete_extra && options.destination.prefix.is_empty() {
+        return Err(Error::InvalidOption(
+            "delete_extra requires a non-empty destination prefix".to_string(),
+        ));
+    }
+    if options.concurrency == 0 {
+        return Err(Error::InvalidOption(
+            "concurrency must be greater than zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_local_unzip_options(options: &LocalUnzipOptions) -> Result<()> {
+    if options.concurrency == 0 {
+        return Err(Error::InvalidOption(
+            "concurrency must be greater than zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_s3_zip_local_unzip_options(options: &S3ZipLocalUnzipOptions) -> Result<()> {
+    if options.concurrency == 0 {
+        return Err(Error::InvalidOption(
+            "concurrency must be greater than zero".to_string(),
+        ));
+    }
+    if options.source_get_concurrency == 0 {
+        return Err(Error::InvalidOption(
+            "source_get_concurrency must be greater than zero".to_string(),
+        ));
+    }
+    if options.source_block_size == 0 {
+        return Err(Error::InvalidOption(
+            "source_block_size must be greater than zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_s3_zip_local_source_range_options(
+    options: &S3ZipLocalUnzipOptions,
+    source_len: u64,
+) -> Result<()> {
+    let mut sync = local_unzip_source_sync_options(options);
+    sync.source_window_capacity = options.source_window_capacity;
+    validate_source_range_options(&sync, source_len)
+}
+
+fn resolve_s3_zip_local_window_capacity(
+    options: &mut S3ZipLocalUnzipOptions,
+    source_zip_bytes: u64,
+    zip_file_count: usize,
+) {
+    if let Some(memory_mb) = options.source_window_memory_budget_mb {
+        options.source_window_capacity = adaptive_source_window_capacity(
+            memory_mb,
+            source_zip_bytes,
+            options.concurrency,
+            zip_file_count,
+            options.source_block_size,
+            options.source_get_concurrency,
+        );
+    }
+}
+
+fn local_unzip_source_sync_options(options: &S3ZipLocalUnzipOptions) -> SyncOptions {
+    let mut sync = SyncOptions::new(
+        options.source.clone(),
+        S3Prefix {
+            bucket: "__local__".to_string(),
+            prefix: String::new(),
+        },
+    );
+    sync.collect_diagnostics = options.collect_diagnostics;
+    sync.ignore_embedded_catalog = options.ignore_embedded_catalog;
+    sync.collect_operations = options.collect_operations;
+    sync.concurrency = options.concurrency;
+    sync.source_block_size = options.source_block_size;
+    sync.source_block_merge_gap = options.source_block_merge_gap;
+    sync.source_get_concurrency = options.source_get_concurrency;
+    sync.source_window_capacity = options.source_window_capacity;
+    sync.source_window_memory_budget_mb = options.source_window_memory_budget_mb;
+    sync
+}
+
+fn validate_upload_stream_options(body_chunk_size: usize, pipe_capacity: usize) -> Result<()> {
+    if body_chunk_size == 0 {
+        return Err(Error::InvalidOption(
+            "body_chunk_size must be greater than zero".to_string(),
+        ));
+    }
+    if body_chunk_size > MAX_BODY_CHUNK_SIZE {
+        return Err(Error::InvalidOption(format!(
+            "body_chunk_size must be less than or equal to {MAX_BODY_CHUNK_SIZE}"
+        )));
+    }
+    if pipe_capacity == 0 {
+        return Err(Error::InvalidOption(
+            "pipe_capacity must be greater than zero".to_string(),
+        ));
+    }
+    if pipe_capacity > MAX_PIPE_CAPACITY {
+        return Err(Error::InvalidOption(format!(
+            "pipe_capacity must be less than or equal to {MAX_PIPE_CAPACITY}"
+        )));
+    }
+    Ok(())
+}
+
 fn log_operation_issue(operation: &ObjectReport, progress: &ExtractProgress) {
     match operation.status {
         OperationStatus::Error => {
@@ -800,6 +2339,11 @@ fn classify_entries(
 
     for entry in entries {
         let existing = destination_objects.get(&entry.key);
+        if entry.is_directory {
+            classify_directory_entry(entry, existing, &mut classified);
+            continue;
+        }
+
         if let Some(report) = catalog_skip_report(&entry, existing) {
             classified.reports.push(report);
             continue;
@@ -850,6 +2394,43 @@ fn classify_entries(
     }
 
     classified
+}
+
+fn classify_directory_entry(
+    entry: ManifestEntry,
+    existing: Option<&DestinationObject>,
+    classified: &mut ClassifiedEntries,
+) {
+    let Some(destination) = existing else {
+        classified.upload_jobs.push(UploadJob {
+            entry,
+            condition: PutCondition::IfNoneMatch,
+            comparison_digest: None,
+        });
+        return;
+    };
+
+    match destination.size {
+        Some(0) => classified.reports.push(ObjectReport {
+            status: OperationStatus::SkippedUnchanged,
+            key: entry.key,
+            zip_path: Some(entry.zip_path),
+            size: Some(0),
+            md5: Some(empty_md5()),
+            destination_etag: destination.etag.clone(),
+            message: None,
+        }),
+        Some(size) => classified.reports.push(entry_error(
+            &entry,
+            destination.etag.clone(),
+            format!("destination directory marker key exists with nonzero size {size}"),
+        )),
+        None => classified.reports.push(entry_error(
+            &entry,
+            destination.etag.clone(),
+            "destination directory marker was listed without a size".to_string(),
+        )),
+    }
 }
 
 async fn run_hash_phase(
@@ -1294,6 +2875,10 @@ async fn put_entry_stream_once(
     options: &SyncOptions,
     put_diagnostics: Option<&PutDiagnosticsCollector>,
 ) -> PutAttemptResult {
+    if entry.is_directory {
+        return put_directory_marker_once(client, entry, condition, options, put_diagnostics).await;
+    }
+
     if entry.size == 0 {
         return put_zero_length_entry_once(
             client,
@@ -1392,6 +2977,46 @@ async fn put_entry_stream_once(
     }
 }
 
+async fn put_directory_marker_once(
+    client: &Client,
+    entry: &ManifestEntry,
+    condition: &PutCondition,
+    options: &SyncOptions,
+    put_diagnostics: Option<&PutDiagnosticsCollector>,
+) -> PutAttemptResult {
+    let mut request = client
+        .put_object()
+        .bucket(&options.destination.bucket)
+        .key(&entry.key)
+        .content_length(0)
+        .body(ByteStream::from_static(b""));
+
+    request = match condition {
+        PutCondition::IfNoneMatch => request.if_none_match("*"),
+        PutCondition::IfMatch(etag) => request.if_match(etag.as_str()),
+    };
+
+    match request.send().await {
+        Ok(_) => PutAttemptResult::Uploaded(ExtractDigest {
+            bytes: 0,
+            md5: empty_md5(),
+        }),
+        Err(err) if is_conditional_put_conflict(&err) => {
+            record_put_failure(put_diagnostics, &err);
+            PutAttemptResult::ConditionalConflict(aws_error_context(&err))
+        }
+        Err(err) => {
+            let (error_code, failure_count) = record_put_failure(put_diagnostics, &err);
+            PutAttemptResult::Failed {
+                message: format!("{}: {}", put_sdk_error_kind(&err), aws_error_context(&err)),
+                retryable: true,
+                error_code: Some(error_code),
+                failure_count,
+            }
+        }
+    }
+}
+
 async fn put_zero_length_entry_once(
     client: &Client,
     store: Arc<BlockStore>,
@@ -1440,6 +3065,10 @@ async fn put_zero_length_entry_once(
             }
         }
     }
+}
+
+fn empty_md5() -> String {
+    "d41d8cd98f00b204e9800998ecf8427e".to_string()
 }
 
 fn record_put_failure(
@@ -1904,8 +3533,102 @@ mod tests {
     use async_zip::Compression;
     use aws_sdk_s3::config::{Credentials, Region};
 
-    use crate::S3Object;
     use crate::range::{SourcePlan, SourceRange};
+    use crate::{S3Object, S3Prefix};
+
+    #[test]
+    fn classify_directory_markers_for_preserved_s3_placeholders() {
+        let entry = ManifestEntry {
+            source_offset: 0,
+            source_span_start: 0,
+            source_span_end: 0,
+            zip_path: "empty/".to_string(),
+            key: "prefix/empty/".to_string(),
+            size: 0,
+            compressed_size: 0,
+            compression: Compression::Stored,
+            crc32: 0,
+            catalog_md5: None,
+            is_directory: true,
+        };
+
+        let classified = classify_entries(vec![entry.clone()], &std::collections::HashMap::new());
+        assert_eq!(classified.upload_jobs.len(), 1);
+        assert!(classified.reports.is_empty());
+
+        let destination_objects = std::collections::HashMap::from([(
+            entry.key.clone(),
+            DestinationObject {
+                etag: Some("\"d41d8cd98f00b204e9800998ecf8427e\"".to_string()),
+                size: Some(0),
+            },
+        )]);
+        let classified = classify_entries(vec![entry.clone()], &destination_objects);
+        assert!(classified.upload_jobs.is_empty());
+        assert_eq!(classified.reports.len(), 1);
+        assert_eq!(
+            classified.reports[0].status,
+            OperationStatus::SkippedUnchanged
+        );
+
+        let destination_objects = std::collections::HashMap::from([(
+            entry.key.clone(),
+            DestinationObject {
+                etag: Some("\"etag\"".to_string()),
+                size: Some(1),
+            },
+        )]);
+        let classified = classify_entries(vec![entry], &destination_objects);
+        assert!(classified.upload_jobs.is_empty());
+        assert_eq!(classified.reports.len(), 1);
+        assert_eq!(classified.reports[0].status, OperationStatus::Error);
+    }
+
+    #[tokio::test]
+    async fn local_zip_directory_marker_rejects_nonzero_existing_destination() {
+        let entry = local_directory_entry("prefix/empty/");
+        let existing = DestinationObject {
+            etag: Some("\"etag\"".to_string()),
+            size: Some(1),
+        };
+        let options = LocalZipSyncOptions::new(
+            PathBuf::from("site.zip"),
+            S3Prefix::parse("s3://destination-bucket/prefix/").unwrap(),
+        );
+
+        let report =
+            put_local_directory_marker(&dummy_s3_client(), entry, Some(&existing), &options).await;
+
+        assert_eq!(report.status, OperationStatus::Error);
+        assert_eq!(report.destination_etag.as_deref(), Some("\"etag\""));
+        assert!(matches!(
+            report.message.as_deref(),
+            Some(message) if message.contains("nonzero size 1")
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_zip_directory_marker_rejects_unknown_size_existing_destination() {
+        let entry = local_directory_entry("prefix/empty/");
+        let existing = DestinationObject {
+            etag: Some("\"etag\"".to_string()),
+            size: None,
+        };
+        let options = LocalZipSyncOptions::new(
+            PathBuf::from("site.zip"),
+            S3Prefix::parse("s3://destination-bucket/prefix/").unwrap(),
+        );
+
+        let report =
+            put_local_directory_marker(&dummy_s3_client(), entry, Some(&existing), &options).await;
+
+        assert_eq!(report.status, OperationStatus::Error);
+        assert_eq!(report.destination_etag.as_deref(), Some("\"etag\""));
+        assert!(matches!(
+            report.message.as_deref(),
+            Some(message) if message.contains("without a size")
+        ));
+    }
 
     #[tokio::test]
     async fn producer_error_after_send_error_is_preserved() {
@@ -1975,6 +3698,7 @@ mod tests {
             compression: Compression::Stored,
             crc32: 1,
             catalog_md5: None,
+            is_directory: false,
         };
         let store = zero_length_entry_store(&entry);
         let options = SyncOptions::new(
@@ -2010,6 +3734,228 @@ mod tests {
             }
             _ => panic!("expected zero-byte CRC mismatch to fail before PutObject"),
         }
+    }
+
+    #[tokio::test]
+    async fn local_entry_crc_mismatch_leaves_pipe_short() {
+        let data = (0..(64 * 1024 + 17))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut crc32 = Crc32Hasher::new();
+        crc32.update(&data);
+        let bad_crc32 = crc32.finalize() ^ u32::MAX;
+        let entry = LocalZipEntry {
+            index: 0,
+            zip_path: "bad.txt".to_string(),
+            destination: "prefix/bad.txt".to_string(),
+            size: data.len() as u64,
+            compressed_size: data.len() as u64,
+            compression: Compression::Stored,
+            crc32: bad_crc32,
+            catalog_md5: None,
+            is_directory: false,
+        };
+        let (writer, mut reader) = tokio::io::duplex(128 * 1024);
+        let producer = tokio::spawn(write_local_entry_to_pipe(
+            writer,
+            std::io::Cursor::new(data.clone()),
+            entry,
+        ));
+        let mut body = Vec::new();
+
+        let read = tokio::time::timeout(Duration::from_secs(1), reader.read_to_end(&mut body))
+            .await
+            .expect("pipe should close after CRC failure")
+            .unwrap();
+        let result = producer.await.unwrap();
+
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("CRC"));
+        assert_eq!(read, 64 * 1024);
+        assert_eq!(body, data[..body.len()]);
+        assert!(body.len() < data.len());
+    }
+
+    #[tokio::test]
+    async fn local_entry_size_overflow_leaves_pipe_short() {
+        let data = vec![7_u8; 64 * 1024 + 1];
+        let mut crc32 = Crc32Hasher::new();
+        crc32.update(&data);
+        let entry = LocalZipEntry {
+            index: 0,
+            zip_path: "too-large.txt".to_string(),
+            destination: "prefix/too-large.txt".to_string(),
+            size: 64 * 1024,
+            compressed_size: data.len() as u64,
+            compression: Compression::Stored,
+            crc32: crc32.finalize(),
+            catalog_md5: None,
+            is_directory: false,
+        };
+        let (writer, mut reader) = tokio::io::duplex(128 * 1024);
+        let producer = tokio::spawn(write_local_entry_to_pipe(
+            writer,
+            std::io::Cursor::new(data),
+            entry,
+        ));
+        let mut body = Vec::new();
+
+        let read = tokio::time::timeout(Duration::from_secs(1), reader.read_to_end(&mut body))
+            .await
+            .expect("pipe should close after size overflow")
+            .unwrap();
+        let result = producer.await.unwrap();
+
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("central directory declared"));
+        assert_eq!(read, 0);
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn local_destination_collisions_respect_case_insensitive_filesystems() {
+        validate_local_destination_path_collisions([("Readme", false), ("README", false)], false)
+            .unwrap();
+
+        let err = validate_local_destination_path_collisions(
+            [("Readme", false), ("README", false)],
+            true,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::InvalidZipEntry { reason, .. }
+                if reason.contains("same local destination path")
+        ));
+    }
+
+    #[test]
+    fn local_destination_parent_collisions_respect_case_insensitive_filesystems() {
+        validate_local_destination_path_collisions(
+            [("Readme", false), ("README/child.txt", false)],
+            false,
+        )
+        .unwrap();
+
+        let err = validate_local_destination_path_collisions(
+            [("Readme", false), ("README/child.txt", false)],
+            true,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::InvalidZipEntry { reason, .. }
+                if reason.contains("same local destination path as file ZIP entry")
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_zero_length_crc_mismatch_fails_before_put_object() {
+        let entry = LocalZipEntry {
+            index: 0,
+            zip_path: "empty.txt".to_string(),
+            destination: "prefix/empty.txt".to_string(),
+            size: 0,
+            compressed_size: 0,
+            compression: Compression::Stored,
+            crc32: 1,
+            catalog_md5: None,
+            is_directory: false,
+        };
+        let options = LocalZipSyncOptions::new(
+            "source.zip",
+            S3Prefix::parse("s3://destination-bucket/prefix/").unwrap(),
+        );
+
+        let report = tokio::time::timeout(
+            Duration::from_secs(1),
+            put_local_file_entry_to_s3(
+                &dummy_s3_client(),
+                std::io::Cursor::new(Vec::<u8>::new()),
+                entry,
+                PutCondition::IfNoneMatch,
+                None,
+                &options,
+            ),
+        )
+        .await
+        .expect("CRC failure should happen before any S3 PutObject attempt");
+
+        assert_eq!(report.status, OperationStatus::Error);
+        assert!(
+            report
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("CRC"))
+        );
+    }
+
+    #[test]
+    fn local_zip_sync_options_reject_delete_extra_at_bucket_root() {
+        let mut options = LocalZipSyncOptions::new(
+            "source.zip",
+            S3Prefix::parse("s3://destination-bucket").unwrap(),
+        );
+        options.delete_extra = true;
+
+        let err = validate_local_zip_sync_options(&options).unwrap_err();
+
+        assert!(err.to_string().contains("delete_extra"));
+    }
+
+    #[tokio::test]
+    async fn local_zip_entries_reject_directory_crc_mismatch() {
+        let zip_bytes = test_zip_bytes(&[("nested/", Compression::Stored, b"".as_slice())]).await;
+        let zip_bytes = set_central_crc32(zip_bytes, "nested/", 1);
+        let source_len = zip_bytes.len() as u64;
+        let reader = async_zip::base::read::mem::ZipFileReader::new(zip_bytes)
+            .await
+            .unwrap();
+        let destination = S3Prefix::parse("s3://destination-bucket/prefix/").unwrap();
+
+        let err =
+            match local_zip_entries_for_s3(reader.file().entries(), &destination, source_len, true)
+            {
+                Ok(_) => panic!("directory entry with nonzero CRC should be rejected"),
+                Err(err) => err,
+            };
+
+        assert!(matches!(
+            err,
+            Error::InvalidZipEntry { ref path, ref reason }
+                if path == "nested/" && reason.contains("zero CRC32")
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_embedded_catalog_falls_back_on_crc_mismatch() {
+        let catalog_json =
+            br#"{"version":1,"entries":[{"path":"a.txt","md5":"2c1743a391305fbf367df8e4f069f9f9"}]}"#;
+        let zip_bytes = test_zip_bytes(&[
+            ("a.txt", Compression::Stored, b"alpha".as_slice()),
+            (
+                EMBEDDED_CATALOG_PATH,
+                Compression::Stored,
+                catalog_json.as_slice(),
+            ),
+        ])
+        .await;
+        let zip_bytes = set_central_crc32(zip_bytes, EMBEDDED_CATALOG_PATH, 0);
+        let path = unique_test_file("local-catalog-crc");
+        tokio::fs::write(&path, zip_bytes).await.unwrap();
+        let reader = open_local_zip_reader(&path).await.unwrap();
+        let catalog_index = reader
+            .file()
+            .entries()
+            .iter()
+            .position(|entry| entry.filename().as_str().unwrap() == EMBEDDED_CATALOG_PATH);
+
+        let catalog = load_local_embedded_catalog(&reader, catalog_index).await;
+
+        assert!(catalog.is_empty());
+        tokio::fs::remove_file(path).await.unwrap();
     }
 
     #[test]
@@ -2116,6 +4062,48 @@ mod tests {
         store
     }
 
+    async fn test_zip_bytes(entries: &[(&str, Compression, &[u8])]) -> Vec<u8> {
+        let mut writer = async_zip::base::write::ZipFileWriter::new(Vec::new());
+        for (path, compression, data) in entries {
+            let entry = async_zip::ZipEntryBuilder::new((*path).to_string().into(), *compression);
+            writer.write_entry_whole(entry, data).await.unwrap();
+        }
+        writer.close().await.unwrap()
+    }
+
+    fn set_central_crc32(mut data: Vec<u8>, path: &str, crc32: u32) -> Vec<u8> {
+        let signature = 0x0201_4b50_u32.to_le_bytes();
+        let mut offset = 0;
+        while let Some(relative) = data[offset..]
+            .windows(signature.len())
+            .position(|window| window == signature)
+        {
+            let index = offset + relative;
+            let file_name_len = u16::from_le_bytes([data[index + 28], data[index + 29]]) as usize;
+            let extra_len = u16::from_le_bytes([data[index + 30], data[index + 31]]) as usize;
+            let comment_len = u16::from_le_bytes([data[index + 32], data[index + 33]]) as usize;
+            let name_start = index + 46;
+            let name_end = name_start + file_name_len;
+            if &data[name_start..name_end] == path.as_bytes() {
+                data[index + 16..index + 20].copy_from_slice(&crc32.to_le_bytes());
+                return data;
+            }
+            offset = name_end + extra_len + comment_len;
+        }
+        panic!("central directory entry for {path} not found");
+    }
+
+    fn unique_test_file(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "s3-unspool-{name}-{}-{nanos}.zip",
+            std::process::id()
+        ))
+    }
+
     fn dummy_s3_client() -> Client {
         let config = aws_sdk_s3::Config::builder()
             .behavior_version_latest()
@@ -2129,5 +4117,19 @@ mod tests {
             ))
             .build();
         Client::from_conf(config)
+    }
+
+    fn local_directory_entry(destination: &str) -> LocalZipEntry {
+        LocalZipEntry {
+            index: 0,
+            zip_path: "empty/".to_string(),
+            destination: destination.to_string(),
+            size: 0,
+            compressed_size: 0,
+            compression: Compression::Stored,
+            crc32: 0,
+            catalog_md5: None,
+            is_directory: true,
+        }
     }
 }
