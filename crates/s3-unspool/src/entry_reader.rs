@@ -2,6 +2,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_compression::tokio::bufread::DeflateDecoder;
+#[cfg(feature = "zstd")]
+use async_compression::tokio::bufread::ZstdDecoder;
 use async_zip::Compression;
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 
@@ -158,6 +160,8 @@ pub(crate) async fn entry_reader(
     match entry.compression {
         Compression::Stored => Ok(Box::pin(compressed)),
         Compression::Deflate => Ok(Box::pin(DeflateDecoder::new(BufReader::new(compressed)))),
+        #[cfg(feature = "zstd")]
+        Compression::Zstd => Ok(Box::pin(ZstdDecoder::new(BufReader::new(compressed)))),
         other => Err(Error::InvalidZipEntry {
             path: entry.zip_path.clone(),
             reason: format!("unsupported compression method {other:?}"),

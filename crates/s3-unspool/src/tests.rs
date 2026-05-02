@@ -36,9 +36,9 @@ use crate::zip_manifest::{
 use crate::{
     DryRunOperationStatus, Error, LocalUnzipOptions, LocalZipOptions, ObjectReport,
     OperationStatus, PutRetryPolicy, S3Object, S3Prefix, S3PrefixLocalZipOptions, SyncOptions,
-    SyncReport, SyncSummary, UploadProgress, UploadProgressHandler, dry_run_unzip_file_to_local,
-    dry_run_zip_directory_to_file, unzip_file_to_local, zip_directory_to_file,
-    zip_s3_prefix_to_file,
+    SyncReport, SyncSummary, UploadProgress, UploadProgressHandler, ZipCompression,
+    dry_run_unzip_file_to_local, dry_run_zip_directory_to_file, unzip_file_to_local,
+    zip_directory_to_file, zip_s3_prefix_to_file,
 };
 
 #[test]
@@ -280,9 +280,10 @@ async fn collects_and_writes_upload_zip_entries() {
     );
 
     let mut data = Vec::new();
-    let catalog_entries = write_upload_zip(&mut data, &entries, true, None)
-        .await
-        .unwrap();
+    let catalog_entries =
+        write_upload_zip(&mut data, &entries, true, ZipCompression::Deflate, None)
+            .await
+            .unwrap();
     assert_eq!(
         catalog_entries
             .iter()
@@ -333,6 +334,51 @@ async fn collects_and_writes_upload_zip_entries() {
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
 
+#[cfg(feature = "zstd")]
+#[tokio::test]
+async fn upload_zip_can_write_zstd_file_entries() {
+    let root = unique_temp_dir("zip-upload-zstd");
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    tokio::fs::write(root.join("a.txt"), b"alpha alpha alpha")
+        .await
+        .unwrap();
+
+    let entries = collect_upload_entries(&root).await.unwrap();
+    let mut data = Vec::new();
+    let catalog_entries = write_upload_zip(&mut data, &entries, true, ZipCompression::Zstd, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        catalog_entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.md5.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("a.txt", "ddb0513e8db13a8aa11fb685c75fd9a4")]
+    );
+
+    let zip = async_zip::base::read::mem::ZipFileReader::new(data)
+        .await
+        .unwrap();
+    let zip_entries = zip.file().entries().to_vec();
+    assert_eq!(zip_entries[0].compression(), Compression::Zstd);
+    assert_eq!(u16::from(zip_entries[0].compression()), 93);
+    assert_eq!(zip_entries[1].compression(), Compression::Deflate);
+    assert_eq!(
+        zip_entries[1].filename().as_str().unwrap(),
+        EMBEDDED_CATALOG_PATH
+    );
+
+    let mut file = zip.reader_with_entry(0).await.unwrap();
+    let mut file_bytes = Vec::new();
+    FuturesAsyncReadExt::read_to_end(&mut file, &mut file_bytes)
+        .await
+        .unwrap();
+    assert_eq!(file_bytes, b"alpha alpha alpha");
+
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
 #[tokio::test]
 async fn upload_zip_rejects_uncompressed_size_overflow() {
     let entries = vec![
@@ -349,7 +395,7 @@ async fn upload_zip_rejects_uncompressed_size_overflow() {
     ];
     let mut data = Vec::new();
 
-    let err = write_upload_zip(&mut data, &entries, false, None)
+    let err = write_upload_zip(&mut data, &entries, false, ZipCompression::Deflate, None)
         .await
         .unwrap_err();
 
@@ -375,9 +421,15 @@ async fn upload_zip_emits_file_progress_events() {
     });
 
     let mut data = Vec::new();
-    write_upload_zip(&mut data, &entries, true, Some(progress))
-        .await
-        .unwrap();
+    write_upload_zip(
+        &mut data,
+        &entries,
+        true,
+        ZipCompression::Deflate,
+        Some(progress),
+    )
+    .await
+    .unwrap();
 
     let events = events.lock().unwrap().clone();
     assert_eq!(
@@ -436,9 +488,15 @@ async fn upload_zip_progress_uses_measured_file_bytes() {
     });
 
     let mut data = Vec::new();
-    write_upload_zip(&mut data, &entries, false, Some(progress))
-        .await
-        .unwrap();
+    write_upload_zip(
+        &mut data,
+        &entries,
+        false,
+        ZipCompression::Deflate,
+        Some(progress),
+    )
+    .await
+    .unwrap();
 
     let events = events.lock().unwrap().clone();
     assert!(events.iter().any(|event| matches!(
@@ -619,6 +677,32 @@ async fn unzips_local_zip_to_local_directory_and_overwrites_files() {
     );
 
     tokio::fs::remove_dir_all(source_root).await.unwrap();
+    tokio::fs::remove_dir_all(zip_dir).await.unwrap();
+    tokio::fs::remove_dir_all(destination).await.unwrap();
+}
+
+#[cfg(feature = "zstd")]
+#[tokio::test]
+async fn local_unzip_reads_zstd_entries() {
+    let zip_dir = unique_temp_dir("unzip-zstd-zip");
+    let destination = unique_temp_dir("unzip-zstd-destination");
+    let source_zip = zip_dir.join("site.zip");
+    tokio::fs::create_dir_all(&zip_dir).await.unwrap();
+
+    let zip_bytes = test_zip(&[("zstd.txt", Compression::Zstd, b"zstd payload".as_slice())]).await;
+    tokio::fs::write(&source_zip, zip_bytes).await.unwrap();
+
+    let report = unzip_file_to_local(LocalUnzipOptions::new(&source_zip, &destination))
+        .await
+        .unwrap();
+
+    assert_eq!(report.summary.zip_files, 1);
+    assert_eq!(report.summary.uploaded_new, 1);
+    assert_eq!(
+        tokio::fs::read(destination.join("zstd.txt")).await.unwrap(),
+        b"zstd payload"
+    );
+
     tokio::fs::remove_dir_all(zip_dir).await.unwrap();
     tokio::fs::remove_dir_all(destination).await.unwrap();
 }
@@ -997,9 +1081,10 @@ async fn s3_prefix_upload_zip_writes_directory_markers() {
     }];
 
     let mut data = Vec::new();
-    let catalog_entries = write_upload_zip(&mut data, &entries, true, None)
-        .await
-        .unwrap();
+    let catalog_entries =
+        write_upload_zip(&mut data, &entries, true, ZipCompression::Deflate, None)
+            .await
+            .unwrap();
 
     assert!(catalog_entries.is_empty());
     let zip = async_zip::base::read::mem::ZipFileReader::new(data)
@@ -1774,6 +1859,30 @@ async fn entry_reader_streams_stored_and_deflated_entries_from_cached_ranges() {
         .await
         .unwrap();
     assert_eq!(deflated, b"bravo");
+}
+
+#[cfg(feature = "zstd")]
+#[tokio::test]
+async fn entry_reader_streams_zstd_entries_from_cached_ranges() {
+    let data = test_zip(&[("zstd.txt", Compression::Zstd, b"charlie".as_slice())]).await;
+    let source_len = data.len() as u64;
+    let reader = async_zip::base::read::mem::ZipFileReader::new(data.clone())
+        .await
+        .unwrap();
+    let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
+    let manifest =
+        build_manifest_entries(reader.file().entries(), &destination, source_len).unwrap();
+    let store = block_store_from_zip(data, &manifest.entries);
+
+    assert_eq!(manifest.entries[0].compression, Compression::Zstd);
+    assert_eq!(u16::from(manifest.entries[0].compression), 93);
+
+    let mut zstd_reader = entry_reader(store, &manifest.entries[0]).await.unwrap();
+    let mut zstd = Vec::new();
+    TokioAsyncReadExt::read_to_end(&mut zstd_reader, &mut zstd)
+        .await
+        .unwrap();
+    assert_eq!(zstd, b"charlie");
 }
 
 #[tokio::test]

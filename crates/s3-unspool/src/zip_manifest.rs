@@ -259,6 +259,8 @@ fn validate_stored_entry(
 
     match stored.compression() {
         Compression::Stored | Compression::Deflate => {}
+        #[cfg(feature = "zstd")]
+        Compression::Zstd => {}
         other => {
             return Err(Error::InvalidZipEntry {
                 path: zip_path.to_string(),
