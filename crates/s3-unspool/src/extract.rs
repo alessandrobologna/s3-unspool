@@ -5,6 +5,8 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,6 +33,18 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, INVALID_HANDLE_VALUE,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileCaseSensitiveInfo,
+    GetFileInformationByHandleEx, OPEN_EXISTING,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::SystemServices::FILE_CS_FLAG_CASE_SENSITIVE_DIR;
 
 use crate::catalog::{EmbeddedCatalog, catalog_md5_by_path};
 use crate::constants::{EMBEDDED_CATALOG_MAX_BYTES, EMBEDDED_CATALOG_PATH};
@@ -2560,11 +2574,6 @@ fn platform_case_insensitive_paths(path: &Path) -> Result<Option<bool>> {
     Ok(None)
 }
 
-#[cfg(not(unix))]
-fn platform_case_insensitive_paths(_path: &Path) -> Result<Option<bool>> {
-    Ok(None)
-}
-
 #[cfg(target_os = "linux")]
 fn linux_case_insensitive_paths(path: &Path) -> Result<Option<bool>> {
     if linux_directory_has_casefold_flag(path)? {
@@ -2671,6 +2680,80 @@ async fn infer_case_insensitive_paths_from_existing_names(path: &Path) -> Result
 #[cfg(not(unix))]
 async fn infer_case_insensitive_paths_from_existing_names(_path: &Path) -> Result<Option<bool>> {
     Ok(None)
+}
+
+#[cfg(windows)]
+fn platform_case_insensitive_paths(path: &Path) -> Result<Option<bool>> {
+    let display_path = path.to_path_buf();
+    let path = windows_path(path);
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(invalid_local_path(
+            &display_path,
+            format!(
+                "cannot open destination directory for case-sensitivity probe: {}",
+                std::io::Error::last_os_error()
+            ),
+        ));
+    }
+
+    let mut info = FILE_CASE_SENSITIVE_INFO { Flags: 0 };
+    let query_result = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileCaseSensitiveInfo,
+            &mut info as *mut FILE_CASE_SENSITIVE_INFO as *mut std::ffi::c_void,
+            std::mem::size_of::<FILE_CASE_SENSITIVE_INFO>() as u32,
+        )
+    };
+    let query_error = (query_result == 0).then(std::io::Error::last_os_error);
+    let close_result = unsafe { CloseHandle(handle) };
+    if close_result == 0 {
+        return Err(invalid_local_path(
+            &display_path,
+            format!(
+                "cannot close destination directory after case-sensitivity probe: {}",
+                std::io::Error::last_os_error()
+            ),
+        ));
+    }
+
+    if let Some(err) = query_error {
+        return match err.raw_os_error() {
+            Some(code)
+                if code == ERROR_INVALID_FUNCTION as i32
+                    || code == ERROR_INVALID_PARAMETER as i32 =>
+            {
+                Ok(None)
+            }
+            _ => Err(invalid_local_path(
+                &display_path,
+                format!("cannot query destination case sensitivity: {err}"),
+            )),
+        };
+    }
+
+    Ok(Some(info.Flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR == 0))
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn platform_case_insensitive_paths(_path: &Path) -> Result<Option<bool>> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn windows_path(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
 fn alternate_case_name(name: &std::ffi::OsStr) -> Option<String> {
