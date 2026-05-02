@@ -7,6 +7,90 @@ use serde::{Deserialize, Serialize};
 use crate::constants::*;
 use crate::s3_uri::{S3Object, S3Prefix};
 
+/// ZIP entry selection patterns for unzip APIs.
+///
+/// When no patterns are configured, unzip operations process every supported ZIP
+/// entry. Patterns are matched against normalized ZIP paths, not local
+/// filesystem paths or destination S3 keys. Use
+/// [`UnzipSelection::new`]/[`UnzipSelection::include`] for builder-style
+/// configuration, or pass an array such as `["docs/**", "!docs/drafts/**"]`
+/// to `with_selection`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UnzipSelection {
+    patterns: Vec<String>,
+}
+
+impl UnzipSelection {
+    /// Creates an empty selection that extracts every supported ZIP entry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a selection from ordered include/exclude patterns.
+    ///
+    /// Patterns use gitignore-style matching. Later patterns override earlier
+    /// patterns, and patterns prefixed with `!` exclude matching ZIP paths.
+    /// If only exclude patterns are configured, every non-excluded ZIP path is
+    /// selected.
+    pub fn patterns(patterns: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            patterns: patterns.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Adds an include pattern.
+    ///
+    /// Leading `!` and `#` characters are treated as literal path characters
+    /// in the builder API. Use [`Self::patterns`] for raw selection lines.
+    pub fn include(mut self, pattern: impl Into<String>) -> Self {
+        self.patterns
+            .push(escape_leading_gitignore_marker(pattern.into()));
+        self
+    }
+
+    /// Adds an exclude pattern.
+    ///
+    /// Leading `!` and `#` characters are treated as literal path characters
+    /// in the builder API. Use [`Self::patterns`] for raw selection lines.
+    pub fn exclude(mut self, pattern: impl Into<String>) -> Self {
+        self.patterns.push(format!(
+            "!{}",
+            escape_leading_gitignore_marker(pattern.into())
+        ));
+        self
+    }
+
+    /// Returns true when no selection patterns have been configured.
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    /// Returns the ordered selection patterns.
+    pub fn as_patterns(&self) -> &[String] {
+        &self.patterns
+    }
+}
+
+impl<const N: usize> From<[&str; N]> for UnzipSelection {
+    fn from(patterns: [&str; N]) -> Self {
+        Self::patterns(patterns)
+    }
+}
+
+impl From<Vec<String>> for UnzipSelection {
+    fn from(patterns: Vec<String>) -> Self {
+        Self { patterns }
+    }
+}
+
+fn escape_leading_gitignore_marker(pattern: String) -> String {
+    if pattern.starts_with('!') || pattern.starts_with('#') {
+        format!("\\{pattern}")
+    } else {
+        pattern
+    }
+}
+
 /// Options for extracting a ZIP object from S3 into an S3 prefix.
 #[derive(Clone, Debug)]
 pub struct SyncOptions {
@@ -19,6 +103,10 @@ pub struct SyncOptions {
     /// This option requires a non-empty destination prefix so a bucket root is
     /// never swept accidentally.
     pub delete_extra: bool,
+    /// ZIP entry selection. Empty selection extracts every supported entry.
+    ///
+    /// Selection cannot be combined with [`Self::delete_extra`].
+    pub selection: UnzipSelection,
     /// Collect source scheduler diagnostics in the returned report.
     pub collect_diagnostics: bool,
     /// Ignore the embedded update catalog even when the ZIP contains one.
@@ -80,6 +168,7 @@ impl SyncOptions {
             source,
             destination,
             delete_extra: false,
+            selection: UnzipSelection::default(),
             collect_diagnostics: false,
             ignore_embedded_catalog: false,
             fail_on_conditional_conflict: false,
@@ -95,6 +184,12 @@ impl SyncOptions {
             body_chunk_size: DEFAULT_BODY_CHUNK_SIZE,
             pipe_capacity: DEFAULT_PIPE_CAPACITY,
         }
+    }
+
+    /// Sets ZIP entry selection patterns.
+    pub fn with_selection(mut self, selection: impl Into<UnzipSelection>) -> Self {
+        self.selection = selection.into();
+        self
     }
 }
 
@@ -280,6 +375,10 @@ pub struct LocalZipSyncOptions {
     /// This option requires a non-empty destination prefix so a bucket root is
     /// never treated as a sync deletion scope.
     pub delete_extra: bool,
+    /// ZIP entry selection. Empty selection extracts every supported entry.
+    ///
+    /// Selection cannot be combined with [`Self::delete_extra`].
+    pub selection: UnzipSelection,
     /// Ignore the embedded update catalog even when the ZIP contains one.
     pub ignore_embedded_catalog: bool,
     /// Collect one operation record per processed object in the returned report.
@@ -299,6 +398,8 @@ pub struct S3ZipLocalUnzipOptions {
     pub source: S3Object,
     /// Destination local directory.
     pub destination_dir: PathBuf,
+    /// ZIP entry selection. Empty selection extracts every supported entry.
+    pub selection: UnzipSelection,
     /// Collect source scheduler diagnostics in the returned report.
     pub collect_diagnostics: bool,
     /// Ignore the embedded update catalog even when the ZIP contains one.
@@ -326,6 +427,8 @@ pub struct LocalUnzipOptions {
     pub source_zip: PathBuf,
     /// Destination local directory.
     pub destination_dir: PathBuf,
+    /// ZIP entry selection. Empty selection extracts every supported entry.
+    pub selection: UnzipSelection,
     /// Ignore the embedded update catalog even when the ZIP contains one.
     pub ignore_embedded_catalog: bool,
     /// Collect one operation record per processed entry in the returned report.
@@ -440,12 +543,19 @@ impl LocalZipSyncOptions {
             source_zip: source_zip.into(),
             destination,
             delete_extra: false,
+            selection: UnzipSelection::default(),
             ignore_embedded_catalog: false,
             collect_operations: true,
             concurrency: DEFAULT_CONCURRENCY,
             body_chunk_size: DEFAULT_BODY_CHUNK_SIZE,
             pipe_capacity: DEFAULT_PIPE_CAPACITY,
         }
+    }
+
+    /// Sets ZIP entry selection patterns.
+    pub fn with_selection(mut self, selection: impl Into<UnzipSelection>) -> Self {
+        self.selection = selection.into();
+        self
     }
 }
 
@@ -456,6 +566,7 @@ impl std::fmt::Debug for LocalZipSyncOptions {
             .field("source_zip", &self.source_zip)
             .field("destination", &self.destination)
             .field("delete_extra", &self.delete_extra)
+            .field("selection", &self.selection)
             .field("ignore_embedded_catalog", &self.ignore_embedded_catalog)
             .field("collect_operations", &self.collect_operations)
             .field("concurrency", &self.concurrency)
@@ -471,6 +582,7 @@ impl S3ZipLocalUnzipOptions {
         Self {
             source,
             destination_dir: destination_dir.into(),
+            selection: UnzipSelection::default(),
             collect_diagnostics: false,
             ignore_embedded_catalog: false,
             collect_operations: true,
@@ -482,6 +594,12 @@ impl S3ZipLocalUnzipOptions {
             source_window_memory_budget_mb: None,
         }
     }
+
+    /// Sets ZIP entry selection patterns.
+    pub fn with_selection(mut self, selection: impl Into<UnzipSelection>) -> Self {
+        self.selection = selection.into();
+        self
+    }
 }
 
 impl std::fmt::Debug for S3ZipLocalUnzipOptions {
@@ -490,6 +608,7 @@ impl std::fmt::Debug for S3ZipLocalUnzipOptions {
             .debug_struct("S3ZipLocalUnzipOptions")
             .field("source", &self.source)
             .field("destination_dir", &self.destination_dir)
+            .field("selection", &self.selection)
             .field("collect_diagnostics", &self.collect_diagnostics)
             .field("ignore_embedded_catalog", &self.ignore_embedded_catalog)
             .field("collect_operations", &self.collect_operations)
@@ -512,10 +631,17 @@ impl LocalUnzipOptions {
         Self {
             source_zip: source_zip.into(),
             destination_dir: destination_dir.into(),
+            selection: UnzipSelection::default(),
             ignore_embedded_catalog: false,
             collect_operations: true,
             concurrency: DEFAULT_CONCURRENCY,
         }
+    }
+
+    /// Sets ZIP entry selection patterns.
+    pub fn with_selection(mut self, selection: impl Into<UnzipSelection>) -> Self {
+        self.selection = selection.into();
+        self
     }
 }
 
@@ -525,6 +651,7 @@ impl std::fmt::Debug for LocalUnzipOptions {
             .debug_struct("LocalUnzipOptions")
             .field("source_zip", &self.source_zip)
             .field("destination_dir", &self.destination_dir)
+            .field("selection", &self.selection)
             .field("ignore_embedded_catalog", &self.ignore_embedded_catalog)
             .field("collect_operations", &self.collect_operations)
             .field("concurrency", &self.concurrency)

@@ -4,7 +4,7 @@ use aws_sdk_s3::config::StalledStreamProtectionConfig;
 use lambda_runtime::{Error as LambdaError, LambdaEvent, service_fn};
 use s3_unspool::{
     ObjectReport, S3Object, S3Prefix, SyncDiagnostics, SyncOptions, SyncReport, SyncSummary,
-    adaptive_source_get_concurrency, sync_zip_to_s3_with_clients,
+    UnzipSelection, adaptive_source_get_concurrency, sync_zip_to_s3_with_clients,
 };
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,10 @@ struct InvokePayload {
     ignore_embedded_catalog: bool,
     #[serde(default, alias = "includeOperations")]
     include_operations: bool,
+    #[serde(default, alias = "include", alias = "includePatterns")]
+    include_patterns: Vec<String>,
+    #[serde(default, alias = "exclude", alias = "excludePatterns")]
+    exclude_patterns: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -72,6 +76,8 @@ async fn handle(event: LambdaEvent<InvokePayload>) -> Result<InvokeResponse, Lam
         diagnostics = payload.diagnostics,
         include_operations,
         ignore_embedded_catalog = payload.ignore_embedded_catalog,
+        selection_includes = payload.include_patterns.len(),
+        selection_excludes = payload.exclude_patterns.len(),
         concurrency,
         "lambda extract invoke started"
     );
@@ -166,6 +172,14 @@ impl InvokePayload {
         options.concurrency = concurrency;
         options.ignore_embedded_catalog = self.ignore_embedded_catalog;
         options.collect_operations = self.include_operations;
+        let mut selection = UnzipSelection::new();
+        for pattern in self.include_patterns {
+            selection = selection.include(pattern);
+        }
+        for pattern in self.exclude_patterns {
+            selection = selection.exclude(pattern);
+        }
+        options.selection = selection;
         Ok(options)
     }
 }
@@ -206,6 +220,8 @@ mod tests {
         assert_eq!(payload.concurrency, None);
         assert!(!payload.ignore_embedded_catalog);
         assert!(!payload.include_operations);
+        assert!(payload.include_patterns.is_empty());
+        assert!(payload.exclude_patterns.is_empty());
     }
 
     #[test]
@@ -218,7 +234,9 @@ mod tests {
                 "collectDiagnostics": true,
                 "concurrency": 8,
                 "ignoreCatalog": true,
-                "includeOperations": true
+                "includeOperations": true,
+                "includePatterns": ["docs/**/*.md", "index.md"],
+                "excludePatterns": ["docs/drafts/**"]
             }"#,
         )
         .unwrap();
@@ -240,6 +258,10 @@ mod tests {
         assert!(!options.fail_on_conditional_conflict);
         assert!(options.collect_operations);
         assert_eq!(options.source_window_memory_budget_mb, None);
+        assert_eq!(
+            options.selection.as_patterns(),
+            ["docs/**/*.md", "index.md", "!docs/drafts/**"]
+        );
     }
 
     #[test]

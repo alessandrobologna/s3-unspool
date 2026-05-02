@@ -55,14 +55,34 @@ pub(crate) async fn load_zip_manifest(
     source_block_size: usize,
     entry_size_limit: Option<u64>,
 ) -> Result<ZipManifest> {
+    load_zip_manifest_with_filter(
+        source,
+        destination,
+        ignore_embedded_catalog,
+        source_block_size,
+        entry_size_limit,
+        |_| true,
+    )
+    .await
+}
+
+pub(crate) async fn load_zip_manifest_with_filter(
+    source: Arc<SourceClient>,
+    destination: &S3Prefix,
+    ignore_embedded_catalog: bool,
+    source_block_size: usize,
+    entry_size_limit: Option<u64>,
+    include_entry: impl Fn(&ZipEntryPath) -> bool,
+) -> Result<ZipManifest> {
     let reader = S3RangeReader::new(Arc::clone(&source), source_block_size);
     let reader = ZipFileReader::with_tokio(reader).await?;
     let zip_file = reader.file().clone();
-    let build = build_manifest_entries_with_size_limit(
+    let build = build_manifest_entries_with_size_limit_and_filter(
         zip_file.entries(),
         destination,
         source.len,
         entry_size_limit,
+        include_entry,
     )?;
     let catalog = if ignore_embedded_catalog {
         HashMap::new()
@@ -93,11 +113,28 @@ pub(crate) fn build_manifest_entries(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn build_manifest_entries_with_size_limit(
     entries: &[StoredZipEntry],
     destination: &S3Prefix,
     source_len: u64,
     entry_size_limit: Option<u64>,
+) -> Result<ManifestBuild> {
+    build_manifest_entries_with_size_limit_and_filter(
+        entries,
+        destination,
+        source_len,
+        entry_size_limit,
+        |_| true,
+    )
+}
+
+pub(crate) fn build_manifest_entries_with_size_limit_and_filter(
+    entries: &[StoredZipEntry],
+    destination: &S3Prefix,
+    source_len: u64,
+    entry_size_limit: Option<u64>,
+    include_entry: impl Fn(&ZipEntryPath) -> bool,
 ) -> Result<ManifestBuild> {
     let mut seen = HashSet::new();
     let mut manifest = Vec::new();
@@ -110,13 +147,20 @@ pub(crate) fn build_manifest_entries_with_size_limit(
 
     for (index, stored) in entries.iter().enumerate() {
         let zip_entry_path = stored_zip_entry_path(stored)?;
-        let zip_path = zip_entry_path.path;
-        let is_directory = zip_entry_path.is_directory;
 
-        if !is_directory && zip_path == EMBEDDED_CATALOG_PATH {
+        if !zip_entry_path.is_directory && zip_entry_path.path == EMBEDDED_CATALOG_PATH {
             catalog_index = Some(index);
             continue;
         }
+
+        if !include_entry(&zip_entry_path) {
+            continue;
+        }
+
+        let ZipEntryPath {
+            path: zip_path,
+            is_directory,
+        } = zip_entry_path;
 
         validate_stored_entry(stored, &zip_path, is_directory, entry_size_limit)?;
         if !seen.insert(zip_path.clone()) {

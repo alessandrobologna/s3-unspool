@@ -30,15 +30,15 @@ use crate::upload::{
 };
 use crate::zip_manifest::{
     ManifestBuild, ManifestEntry, apply_embedded_catalog, build_manifest_entries,
-    build_manifest_entries_with_size_limit, count_zip_file_entries, normalize_zip_entry_path,
-    normalize_zip_file_path,
+    build_manifest_entries_with_size_limit, build_manifest_entries_with_size_limit_and_filter,
+    count_zip_file_entries, normalize_zip_entry_path, normalize_zip_file_path,
 };
 use crate::{
     DryRunOperationStatus, Error, LocalUnzipOptions, LocalZipOptions, ObjectReport,
     OperationStatus, PutRetryPolicy, S3Object, S3Prefix, S3PrefixLocalZipOptions, SyncOptions,
-    SyncReport, SyncSummary, UploadProgress, UploadProgressHandler, dry_run_unzip_file_to_local,
-    dry_run_zip_directory_to_file, unzip_file_to_local, zip_directory_to_file,
-    zip_s3_prefix_to_file,
+    SyncReport, SyncSummary, UnzipSelection, UploadProgress, UploadProgressHandler,
+    dry_run_unzip_file_to_local, dry_run_zip_directory_to_file, unzip_file_to_local,
+    zip_directory_to_file, zip_s3_prefix_to_file,
 };
 
 #[test]
@@ -66,6 +66,25 @@ fn rejects_source_without_key() {
 fn rejects_s3_object_uri_with_only_repeated_slashes() {
     let err = S3Object::parse("s3://bucket//").unwrap_err();
     assert!(err.to_string().contains("missing object key"));
+}
+
+#[test]
+fn unzip_selection_builder_treats_leading_markers_as_literals() {
+    let selection = UnzipSelection::new()
+        .include("!important.md")
+        .include("#notes.md")
+        .exclude("!draft.md")
+        .exclude("#draft.md");
+
+    assert_eq!(
+        selection.as_patterns(),
+        [
+            "\\!important.md",
+            "\\#notes.md",
+            "!\\!draft.md",
+            "!\\#draft.md"
+        ]
+    );
 }
 
 #[test]
@@ -713,6 +732,239 @@ async fn dry_run_local_unzip_reports_directory_component_error_path() {
             .contains("exists and is not a directory")
     );
 
+    tokio::fs::remove_dir_all(zip_dir).await.unwrap();
+    tokio::fs::remove_dir_all(destination).await.unwrap();
+}
+
+#[tokio::test]
+async fn local_unzip_extracts_selected_exact_path_only() {
+    let zip_dir = unique_temp_dir("unzip-selected-exact-zip");
+    let destination = unique_temp_dir("unzip-selected-exact-destination");
+    let source_zip = zip_dir.join("site.zip");
+    tokio::fs::create_dir_all(&zip_dir).await.unwrap();
+    tokio::fs::create_dir_all(&destination).await.unwrap();
+    let zip_bytes = test_zip(&[
+        ("a.txt", Compression::Stored, b"alpha".as_slice()),
+        ("nested/b.txt", Compression::Stored, b"bravo".as_slice()),
+        ("nested/c.txt", Compression::Stored, b"charlie".as_slice()),
+    ])
+    .await;
+    tokio::fs::write(&source_zip, zip_bytes).await.unwrap();
+
+    let options =
+        LocalUnzipOptions::new(&source_zip, &destination).with_selection(["nested/b.txt"]);
+    let report = unzip_file_to_local(options).await.unwrap();
+
+    assert_eq!(report.summary.zip_files, 1);
+    assert_eq!(report.summary.uploaded_new, 1);
+    assert_eq!(
+        tokio::fs::read(destination.join("nested").join("b.txt"))
+            .await
+            .unwrap(),
+        b"bravo"
+    );
+    assert!(
+        tokio::fs::metadata(destination.join("a.txt"))
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::fs::metadata(destination.join("nested").join("c.txt"))
+            .await
+            .is_err()
+    );
+    tokio::fs::remove_dir_all(zip_dir).await.unwrap();
+    tokio::fs::remove_dir_all(destination).await.unwrap();
+}
+
+#[tokio::test]
+async fn local_unzip_extracts_selected_prefix_only() {
+    let zip_dir = unique_temp_dir("unzip-selected-prefix-zip");
+    let destination = unique_temp_dir("unzip-selected-prefix-destination");
+    let source_zip = zip_dir.join("site.zip");
+    tokio::fs::create_dir_all(&zip_dir).await.unwrap();
+    tokio::fs::create_dir_all(&destination).await.unwrap();
+    let zip_bytes = test_zip(&[
+        ("a.txt", Compression::Stored, b"alpha".as_slice()),
+        ("nested/", Compression::Stored, b"".as_slice()),
+        ("nested/b.txt", Compression::Stored, b"bravo".as_slice()),
+        ("nested/c.txt", Compression::Stored, b"charlie".as_slice()),
+    ])
+    .await;
+    tokio::fs::write(&source_zip, zip_bytes).await.unwrap();
+
+    let options = LocalUnzipOptions::new(&source_zip, &destination).with_selection(["nested/"]);
+    let report = unzip_file_to_local(options).await.unwrap();
+
+    assert_eq!(report.summary.zip_files, 3);
+    assert_eq!(report.summary.uploaded_new, 3);
+    assert!(
+        tokio::fs::metadata(destination.join("nested"))
+            .await
+            .unwrap()
+            .is_dir()
+    );
+    assert_eq!(
+        tokio::fs::read(destination.join("nested").join("b.txt"))
+            .await
+            .unwrap(),
+        b"bravo"
+    );
+    assert_eq!(
+        tokio::fs::read(destination.join("nested").join("c.txt"))
+            .await
+            .unwrap(),
+        b"charlie"
+    );
+    assert!(
+        tokio::fs::metadata(destination.join("a.txt"))
+            .await
+            .is_err()
+    );
+    tokio::fs::remove_dir_all(zip_dir).await.unwrap();
+    tokio::fs::remove_dir_all(destination).await.unwrap();
+}
+
+#[tokio::test]
+async fn local_unzip_extracts_with_exclude_only_selection() {
+    let zip_dir = unique_temp_dir("unzip-selected-exclude-only-zip");
+    let destination = unique_temp_dir("unzip-selected-exclude-only-destination");
+    let source_zip = zip_dir.join("site.zip");
+    tokio::fs::create_dir_all(&zip_dir).await.unwrap();
+    tokio::fs::create_dir_all(&destination).await.unwrap();
+    let zip_bytes = test_zip(&[
+        ("index.md", Compression::Stored, b"index".as_slice()),
+        ("docs/live.md", Compression::Stored, b"live".as_slice()),
+        (
+            "docs/drafts/old.md",
+            Compression::Stored,
+            b"draft".as_slice(),
+        ),
+    ])
+    .await;
+    tokio::fs::write(&source_zip, zip_bytes).await.unwrap();
+
+    let options = LocalUnzipOptions::new(&source_zip, &destination)
+        .with_selection(UnzipSelection::new().exclude("docs/drafts/**"));
+    let report = unzip_file_to_local(options).await.unwrap();
+
+    assert_eq!(report.summary.zip_files, 2);
+    assert_eq!(report.summary.uploaded_new, 2);
+    assert_eq!(
+        tokio::fs::read(destination.join("index.md")).await.unwrap(),
+        b"index"
+    );
+    assert_eq!(
+        tokio::fs::read(destination.join("docs").join("live.md"))
+            .await
+            .unwrap(),
+        b"live"
+    );
+    assert!(
+        tokio::fs::metadata(destination.join("docs").join("drafts").join("old.md"))
+            .await
+            .is_err()
+    );
+    tokio::fs::remove_dir_all(zip_dir).await.unwrap();
+    tokio::fs::remove_dir_all(destination).await.unwrap();
+}
+
+#[tokio::test]
+async fn local_unzip_extracts_with_include_then_exclude_selection() {
+    let zip_dir = unique_temp_dir("unzip-selected-include-exclude-zip");
+    let destination = unique_temp_dir("unzip-selected-include-exclude-destination");
+    let source_zip = zip_dir.join("site.zip");
+    tokio::fs::create_dir_all(&zip_dir).await.unwrap();
+    tokio::fs::create_dir_all(&destination).await.unwrap();
+    let zip_bytes = test_zip(&[
+        ("index.md", Compression::Stored, b"index".as_slice()),
+        ("docs/live.md", Compression::Stored, b"live".as_slice()),
+        (
+            "docs/drafts/old.md",
+            Compression::Stored,
+            b"draft".as_slice(),
+        ),
+        ("images/logo.png", Compression::Stored, b"image".as_slice()),
+    ])
+    .await;
+    tokio::fs::write(&source_zip, zip_bytes).await.unwrap();
+
+    let options = LocalUnzipOptions::new(&source_zip, &destination).with_selection(
+        UnzipSelection::new()
+            .include("docs/**")
+            .exclude("docs/drafts/**"),
+    );
+    let report = unzip_file_to_local(options).await.unwrap();
+
+    assert_eq!(report.summary.zip_files, 1);
+    assert_eq!(report.summary.uploaded_new, 1);
+    assert_eq!(
+        tokio::fs::read(destination.join("docs").join("live.md"))
+            .await
+            .unwrap(),
+        b"live"
+    );
+    assert!(
+        tokio::fs::metadata(destination.join("index.md"))
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::fs::metadata(destination.join("docs").join("drafts").join("old.md"))
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::fs::metadata(destination.join("images").join("logo.png"))
+            .await
+            .is_err()
+    );
+    tokio::fs::remove_dir_all(zip_dir).await.unwrap();
+    tokio::fs::remove_dir_all(destination).await.unwrap();
+}
+
+#[tokio::test]
+async fn local_unzip_selection_preserves_leading_space_patterns() {
+    let zip_dir = unique_temp_dir("unzip-selected-leading-space-zip");
+    let destination = unique_temp_dir("unzip-selected-leading-space-destination");
+    let source_zip = zip_dir.join("site.zip");
+    tokio::fs::create_dir_all(&zip_dir).await.unwrap();
+    tokio::fs::create_dir_all(&destination).await.unwrap();
+    let zip_bytes = test_zip(&[
+        (" #notes.md", Compression::Stored, b"notes".as_slice()),
+        (
+            " !important.md",
+            Compression::Stored,
+            b"important".as_slice(),
+        ),
+        ("other.md", Compression::Stored, b"other".as_slice()),
+    ])
+    .await;
+    tokio::fs::write(&source_zip, zip_bytes).await.unwrap();
+
+    let options = LocalUnzipOptions::new(&source_zip, &destination)
+        .with_selection([" #notes.md", " !important.md"]);
+    let report = unzip_file_to_local(options).await.unwrap();
+
+    assert_eq!(report.summary.zip_files, 2);
+    assert_eq!(report.summary.uploaded_new, 2);
+    assert_eq!(
+        tokio::fs::read(destination.join(" #notes.md"))
+            .await
+            .unwrap(),
+        b"notes"
+    );
+    assert_eq!(
+        tokio::fs::read(destination.join(" !important.md"))
+            .await
+            .unwrap(),
+        b"important"
+    );
+    assert!(
+        tokio::fs::metadata(destination.join("other.md"))
+            .await
+            .is_err()
+    );
     tokio::fs::remove_dir_all(zip_dir).await.unwrap();
     tokio::fs::remove_dir_all(destination).await.unwrap();
 }
@@ -1677,6 +1929,32 @@ async fn manifest_size_limit_can_be_disabled_for_local_unzip() {
     assert_eq!(manifest.entries.len(), 1);
     assert_eq!(manifest.entries[0].zip_path, "large.txt");
     assert_eq!(manifest.entries[0].size, 5);
+}
+
+#[tokio::test]
+async fn manifest_selection_skips_unselected_size_limit_failures() {
+    let data = test_zip(&[
+        ("selected.txt", Compression::Stored, b"ok".as_slice()),
+        ("large.txt", Compression::Stored, b"alpha".as_slice()),
+    ])
+    .await;
+    let source_len = data.len() as u64;
+    let reader = async_zip::base::read::mem::ZipFileReader::new(data)
+        .await
+        .unwrap();
+    let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
+
+    let manifest = build_manifest_entries_with_size_limit_and_filter(
+        reader.file().entries(),
+        &destination,
+        source_len,
+        Some(4),
+        |entry| entry.path == "selected.txt",
+    )
+    .unwrap();
+
+    assert_eq!(manifest.entries.len(), 1);
+    assert_eq!(manifest.entries[0].zip_path, "selected.txt");
 }
 
 #[tokio::test]
