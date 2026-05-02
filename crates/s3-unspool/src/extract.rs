@@ -26,6 +26,8 @@ use futures_util::TryStreamExt;
 use futures_util::stream::{self, StreamExt};
 use http_body::Frame;
 use http_body_util::StreamBody;
+use ignore::Match;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use md5::{Digest, Md5};
 use tokio::io::AsyncRead;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -53,7 +55,7 @@ use crate::entry_reader::{EntryReader, entry_reader};
 use crate::error::{Error, Result, aws_error_context, aws_error_message};
 use crate::options::{
     LocalUnzipOptions, LocalZipSyncOptions, PutRetryPolicy, RetryJitter, S3ZipLocalUnzipOptions,
-    SyncOptions, adaptive_source_window_capacity,
+    SyncOptions, UnzipSelection, adaptive_source_window_capacity,
 };
 use crate::range::{
     BlockStore, SourceClient, SourceDiagnosticsCollector, plan_source_blocks,
@@ -71,7 +73,8 @@ use crate::upload::{
     invalid_local_path, is_platform_path_alias_symlink, replace_temp_file, temp_sibling_path,
 };
 use crate::zip_manifest::{
-    ManifestEntry, load_zip_manifest, normalize_zip_entry_path, validate_crc32_value,
+    ManifestEntry, ZipEntryPath, load_zip_manifest, load_zip_manifest_with_filter,
+    normalize_zip_entry_path, validate_crc32_value,
 };
 
 const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
@@ -335,6 +338,84 @@ async fn stop_progress_logger(progress_task: Option<JoinHandle<()>>) {
     }
 }
 
+#[derive(Debug, Default)]
+struct NormalizedUnzipSelection {
+    matcher: Option<Gitignore>,
+    pattern_count: usize,
+    default_include: bool,
+}
+
+impl NormalizedUnzipSelection {
+    fn is_empty(&self) -> bool {
+        self.matcher.is_none()
+    }
+
+    fn matches(&self, entry: &ZipEntryPath) -> bool {
+        let Some(matcher) = &self.matcher else {
+            return true;
+        };
+
+        let path = if entry.is_directory {
+            entry.path.trim_end_matches('/')
+        } else {
+            entry.path.as_str()
+        };
+        match matcher.matched_path_or_any_parents(path, entry.is_directory) {
+            Match::Ignore(_) => true,
+            Match::Whitelist(_) => false,
+            Match::None => self.default_include,
+        }
+    }
+}
+
+fn normalize_unzip_selection(selection: &UnzipSelection) -> Result<NormalizedUnzipSelection> {
+    if selection.is_empty() {
+        return Ok(NormalizedUnzipSelection::default());
+    }
+
+    let mut builder = GitignoreBuilder::new("");
+    let mut pattern_count = 0;
+    let mut has_include_pattern = false;
+    for raw_pattern in selection.as_patterns() {
+        builder.add_line(None, raw_pattern).map_err(|err| {
+            Error::InvalidOption(format!(
+                "invalid unzip selection pattern {raw_pattern:?}: {err}"
+            ))
+        })?;
+        let trimmed = raw_pattern.trim_start();
+        if !trimmed.trim_end().is_empty() && !trimmed.starts_with('#') {
+            pattern_count += 1;
+            if !trimmed.starts_with('!') {
+                has_include_pattern = true;
+            }
+        }
+    }
+    if pattern_count == 0 {
+        return Ok(NormalizedUnzipSelection::default());
+    }
+    let matcher = builder
+        .build()
+        .map_err(|err| Error::InvalidOption(format!("invalid unzip selection: {err}")))?;
+
+    Ok(NormalizedUnzipSelection {
+        matcher: Some(matcher),
+        pattern_count,
+        default_include: !has_include_pattern,
+    })
+}
+
+fn validate_delete_extra_selection(
+    delete_extra: bool,
+    selection: &NormalizedUnzipSelection,
+) -> Result<()> {
+    if delete_extra && !selection.is_empty() {
+        return Err(Error::InvalidOption(
+            "delete_extra cannot be combined with unzip selection because it would delete destination objects outside the selected ZIP entries".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Extracts missing or changed files from an S3 ZIP object into an S3 prefix.
 ///
 /// The source ZIP is read with ranged `GetObject` requests. Destination objects
@@ -359,6 +440,8 @@ pub async fn sync_zip_to_s3_with_clients(
     mut options: SyncOptions,
 ) -> Result<SyncReport> {
     validate_options(&options)?;
+    let selection = normalize_unzip_selection(&options.selection)?;
+    validate_delete_extra_selection(options.delete_extra, &selection)?;
     let started = Instant::now();
     tracing::info!(
         source_bucket = %options.source.bucket,
@@ -412,24 +495,37 @@ pub async fn sync_zip_to_s3_with_clients(
         diagnostics: diagnostics.clone(),
     });
 
-    let manifest = load_zip_manifest(
-        Arc::clone(&source),
-        &options.destination,
-        options.ignore_embedded_catalog,
-        options.source_block_size,
-        Some(crate::constants::S3_SINGLE_PUT_LIMIT),
-    )
-    .await?;
-    resolve_source_window_capacity(&mut options, source_head.len, manifest.entries.len());
+    let manifest = if selection.is_empty() {
+        load_zip_manifest(
+            Arc::clone(&source),
+            &options.destination,
+            options.ignore_embedded_catalog,
+            options.source_block_size,
+            Some(crate::constants::S3_SINGLE_PUT_LIMIT),
+        )
+        .await?
+    } else {
+        load_zip_manifest_with_filter(
+            Arc::clone(&source),
+            &options.destination,
+            options.ignore_embedded_catalog,
+            options.source_block_size,
+            Some(crate::constants::S3_SINGLE_PUT_LIMIT),
+            |entry| selection.matches(entry),
+        )
+        .await?
+    };
+    let entries = manifest.entries;
+    resolve_source_window_capacity(&mut options, source_head.len, entries.len());
     validate_source_range_options(&options, source_head.len)?;
-    let entries_with_catalog_md5 = manifest
-        .entries
+    let entries_with_catalog_md5 = entries
         .iter()
         .filter(|entry| entry.catalog_md5.is_some())
         .count();
     tracing::info!(
-        zip_files = manifest.entries.len(),
+        zip_files = entries.len(),
         entries_with_catalog_md5,
+        selection_patterns = selection.pattern_count,
         source_window_capacity = options.source_window_capacity,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "zip manifest loaded"
@@ -442,7 +538,6 @@ pub async fn sync_zip_to_s3_with_clients(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "destination prefix listed"
     );
-    let entries = manifest.entries;
     let total_entries = entries.len();
     let expected_keys = options.delete_extra.then(|| {
         entries
@@ -666,6 +761,8 @@ pub async fn unzip_file_to_s3(
     options: LocalZipSyncOptions,
 ) -> Result<LocalZipToS3Report> {
     validate_local_zip_sync_options(&options)?;
+    let selection = normalize_unzip_selection(&options.selection)?;
+    validate_delete_extra_selection(options.delete_extra, &selection)?;
     let reader = open_local_zip_reader(&options.source_zip).await?;
     let source_len = tokio::fs::metadata(&options.source_zip).await?.len();
     let mut entries = local_zip_entries_for_s3(
@@ -673,6 +770,7 @@ pub async fn unzip_file_to_s3(
         &options.destination,
         source_len,
         true,
+        |entry| selection.matches(entry),
     )?;
     if !options.ignore_embedded_catalog {
         let catalog = load_local_embedded_catalog(&reader, entries.catalog_index).await;
@@ -738,9 +836,11 @@ pub async fn unzip_file_to_s3(
 /// local directories, and extra local files are left untouched.
 pub async fn unzip_s3_zip_to_local(
     client: &Client,
-    mut options: S3ZipLocalUnzipOptions,
+    options: S3ZipLocalUnzipOptions,
 ) -> Result<LocalUnzipReport> {
+    let mut options = options;
     validate_s3_zip_local_unzip_options(&options)?;
+    let selection = normalize_unzip_selection(&options.selection)?;
     let destination_root = prepare_local_destination_root(&options.destination_dir).await?;
     let started = Instant::now();
     let source_head = head_source(client, &options.source).await?;
@@ -759,14 +859,26 @@ pub async fn unzip_s3_zip_to_local(
         bucket: "__local__".to_string(),
         prefix: String::new(),
     };
-    let manifest = load_zip_manifest(
-        Arc::clone(&source),
-        &local_destination,
-        options.ignore_embedded_catalog,
-        options.source_block_size,
-        None,
-    )
-    .await?;
+    let manifest = if selection.is_empty() {
+        load_zip_manifest(
+            Arc::clone(&source),
+            &local_destination,
+            options.ignore_embedded_catalog,
+            options.source_block_size,
+            None,
+        )
+        .await?
+    } else {
+        load_zip_manifest_with_filter(
+            Arc::clone(&source),
+            &local_destination,
+            options.ignore_embedded_catalog,
+            options.source_block_size,
+            None,
+            |entry| selection.matches(entry),
+        )
+        .await?
+    };
     resolve_s3_zip_local_window_capacity(&mut options, source_head.len, manifest.entries.len());
     validate_s3_zip_local_source_range_options(&options, source_head.len)?;
 
@@ -845,10 +957,15 @@ pub async fn unzip_s3_zip_to_local(
 /// local directories, and extra local files are left untouched.
 pub async fn unzip_file_to_local(options: LocalUnzipOptions) -> Result<LocalUnzipReport> {
     validate_local_unzip_options(&options)?;
+    let selection = normalize_unzip_selection(&options.selection)?;
     let destination_root = prepare_local_destination_root(&options.destination_dir).await?;
     let reader = open_local_zip_reader(&options.source_zip).await?;
     let source_len = tokio::fs::metadata(&options.source_zip).await?.len();
-    let entries = local_zip_entries_for_local(reader.file().entries(), source_len, false)?.entries;
+    let entries =
+        local_zip_entries_for_local(reader.file().entries(), source_len, false, |entry| {
+            selection.matches(entry)
+        })?
+        .entries;
     validate_local_destination_zip_paths(entries.iter().map(|entry| entry.zip_path.as_str()))?;
     let destination_case_insensitive =
         destination_uses_case_insensitive_paths(&destination_root).await?;
@@ -903,6 +1020,8 @@ pub async fn dry_run_sync_zip_to_s3_with_clients(
     mut options: SyncOptions,
 ) -> Result<UnzipDryRunReport> {
     validate_options(&options)?;
+    let selection = normalize_unzip_selection(&options.selection)?;
+    validate_delete_extra_selection(options.delete_extra, &selection)?;
     let source_head = head_source(source_client, &options.source).await?;
     let diagnostics = options
         .collect_diagnostics
@@ -916,14 +1035,26 @@ pub async fn dry_run_sync_zip_to_s3_with_clients(
         diagnostics: diagnostics.clone(),
     });
 
-    let manifest = load_zip_manifest(
-        Arc::clone(&source),
-        &options.destination,
-        options.ignore_embedded_catalog,
-        options.source_block_size,
-        Some(crate::constants::S3_SINGLE_PUT_LIMIT),
-    )
-    .await?;
+    let manifest = if selection.is_empty() {
+        load_zip_manifest(
+            Arc::clone(&source),
+            &options.destination,
+            options.ignore_embedded_catalog,
+            options.source_block_size,
+            Some(crate::constants::S3_SINGLE_PUT_LIMIT),
+        )
+        .await?
+    } else {
+        load_zip_manifest_with_filter(
+            Arc::clone(&source),
+            &options.destination,
+            options.ignore_embedded_catalog,
+            options.source_block_size,
+            Some(crate::constants::S3_SINGLE_PUT_LIMIT),
+            |entry| selection.matches(entry),
+        )
+        .await?
+    };
     resolve_source_window_capacity(&mut options, source_head.len, manifest.entries.len());
     validate_source_range_options(&options, source_head.len)?;
 
@@ -1022,6 +1153,8 @@ pub async fn dry_run_unzip_file_to_s3(
     options: LocalZipSyncOptions,
 ) -> Result<UnzipDryRunReport> {
     validate_local_zip_sync_options(&options)?;
+    let selection = normalize_unzip_selection(&options.selection)?;
+    validate_delete_extra_selection(options.delete_extra, &selection)?;
     let reader = open_local_zip_reader(&options.source_zip).await?;
     let source_len = tokio::fs::metadata(&options.source_zip).await?.len();
     let mut entries = local_zip_entries_for_s3(
@@ -1029,6 +1162,7 @@ pub async fn dry_run_unzip_file_to_s3(
         &options.destination,
         source_len,
         true,
+        |entry| selection.matches(entry),
     )?;
     if !options.ignore_embedded_catalog {
         let catalog = load_local_embedded_catalog(&reader, entries.catalog_index).await;
@@ -1095,6 +1229,7 @@ pub async fn dry_run_unzip_s3_zip_to_local(
     mut options: S3ZipLocalUnzipOptions,
 ) -> Result<UnzipDryRunReport> {
     validate_s3_zip_local_unzip_options(&options)?;
+    let selection = normalize_unzip_selection(&options.selection)?;
     let destination_root =
         validate_local_destination_root_for_dry_run(&options.destination_dir).await?;
     let source_head = head_source(client, &options.source).await?;
@@ -1113,14 +1248,26 @@ pub async fn dry_run_unzip_s3_zip_to_local(
         bucket: "__local__".to_string(),
         prefix: String::new(),
     };
-    let manifest = load_zip_manifest(
-        Arc::clone(&source),
-        &local_destination,
-        options.ignore_embedded_catalog,
-        options.source_block_size,
-        None,
-    )
-    .await?;
+    let manifest = if selection.is_empty() {
+        load_zip_manifest(
+            Arc::clone(&source),
+            &local_destination,
+            options.ignore_embedded_catalog,
+            options.source_block_size,
+            None,
+        )
+        .await?
+    } else {
+        load_zip_manifest_with_filter(
+            Arc::clone(&source),
+            &local_destination,
+            options.ignore_embedded_catalog,
+            options.source_block_size,
+            None,
+            |entry| selection.matches(entry),
+        )
+        .await?
+    };
     resolve_s3_zip_local_window_capacity(&mut options, source_head.len, manifest.entries.len());
     validate_s3_zip_local_source_range_options(&options, source_head.len)?;
 
@@ -1168,11 +1315,16 @@ pub async fn dry_run_unzip_s3_zip_to_local(
 /// Plans extracting a local ZIP file into a local directory without writing files.
 pub async fn dry_run_unzip_file_to_local(options: LocalUnzipOptions) -> Result<UnzipDryRunReport> {
     validate_local_unzip_options(&options)?;
+    let selection = normalize_unzip_selection(&options.selection)?;
     let destination_root =
         validate_local_destination_root_for_dry_run(&options.destination_dir).await?;
     let reader = open_local_zip_reader(&options.source_zip).await?;
     let source_len = tokio::fs::metadata(&options.source_zip).await?.len();
-    let entries = local_zip_entries_for_local(reader.file().entries(), source_len, false)?.entries;
+    let entries =
+        local_zip_entries_for_local(reader.file().entries(), source_len, false, |entry| {
+            selection.matches(entry)
+        })?
+        .entries;
     validate_local_destination_zip_paths(entries.iter().map(|entry| entry.zip_path.as_str()))?;
     let destination_case_insensitive =
         destination_uses_case_insensitive_paths_for_dry_run(&options.destination_dir).await?;
@@ -1239,18 +1391,30 @@ fn local_zip_entries_for_s3(
     destination: &S3Prefix,
     source_len: u64,
     enforce_s3_limit: bool,
+    include_entry: impl Fn(&ZipEntryPath) -> bool,
 ) -> Result<LocalZipEntries> {
-    local_zip_entries(stored_entries, source_len, enforce_s3_limit, |zip_path| {
-        destination.join_key(zip_path)
-    })
+    local_zip_entries(
+        stored_entries,
+        source_len,
+        enforce_s3_limit,
+        |zip_path| destination.join_key(zip_path),
+        include_entry,
+    )
 }
 
 fn local_zip_entries_for_local(
     stored_entries: &[StoredZipEntry],
     source_len: u64,
     enforce_s3_limit: bool,
+    include_entry: impl Fn(&ZipEntryPath) -> bool,
 ) -> Result<LocalZipEntries> {
-    local_zip_entries(stored_entries, source_len, enforce_s3_limit, str::to_string)
+    local_zip_entries(
+        stored_entries,
+        source_len,
+        enforce_s3_limit,
+        str::to_string,
+        include_entry,
+    )
 }
 
 fn local_zip_entries(
@@ -1258,6 +1422,7 @@ fn local_zip_entries(
     source_len: u64,
     enforce_s3_limit: bool,
     destination: impl Fn(&str) -> String,
+    include_entry: impl Fn(&ZipEntryPath) -> bool,
 ) -> Result<LocalZipEntries> {
     let mut seen = HashSet::new();
     let mut entries = Vec::new();
@@ -1272,13 +1437,20 @@ fn local_zip_entries(
                 reason: err.to_string(),
             })?;
         let zip_entry_path = normalize_zip_entry_path(raw_path)?;
-        let zip_path = zip_entry_path.path;
-        let is_directory = zip_entry_path.is_directory;
 
-        if !is_directory && zip_path == EMBEDDED_CATALOG_PATH {
+        if !zip_entry_path.is_directory && zip_entry_path.path == EMBEDDED_CATALOG_PATH {
             catalog_index = Some(index);
             continue;
         }
+
+        if !include_entry(&zip_entry_path) {
+            continue;
+        }
+
+        let ZipEntryPath {
+            path: zip_path,
+            is_directory,
+        } = zip_entry_path;
 
         validate_local_stored_entry(
             stored,
@@ -5225,12 +5397,16 @@ mod tests {
             .unwrap();
         let destination = S3Prefix::parse("s3://destination-bucket/prefix/").unwrap();
 
-        let err =
-            match local_zip_entries_for_s3(reader.file().entries(), &destination, source_len, true)
-            {
-                Ok(_) => panic!("directory entry with nonzero CRC should be rejected"),
-                Err(err) => err,
-            };
+        let err = match local_zip_entries_for_s3(
+            reader.file().entries(),
+            &destination,
+            source_len,
+            true,
+            |_| true,
+        ) {
+            Ok(_) => panic!("directory entry with nonzero CRC should be rejected"),
+            Err(err) => err,
+        };
 
         assert!(matches!(
             err,

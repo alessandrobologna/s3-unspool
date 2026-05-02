@@ -145,6 +145,45 @@ async fn main() -> s3_unspool::Result<()> {
 to benchmark or force the fallback extract-and-hash comparison path against the
 same ZIP object.
 
+### Extract Selected ZIP Entries
+
+Set `SyncOptions::selection` when only a subset of entries should be restored
+from an S3 ZIP. Selection patterns use gitignore-style syntax and are applied
+before source range planning, so the existing block coalescing still reduces
+ranged `GetObject` calls for the selected entries. Exclude-only selections
+restore every non-excluded ZIP entry.
+
+```rust
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::Client;
+use s3_unspool::{S3Object, S3Prefix, SyncOptions, UnzipSelection, sync_zip_to_s3};
+
+#[tokio::main]
+async fn main() -> s3_unspool::Result<()> {
+    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let client = Client::new(&config);
+
+    let extract = SyncOptions::new(
+        S3Object::parse("s3://my-bucket/releases/site.zip")?,
+        S3Prefix::parse("s3://my-bucket/www/")?,
+    )
+    .with_selection(
+        UnzipSelection::new()
+            .include("index.md")
+            .include("docs/**/*.md")
+            .exclude("docs/drafts/**"),
+    );
+
+    let report = sync_zip_to_s3(&client, extract).await?;
+    println!("processed entries: {}", report.summary.zip_files);
+
+    Ok(())
+}
+```
+
+Selected extracts cannot be combined with `delete_extra`, because unselected
+destination objects are outside the restore scope.
+
 ### Upload a Directory as a Cataloged ZIP
 
 Use `upload_directory_zip_to_s3` when you want `s3-unspool` to create the source
@@ -408,6 +447,11 @@ Useful unzip options:
   created, replaced, skipped, or deleted without writing or deleting anything.
 - `--delete-extra`: delete destination objects under the prefix that are not in
   the ZIP.
+- `--include PATTERN`: extract ZIP entries matching this gitignore-style
+  pattern. Repeat to include multiple patterns.
+- `--exclude PATTERN`: exclude ZIP entries matching this gitignore-style
+  pattern. Repeat to exclude multiple patterns. Selection cannot be combined
+  with `--delete-extra`.
 - `--concurrency <N>`: maximum number of ZIP entries processed at once. The CLI
   default is `64`.
 - `--report`: add a formatted operation report to the CLI transcript.
@@ -572,7 +616,9 @@ Payload fields:
   "deleteExtra": false,
   "diagnostics": false,
   "ignoreCatalog": false,
-  "includeOperations": false
+  "includeOperations": false,
+  "includePatterns": [],
+  "excludePatterns": []
 }
 ```
 
@@ -588,6 +634,11 @@ the configured memory size: `4` workers at `128` MB, `6` at `256` MB, `8` at
 Set `"ignoreCatalog": true` to force extraction to ignore the embedded MD5
 catalog and measure the fallback extract-and-hash path. The payload also accepts
 `"ignoreEmbeddedCatalog": true`.
+
+Set `"includePatterns"` or `"excludePatterns"` to restore only selected ZIP
+entries from the archive. Selected Lambda extracts use the same source-range
+planning as full extracts, and they reject `"deleteExtra": true` for the same
+reason as the CLI: unselected destination objects are outside the restore scope.
 
 Lambda responses omit per-object `operations` by default so large benchmark
 invokes stay below the synchronous invoke response limit. Set
