@@ -1,6 +1,7 @@
 use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
+use std::result::Result;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,19 +10,7 @@ use std::time::{Duration, Instant};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::StalledStreamProtectionConfig;
 use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
-use s3_unspool::{
-    DryRunObjectReport, DryRunOperationStatus, LocalUnzipOptions, LocalUnzipReport,
-    LocalZipOptions, LocalZipReport, LocalZipSyncOptions, LocalZipToS3Report, ObjectReport,
-    OperationStatus, PutDiagnostics, S3Object, S3Prefix, S3PrefixLocalZipOptions,
-    S3PrefixUploadOptions, S3PrefixUploadReport, S3ZipLocalUnzipOptions, SyncDiagnostics,
-    SyncOptions, SyncReport, SyncSummary, UnzipDryRunReport, UnzipDryRunSummary, UploadOptions,
-    UploadProgress, UploadProgressHandler, UploadReport, ZipCompression, ZipDryRunReport,
-    dry_run_sync_zip_to_s3, dry_run_unzip_file_to_local, dry_run_unzip_file_to_s3,
-    dry_run_unzip_s3_zip_to_local, dry_run_upload_directory_zip_to_s3,
-    dry_run_zip_directory_to_file, dry_run_zip_s3_prefix_to_file, dry_run_zip_s3_prefix_to_s3,
-    sync_zip_to_s3, unzip_file_to_local, unzip_file_to_s3, unzip_s3_zip_to_local,
-    upload_directory_zip_to_s3, zip_directory_to_file, zip_s3_prefix_to_file, zip_s3_prefix_to_s3,
-};
+use s3_unspool::*;
 use serde::Serialize;
 use terminal_size::{Width, terminal_size};
 
