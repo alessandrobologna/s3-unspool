@@ -43,6 +43,15 @@
 //! them. Set [`SyncOptions::ignore_embedded_catalog`] when you need to measure
 //! or force the fallback extract-and-hash path.
 //!
+//! Set [`SyncOptions::selection`] or the equivalent local unzip option field
+//! when only a subset of ZIP paths should be restored. Selection patterns use
+//! gitignore-style syntax and are applied before source range planning, so
+//! ranged `GetObject` requests are planned only for selected entries that still
+//! need source bytes. Exclude-only selections restore every non-excluded ZIP
+//! path. Selected extracts reject
+//! [`SyncOptions::delete_extra`] because unselected destination objects are
+//! outside the restore scope.
+//!
 //! ZIP directory entries round-trip as zero-byte S3 marker objects whose keys
 //! end in `/`. Local upload preserves empty directories as ZIP directory
 //! entries, and S3-prefix upload preserves zero-byte S3 marker objects as ZIP
@@ -68,6 +77,34 @@
 //!
 //! let report = sync_zip_to_s3(&client, extract).await?;
 //! println!("uploaded changed files: {}", report.summary.uploaded_changed);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Extract Selected Entries from an S3 ZIP
+//!
+//! ```no_run
+//! use aws_config::BehaviorVersion;
+//! use aws_sdk_s3::Client;
+//! use s3_unspool::{S3Object, S3Prefix, SyncOptions, UnzipSelection, sync_zip_to_s3};
+//!
+//! # async fn run() -> s3_unspool::Result<()> {
+//! let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+//! let client = Client::new(&config);
+//!
+//! let extract = SyncOptions::new(
+//!     S3Object::parse("s3://my-bucket/releases/site.zip")?,
+//!     S3Prefix::parse("s3://my-bucket/www/")?,
+//! )
+//! .with_selection(
+//!     UnzipSelection::new()
+//!         .include("index.md")
+//!         .include("docs/**/*.md")
+//!         .exclude("docs/drafts/**"),
+//! );
+//!
+//! let report = sync_zip_to_s3(&client, extract).await?;
+//! println!("processed entries: {}", report.summary.zip_files);
 //! # Ok(())
 //! # }
 //! ```
@@ -147,7 +184,7 @@ pub use inspect::{S3ZipInfo, inspect_s3_zip};
 pub use options::{
     LocalUnzipOptions, LocalZipOptions, LocalZipSyncOptions, PutRetryPolicy, RetryJitter,
     S3PrefixLocalZipOptions, S3PrefixUploadOptions, S3ZipLocalUnzipOptions, SyncOptions,
-    UploadOptions, UploadProgress, UploadProgressHandler, ZipCompression,
+    UnzipSelection, UploadOptions, UploadProgress, UploadProgressHandler, ZipCompression,
     adaptive_source_get_concurrency, adaptive_source_window_capacity,
 };
 pub use report::{

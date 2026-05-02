@@ -70,23 +70,33 @@ async fn run_unzip(
     let diagnostics = matches.get_flag("diagnostics");
     let ignore_catalog = matches.get_flag("ignore-catalog");
     let dry_run = matches.get_flag("dry-run");
+    let selection = unzip_selection_from_matches(matches);
     let report_destination = ReportDestination::from_cli_value(matches.get_one::<String>("report"));
     let source = parse_zip_source(source)?;
     let destination = parse_tree_destination(destination)?;
     validate_delete_extra_destination(delete_extra, &destination)?;
+    validate_delete_extra_selection(delete_extra, &selection)?;
     validate_diagnostics_source(diagnostics, &source)?;
+
+    let mut details = vec![
+        format!("{} -> {}", source.display(), destination.display()),
+        format!(
+            "{} workers{}{}",
+            concurrency,
+            if delete_extra { ", delete extra" } else { "" },
+            if dry_run { ", no changes" } else { "" }
+        ),
+    ];
+    if !selection.is_empty() {
+        details.push(format!(
+            "{} selection pattern filters",
+            selection.as_patterns().len()
+        ));
+    }
 
     output.write(&Transcript::running(
         if dry_run { "Unzip dry run" } else { "Unzip" },
-        vec![
-            format!("{} -> {}", source.display(), destination.display()),
-            format!(
-                "{} workers{}{}",
-                concurrency,
-                if delete_extra { ", delete extra" } else { "" },
-                if dry_run { ", no changes" } else { "" }
-            ),
-        ],
+        details,
     ))?;
 
     let activity = output.start_activity(
@@ -106,6 +116,7 @@ async fn run_unzip(
             options.collect_diagnostics = diagnostics;
             options.collect_operations = !matches!(report_destination, ReportDestination::None);
             options.ignore_embedded_catalog = ignore_catalog;
+            options.selection = selection;
             if dry_run {
                 UnzipCommandReport::DryRun(unspool::dry_run_sync_zip_to_s3(&client, options).await?)
             } else {
@@ -119,6 +130,7 @@ async fn run_unzip(
             options.delete_extra = delete_extra;
             options.collect_operations = !matches!(report_destination, ReportDestination::None);
             options.ignore_embedded_catalog = ignore_catalog;
+            options.selection = selection;
             if dry_run {
                 UnzipCommandReport::DryRun(
                     unspool::dry_run_unzip_file_to_s3(&client, options).await?,
@@ -134,6 +146,7 @@ async fn run_unzip(
             options.collect_diagnostics = diagnostics;
             options.collect_operations = !matches!(report_destination, ReportDestination::None);
             options.ignore_embedded_catalog = ignore_catalog;
+            options.selection = selection;
             if dry_run {
                 UnzipCommandReport::DryRun(
                     unspool::dry_run_unzip_s3_zip_to_local(&client, options).await?,
@@ -147,6 +160,7 @@ async fn run_unzip(
             options.concurrency = concurrency;
             options.collect_operations = !matches!(report_destination, ReportDestination::None);
             options.ignore_embedded_catalog = ignore_catalog;
+            options.selection = selection;
             if dry_run {
                 UnzipCommandReport::DryRun(unspool::dry_run_unzip_file_to_local(options).await?)
             } else {
@@ -416,6 +430,32 @@ fn validate_delete_extra_destination(
     }
 }
 
+fn unzip_selection_from_matches(matches: &ArgMatches) -> unspool::UnzipSelection {
+    let mut selection = unspool::UnzipSelection::new();
+    if let Some(includes) = matches.get_many::<String>("include") {
+        for include in includes {
+            selection = selection.include(include.clone());
+        }
+    }
+    if let Some(excludes) = matches.get_many::<String>("exclude") {
+        for exclude in excludes {
+            selection = selection.exclude(exclude.clone());
+        }
+    }
+    selection
+}
+
+fn validate_delete_extra_selection(
+    delete_extra: bool,
+    selection: &unspool::UnzipSelection,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if delete_extra && !selection.is_empty() {
+        Err("--delete-extra cannot be combined with --include or --exclude".into())
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_diagnostics_source(
     diagnostics: bool,
     source: &ZipSource,
@@ -483,6 +523,20 @@ fn cli() -> Command {
                         .long("dry-run")
                         .help("Inspect the ZIP and destination, then report planned changes without writing or deleting anything")
                         .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("include")
+                        .long("include")
+                        .value_name("PATTERN")
+                        .help("Extract ZIP entries matching this gitignore-style pattern; repeat to include multiple patterns")
+                        .action(ArgAction::Append),
+                )
+                .arg(
+                    Arg::new("exclude")
+                        .long("exclude")
+                        .value_name("PATTERN")
+                        .help("Exclude ZIP entries matching this gitignore-style pattern; repeat to exclude multiple patterns")
+                        .action(ArgAction::Append),
                 )
                 .arg(
                     Arg::new("concurrency")
@@ -1802,6 +1856,10 @@ mod tests {
                 "unzip",
                 "--delete-extra",
                 "--ignore-catalog",
+                "--include",
+                "docs/**/*.md",
+                "--exclude",
+                "docs/drafts/**",
                 "s3://source-bucket/archive.zip",
                 "s3://destination-bucket/prefix/",
             ])
@@ -1818,6 +1876,18 @@ mod tests {
         };
         assert!(extract.get_flag("delete-extra"));
         assert!(extract.get_flag("ignore-catalog"));
+        assert_eq!(
+            extract
+                .get_many::<String>("include")
+                .map(|values| values.map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["docs/**/*.md"])
+        );
+        assert_eq!(
+            extract
+                .get_many::<String>("exclude")
+                .map(|values| values.map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["docs/drafts/**"])
+        );
         assert_eq!(
             extract.get_one::<String>("source").map(String::as_str),
             Some("s3://source-bucket/archive.zip")
@@ -1980,6 +2050,15 @@ mod tests {
                 Some(destination)
             );
         }
+    }
+
+    #[test]
+    fn rejects_delete_extra_with_unzip_selection() {
+        let selection = unspool::UnzipSelection::new().include("index.md");
+
+        let err = validate_delete_extra_selection(true, &selection).unwrap_err();
+
+        assert!(err.to_string().contains("--delete-extra"));
     }
 
     #[test]

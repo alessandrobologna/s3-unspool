@@ -29,6 +29,7 @@ futures-util.workspace = true
 hex.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
+ignore.workspace = true
 libc.workspace = true
 md5.workspace = true
 serde.workspace = true

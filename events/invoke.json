@@ -5,5 +5,7 @@
   "diagnostics": false,
   "ignoreCatalog": false,
   "includeOperations": false,
+  "includePatterns": [],
+  "excludePatterns": [],
   "concurrency": 16
 }

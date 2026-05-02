@@ -110,6 +110,8 @@ async fn main() -> s3_unspool::Result<()> {
 - Uses listed destination ETags instead of per-object `HeadObject` calls.
 - Uploads missing files with `If-None-Match: *`.
 - Uploads changed files with `If-Match: <listed destination ETag>`.
+- Can selectively extract gitignore-style ZIP path patterns with
+  `UnzipSelection`; selection is applied before source range planning.
 - Optionally deletes destination objects that are not present in the ZIP.
 - Supports Stored, Deflate, and Zstandard method 93 ZIP entries when default
   features are enabled.
