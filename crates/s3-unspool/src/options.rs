@@ -41,7 +41,7 @@ impl UnzipSelection {
     /// Adds an include pattern.
     ///
     /// Leading `!` and `#` characters are treated as literal path characters
-    /// in the builder API. Use [`Self::patterns`] for raw gitignore lines.
+    /// in the builder API. Use [`Self::patterns`] for raw selection lines.
     pub fn include(mut self, pattern: impl Into<String>) -> Self {
         self.patterns
             .push(escape_leading_gitignore_marker(pattern.into()));
@@ -51,7 +51,7 @@ impl UnzipSelection {
     /// Adds an exclude pattern.
     ///
     /// Leading `!` and `#` characters are treated as literal path characters
-    /// in the builder API. Use [`Self::patterns`] for raw gitignore lines.
+    /// in the builder API. Use [`Self::patterns`] for raw selection lines.
     pub fn exclude(mut self, pattern: impl Into<String>) -> Self {
         self.patterns.push(format!(
             "!{}",

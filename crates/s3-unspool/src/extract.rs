@@ -382,10 +382,14 @@ fn normalize_unzip_selection(selection: &UnzipSelection) -> Result<NormalizedUnz
                 "invalid unzip selection pattern {raw_pattern:?}: {err}"
             ))
         })?;
-        let trimmed = raw_pattern.trim_start();
-        if !trimmed.trim_end().is_empty() && !trimmed.starts_with('#') {
+        let line = if raw_pattern.ends_with("\\ ") {
+            raw_pattern.as_str()
+        } else {
+            raw_pattern.trim_end()
+        };
+        if !line.is_empty() && !line.starts_with('#') {
             pattern_count += 1;
-            if !trimmed.starts_with('!') {
+            if !line.starts_with('!') {
                 has_include_pattern = true;
             }
         }

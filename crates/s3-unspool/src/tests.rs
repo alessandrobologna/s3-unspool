@@ -924,6 +924,52 @@ async fn local_unzip_extracts_with_include_then_exclude_selection() {
 }
 
 #[tokio::test]
+async fn local_unzip_selection_preserves_leading_space_patterns() {
+    let zip_dir = unique_temp_dir("unzip-selected-leading-space-zip");
+    let destination = unique_temp_dir("unzip-selected-leading-space-destination");
+    let source_zip = zip_dir.join("site.zip");
+    tokio::fs::create_dir_all(&zip_dir).await.unwrap();
+    tokio::fs::create_dir_all(&destination).await.unwrap();
+    let zip_bytes = test_zip(&[
+        (" #notes.md", Compression::Stored, b"notes".as_slice()),
+        (
+            " !important.md",
+            Compression::Stored,
+            b"important".as_slice(),
+        ),
+        ("other.md", Compression::Stored, b"other".as_slice()),
+    ])
+    .await;
+    tokio::fs::write(&source_zip, zip_bytes).await.unwrap();
+
+    let options = LocalUnzipOptions::new(&source_zip, &destination)
+        .with_selection([" #notes.md", " !important.md"]);
+    let report = unzip_file_to_local(options).await.unwrap();
+
+    assert_eq!(report.summary.zip_files, 2);
+    assert_eq!(report.summary.uploaded_new, 2);
+    assert_eq!(
+        tokio::fs::read(destination.join(" #notes.md"))
+            .await
+            .unwrap(),
+        b"notes"
+    );
+    assert_eq!(
+        tokio::fs::read(destination.join(" !important.md"))
+            .await
+            .unwrap(),
+        b"important"
+    );
+    assert!(
+        tokio::fs::metadata(destination.join("other.md"))
+            .await
+            .is_err()
+    );
+    tokio::fs::remove_dir_all(zip_dir).await.unwrap();
+    tokio::fs::remove_dir_all(destination).await.unwrap();
+}
+
+#[tokio::test]
 async fn local_unzip_creates_shared_missing_parent_concurrently() {
     let zip_dir = unique_temp_dir("unzip-shared-parent-zip");
     let destination = unique_temp_dir("unzip-shared-parent-destination");
