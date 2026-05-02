@@ -343,6 +343,10 @@ External ZIP files are still supported. If the embedded catalog is missing,
 Use `SyncOptions::ignore_embedded_catalog = true`, CLI `--ignore-catalog`, or
 Lambda payload `"ignoreCatalog": true` to force that fallback path.
 
+`zip --no-catalog` controls catalog creation when building a new ZIP.
+`unzip --ignore-catalog` controls whether extraction uses an embedded catalog
+that is already present in the source ZIP.
+
 The embedded catalog file is reserved. It is never extracted to the destination,
 and upload sources cannot contain a file at that path.
 
@@ -390,8 +394,18 @@ s3-unspool unzip s3://my-bucket/site.zip ./site
 s3-unspool unzip s3://my-bucket/site.zip s3://my-bucket/www/
 ```
 
+Useful zip options:
+
+- `--dry-run`: inspect the source tree and report what would be archived
+  without creating a local ZIP or uploading an S3 object.
+- `--no-catalog`: create a plain ZIP without `.s3-unspool/catalog.v1.json`.
+- `--report`: add a formatted zip report to the CLI transcript.
+- `--report=PATH`: write the JSON zip report to a file.
+
 Useful unzip options:
 
+- `--dry-run`: inspect the ZIP and destination, then report what would be
+  created, replaced, skipped, or deleted without writing or deleting anything.
 - `--delete-extra`: delete destination objects under the prefix that are not in
   the ZIP.
 - `--concurrency <N>`: maximum number of ZIP entries processed at once. The CLI

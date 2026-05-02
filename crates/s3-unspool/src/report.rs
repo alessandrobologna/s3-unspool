@@ -17,6 +17,9 @@ pub struct UploadReport {
     /// Number of preserved directory entries included in the ZIP.
     #[serde(default)]
     pub directories: usize,
+    /// Whether the embedded update catalog was included.
+    #[serde(default = "default_include_catalog")]
+    pub include_catalog: bool,
     /// Total uncompressed payload bytes.
     pub uncompressed_bytes: u64,
     /// Total uploaded ZIP object bytes.
@@ -34,6 +37,9 @@ pub struct S3PrefixUploadReport {
     pub files: usize,
     /// Number of zero-byte trailing-slash source objects included as ZIP directories.
     pub directories: usize,
+    /// Whether the embedded update catalog was included.
+    #[serde(default = "default_include_catalog")]
+    pub include_catalog: bool,
     /// Total number of ZIP entries written, excluding the embedded catalog.
     pub entries: usize,
     /// Total uncompressed payload bytes across regular file entries.
@@ -53,12 +59,38 @@ pub struct LocalZipReport {
     pub files: usize,
     /// Number of preserved directory entries included in the ZIP.
     pub directories: usize,
+    /// Whether the embedded update catalog was included.
+    #[serde(default = "default_include_catalog")]
+    pub include_catalog: bool,
     /// Total number of ZIP entries written, excluding the embedded catalog.
     pub entries: usize,
     /// Total uncompressed payload bytes across regular file entries.
     pub uncompressed_bytes: u64,
     /// Size of the generated ZIP file.
     pub zip_bytes: u64,
+}
+
+/// Summary returned by ZIP dry-run helpers.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ZipDryRunReport {
+    /// Source tree that would be zipped.
+    pub source: String,
+    /// Destination ZIP file path or S3 object URI.
+    pub destination: String,
+    /// Number of regular file entries that would be included.
+    pub files: usize,
+    /// Number of directory entries that would be included.
+    pub directories: usize,
+    /// Total number of ZIP entries that would be written, excluding the embedded catalog.
+    pub entries: usize,
+    /// Total uncompressed payload bytes across regular file entries.
+    pub uncompressed_bytes: u64,
+    /// Whether the embedded update catalog would be included.
+    pub include_catalog: bool,
+}
+
+fn default_include_catalog() -> bool {
+    true
 }
 
 /// Aggregate counters for an extract run.
@@ -79,6 +111,25 @@ pub struct SyncSummary {
     /// Number of extra destination objects deleted.
     pub deleted_extra: usize,
     /// Number of per-object errors.
+    pub errors: usize,
+}
+
+/// Aggregate counters for an extract dry run.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct UnzipDryRunSummary {
+    /// Number of source ZIP entries found, excluding the embedded catalog.
+    pub zip_files: usize,
+    /// Number of destination objects listed before extraction, for S3 destinations.
+    pub destination_objects: usize,
+    /// Number of missing destination entries that would be uploaded or created.
+    pub would_upload_new: usize,
+    /// Number of existing destination entries that would be replaced.
+    pub would_upload_changed: usize,
+    /// Number of destination entries that already match the source entry.
+    pub skipped_unchanged: usize,
+    /// Number of extra destination objects that would be deleted.
+    pub would_delete_extra: usize,
+    /// Number of per-entry errors found while planning.
     pub errors: usize,
 }
 
@@ -148,6 +199,29 @@ impl LocalUnzipReport {
     }
 }
 
+/// Full report returned by extract dry-run helpers.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnzipDryRunReport {
+    /// Source ZIP object URI or local file path.
+    pub source_zip: String,
+    /// Destination prefix URI or local directory.
+    pub destination: String,
+    /// Aggregate dry-run counters.
+    pub summary: UnzipDryRunSummary,
+    /// Optional source scheduler diagnostics for S3 ZIP sources.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<DryRunDiagnostics>,
+    /// Per-entry dry-run operation records.
+    pub operations: Vec<DryRunObjectReport>,
+}
+
+impl UnzipDryRunReport {
+    /// Returns `true` when one or more planned operations failed.
+    pub fn has_errors(&self) -> bool {
+        self.summary.errors > 0
+    }
+}
+
 /// Effective extract settings and aggregate diagnostics.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyncDiagnostics {
@@ -174,6 +248,23 @@ pub struct SyncDiagnostics {
 /// Effective local unzip settings and aggregate source diagnostics.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LocalUnzipDiagnostics {
+    /// Effective entry concurrency.
+    pub concurrency: usize,
+    /// Effective source block size in bytes.
+    pub source_block_size: usize,
+    /// Effective source block merge gap in bytes.
+    pub source_block_merge_gap: usize,
+    /// Effective source ranged `GetObject` concurrency.
+    pub source_get_concurrency: usize,
+    /// Effective source block window capacity in bytes.
+    pub source_window_capacity: usize,
+    /// Aggregate source scheduler counters.
+    pub source: SourceDiagnostics,
+}
+
+/// Effective dry-run source settings and aggregate diagnostics.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DryRunDiagnostics {
     /// Effective entry concurrency.
     pub concurrency: usize,
     /// Effective source block size in bytes.
@@ -289,6 +380,22 @@ pub enum OperationStatus {
     Error,
 }
 
+/// Status for a single dry-run destination operation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DryRunOperationStatus {
+    /// The destination entry is absent and would be uploaded or created.
+    WouldUploadNew,
+    /// The destination entry exists and would be replaced.
+    WouldUploadChanged,
+    /// The destination entry already matches the source entry.
+    SkippedUnchanged,
+    /// The destination object is extra and would be deleted.
+    WouldDeleteExtra,
+    /// The object operation failed while planning.
+    Error,
+}
+
 /// Per-object operation result.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ObjectReport {
@@ -313,10 +420,47 @@ pub struct ObjectReport {
     pub message: Option<String>,
 }
 
+/// Per-object dry-run operation result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DryRunObjectReport {
+    /// Planned operation status.
+    pub status: DryRunOperationStatus,
+    /// Destination object key or local path.
+    pub key: String,
+    /// Source ZIP path when the operation corresponds to a ZIP entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zip_path: Option<String>,
+    /// Source entry size in bytes when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// Source MD5 digest when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub md5: Option<String>,
+    /// Destination ETag observed during the initial listing when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination_etag: Option<String>,
+    /// Error message when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 #[cfg(test)]
 pub(crate) fn summarize(report: &mut SyncReport) {
     for operation in &report.operations {
         summarize_operation(&mut report.summary, operation);
+    }
+}
+
+pub(crate) fn summarize_dry_run_operation(
+    summary: &mut UnzipDryRunSummary,
+    operation: &DryRunObjectReport,
+) {
+    match operation.status {
+        DryRunOperationStatus::WouldUploadNew => summary.would_upload_new += 1,
+        DryRunOperationStatus::WouldUploadChanged => summary.would_upload_changed += 1,
+        DryRunOperationStatus::SkippedUnchanged => summary.skipped_unchanged += 1,
+        DryRunOperationStatus::WouldDeleteExtra => summary.would_delete_extra += 1,
+        DryRunOperationStatus::Error => summary.errors += 1,
     }
 }
 

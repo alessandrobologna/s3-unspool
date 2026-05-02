@@ -34,9 +34,10 @@ use crate::zip_manifest::{
     normalize_zip_file_path,
 };
 use crate::{
-    Error, LocalUnzipOptions, LocalZipOptions, ObjectReport, OperationStatus, PutRetryPolicy,
-    S3Object, S3Prefix, S3PrefixLocalZipOptions, SyncOptions, SyncReport, SyncSummary,
-    UploadProgress, UploadProgressHandler, unzip_file_to_local, zip_directory_to_file,
+    DryRunOperationStatus, Error, LocalUnzipOptions, LocalZipOptions, ObjectReport,
+    OperationStatus, PutRetryPolicy, S3Object, S3Prefix, S3PrefixLocalZipOptions, SyncOptions,
+    SyncReport, SyncSummary, UploadProgress, UploadProgressHandler, dry_run_unzip_file_to_local,
+    dry_run_zip_directory_to_file, unzip_file_to_local, zip_directory_to_file,
     zip_s3_prefix_to_file,
 };
 
@@ -491,6 +492,68 @@ async fn zips_local_directory_to_local_zip_with_empty_directories() {
 }
 
 #[tokio::test]
+async fn dry_run_local_zip_reports_inputs_without_creating_zip() {
+    let root = unique_temp_dir("zip-dry-run-source");
+    let output_dir = unique_temp_dir("zip-dry-run-output");
+    let destination_zip = output_dir.join("site.zip");
+    tokio::fs::create_dir_all(root.join("empty")).await.unwrap();
+    tokio::fs::create_dir_all(root.join("nested"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(&output_dir).await.unwrap();
+    tokio::fs::write(root.join("nested").join("a.txt"), b"alpha")
+        .await
+        .unwrap();
+
+    let report = dry_run_zip_directory_to_file(LocalZipOptions::new(&root, &destination_zip))
+        .await
+        .unwrap();
+
+    assert_eq!(report.files, 1);
+    assert_eq!(report.directories, 1);
+    assert_eq!(report.entries, 2);
+    assert_eq!(report.uncompressed_bytes, 5);
+    assert!(report.include_catalog);
+    assert!(!tokio::fs::try_exists(&destination_zip).await.unwrap());
+
+    tokio::fs::remove_dir_all(root).await.unwrap();
+    tokio::fs::remove_dir_all(output_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn local_zip_can_disable_embedded_catalog() {
+    let root = unique_temp_dir("zip-no-catalog-source");
+    let output_dir = unique_temp_dir("zip-no-catalog-output");
+    let destination_zip = output_dir.join("site.zip");
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    tokio::fs::create_dir_all(&output_dir).await.unwrap();
+    tokio::fs::write(root.join("a.txt"), b"alpha")
+        .await
+        .unwrap();
+
+    let mut options = LocalZipOptions::new(&root, &destination_zip);
+    options.include_catalog = false;
+    let report = zip_directory_to_file(options).await.unwrap();
+    assert!(!report.include_catalog);
+
+    let data = tokio::fs::read(&destination_zip).await.unwrap();
+    let zip = async_zip::base::read::mem::ZipFileReader::new(data)
+        .await
+        .unwrap();
+    let names = zip
+        .file()
+        .entries()
+        .iter()
+        .map(|entry| entry.filename().as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"a.txt".to_string()));
+    assert!(!names.contains(&EMBEDDED_CATALOG_PATH.to_string()));
+
+    tokio::fs::remove_dir_all(root).await.unwrap();
+    tokio::fs::remove_dir_all(output_dir).await.unwrap();
+}
+
+#[tokio::test]
 async fn local_zip_rejects_destination_inside_source_tree() {
     let root = unique_temp_dir("zip-local-destination-inside-source");
     tokio::fs::create_dir_all(&root).await.unwrap();
@@ -556,6 +619,100 @@ async fn unzips_local_zip_to_local_directory_and_overwrites_files() {
     );
 
     tokio::fs::remove_dir_all(source_root).await.unwrap();
+    tokio::fs::remove_dir_all(zip_dir).await.unwrap();
+    tokio::fs::remove_dir_all(destination).await.unwrap();
+}
+
+#[tokio::test]
+async fn dry_run_local_unzip_reports_create_and_replace_without_writing() {
+    let source_root = unique_temp_dir("unzip-dry-run-source");
+    let zip_dir = unique_temp_dir("unzip-dry-run-zip");
+    let destination = unique_temp_dir("unzip-dry-run-destination");
+    let source_zip = zip_dir.join("site.zip");
+    tokio::fs::create_dir_all(source_root.join("empty"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(source_root.join("nested"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(&zip_dir).await.unwrap();
+    tokio::fs::create_dir_all(destination.join("nested"))
+        .await
+        .unwrap();
+    tokio::fs::write(source_root.join("nested").join("a.txt"), b"alpha")
+        .await
+        .unwrap();
+    tokio::fs::write(destination.join("nested").join("a.txt"), b"old")
+        .await
+        .unwrap();
+    zip_directory_to_file(LocalZipOptions::new(&source_root, &source_zip))
+        .await
+        .unwrap();
+
+    let report = dry_run_unzip_file_to_local(LocalUnzipOptions::new(&source_zip, &destination))
+        .await
+        .unwrap();
+
+    assert_eq!(report.summary.zip_files, 2);
+    assert_eq!(report.summary.would_upload_changed, 1);
+    assert_eq!(report.summary.would_upload_new, 1);
+    assert_eq!(report.summary.skipped_unchanged, 0);
+    assert_eq!(
+        tokio::fs::read(destination.join("nested").join("a.txt"))
+            .await
+            .unwrap(),
+        b"old"
+    );
+    assert!(
+        !tokio::fs::try_exists(destination.join("empty"))
+            .await
+            .unwrap()
+    );
+    let nested_file = Path::new("nested").join("a.txt");
+    assert!(report.operations.iter().any(|operation| {
+        operation.status == DryRunOperationStatus::WouldUploadChanged
+            && Path::new(&operation.key).ends_with(&nested_file)
+    }));
+
+    tokio::fs::remove_dir_all(source_root).await.unwrap();
+    tokio::fs::remove_dir_all(zip_dir).await.unwrap();
+    tokio::fs::remove_dir_all(destination).await.unwrap();
+}
+
+#[tokio::test]
+async fn dry_run_local_unzip_reports_directory_component_error_path() {
+    let zip_dir = unique_temp_dir("unzip-dry-run-component-zip");
+    let destination = unique_temp_dir("unzip-dry-run-component-destination");
+    let source_zip = zip_dir.join("site.zip");
+    tokio::fs::create_dir_all(&zip_dir).await.unwrap();
+    tokio::fs::create_dir_all(&destination).await.unwrap();
+    tokio::fs::write(destination.join("blocked"), b"file")
+        .await
+        .unwrap();
+    let zip_bytes = test_zip(&[("blocked/empty/", Compression::Stored, b"".as_slice())]).await;
+    tokio::fs::write(&source_zip, zip_bytes).await.unwrap();
+
+    let report = dry_run_unzip_file_to_local(LocalUnzipOptions::new(&source_zip, &destination))
+        .await
+        .unwrap();
+
+    assert_eq!(report.summary.errors, 1);
+    let operation = report
+        .operations
+        .iter()
+        .find(|operation| operation.status == DryRunOperationStatus::Error)
+        .unwrap();
+    let blocked = destination.join("blocked");
+    assert_eq!(Path::new(&operation.key), blocked.as_path());
+    assert_eq!(operation.zip_path.as_deref(), Some("blocked/empty/"));
+    assert!(
+        operation
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("exists and is not a directory")
+    );
+
     tokio::fs::remove_dir_all(zip_dir).await.unwrap();
     tokio::fs::remove_dir_all(destination).await.unwrap();
 }

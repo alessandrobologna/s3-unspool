@@ -26,7 +26,7 @@ use crate::options::{
     LocalZipOptions, S3PrefixLocalZipOptions, S3PrefixUploadOptions, UploadOptions, UploadProgress,
     UploadProgressHandler,
 };
-use crate::report::{LocalZipReport, S3PrefixUploadReport, UploadReport};
+use crate::report::{LocalZipReport, S3PrefixUploadReport, UploadReport, ZipDryRunReport};
 use crate::s3_uri::{S3Object, S3Prefix};
 use crate::zip_manifest::normalize_zip_entry_path;
 
@@ -170,9 +170,23 @@ pub async fn upload_directory_zip_to_s3(
         destination: options.destination,
         files,
         directories,
+        include_catalog,
         uncompressed_bytes,
         zip_bytes,
     })
+}
+
+/// Plans zipping a local directory and uploading it as an S3 object without writing anything.
+pub async fn dry_run_upload_directory_zip_to_s3(options: UploadOptions) -> Result<ZipDryRunReport> {
+    validate_upload_options(&options)?;
+
+    let entries = collect_upload_entries(&options.source_dir).await?;
+    zip_dry_run_report(
+        options.source_dir.display().to_string(),
+        options.destination.uri(),
+        &entries,
+        options.include_catalog,
+    )
 }
 
 /// Zips a local directory into a local ZIP file.
@@ -214,10 +228,24 @@ pub async fn zip_directory_to_file(options: LocalZipOptions) -> Result<LocalZipR
         destination_zip: options.destination_zip.display().to_string(),
         files,
         directories,
+        include_catalog: options.include_catalog,
         entries: entries.len(),
         uncompressed_bytes,
         zip_bytes,
     })
+}
+
+/// Plans zipping a local directory into a local ZIP file without writing anything.
+pub async fn dry_run_zip_directory_to_file(options: LocalZipOptions) -> Result<ZipDryRunReport> {
+    validate_local_zip_options(&options).await?;
+
+    let entries = collect_upload_entries_with_size_limit(&options.source_dir, None).await?;
+    zip_dry_run_report(
+        options.source_dir.display().to_string(),
+        options.destination_zip.display().to_string(),
+        &entries,
+        options.include_catalog,
+    )
 }
 
 /// Zips an S3 prefix and uploads the archive to S3.
@@ -319,10 +347,27 @@ pub async fn zip_s3_prefix_to_s3(
         destination: options.destination,
         files,
         directories,
+        include_catalog,
         entries: total_entries,
         uncompressed_bytes,
         zip_bytes,
     })
+}
+
+/// Plans zipping an S3 prefix and uploading it as an S3 object without writing anything.
+pub async fn dry_run_zip_s3_prefix_to_s3(
+    client: &Client,
+    options: S3PrefixUploadOptions,
+) -> Result<ZipDryRunReport> {
+    validate_s3_prefix_upload_options(&options)?;
+
+    let entries = collect_s3_prefix_upload_entries(client, &options).await?;
+    zip_dry_run_report(
+        options.source.uri(),
+        options.destination.uri(),
+        &entries,
+        options.include_catalog,
+    )
 }
 
 /// Zips an S3 prefix into a local ZIP file.
@@ -335,22 +380,8 @@ pub async fn zip_s3_prefix_to_file(
 ) -> Result<LocalZipReport> {
     validate_local_zip_destination_path(&options.destination_zip).await?;
 
-    let entries = collect_s3_prefix_upload_entries_with_size_limit(
-        client,
-        &S3PrefixUploadOptions {
-            source: options.source.clone(),
-            destination: S3Object {
-                bucket: "__local__".to_string(),
-                key: options.destination_zip.display().to_string(),
-            },
-            include_catalog: options.include_catalog,
-            body_chunk_size: MAX_BODY_CHUNK_SIZE.min(64 * 1024),
-            pipe_capacity: 64 * 1024,
-            progress: options.progress.clone(),
-        },
-        None,
-    )
-    .await?;
+    let entries =
+        collect_s3_prefix_upload_entries_from_prefix(client, &options.source, None).await?;
     let files = entries.iter().filter(|entry| entry.is_file()).count();
     let directories = entries.len().saturating_sub(files);
     let uncompressed_bytes = upload_entries_uncompressed_bytes(&entries)?;
@@ -382,9 +413,47 @@ pub async fn zip_s3_prefix_to_file(
         destination_zip: options.destination_zip.display().to_string(),
         files,
         directories,
+        include_catalog: options.include_catalog,
         entries: entries.len(),
         uncompressed_bytes,
         zip_bytes,
+    })
+}
+
+/// Plans zipping an S3 prefix into a local ZIP file without writing anything.
+pub async fn dry_run_zip_s3_prefix_to_file(
+    client: &Client,
+    options: S3PrefixLocalZipOptions,
+) -> Result<ZipDryRunReport> {
+    validate_local_zip_destination_path(&options.destination_zip).await?;
+
+    let entries =
+        collect_s3_prefix_upload_entries_from_prefix(client, &options.source, None).await?;
+    zip_dry_run_report(
+        options.source.uri(),
+        options.destination_zip.display().to_string(),
+        &entries,
+        options.include_catalog,
+    )
+}
+
+fn zip_dry_run_report(
+    source: String,
+    destination: String,
+    entries: &[UploadEntry],
+    include_catalog: bool,
+) -> Result<ZipDryRunReport> {
+    let files = entries.iter().filter(|entry| entry.is_file()).count();
+    let directories = entries.len().saturating_sub(files);
+    let uncompressed_bytes = upload_entries_uncompressed_bytes(entries)?;
+    Ok(ZipDryRunReport {
+        source,
+        destination,
+        files,
+        directories,
+        entries: entries.len(),
+        uncompressed_bytes,
+        include_catalog,
     })
 }
 
@@ -958,24 +1027,24 @@ pub(crate) async fn collect_s3_prefix_upload_entries(
     client: &Client,
     options: &S3PrefixUploadOptions,
 ) -> Result<Vec<UploadEntry>> {
-    collect_s3_prefix_upload_entries_with_size_limit(client, options, Some(S3_SINGLE_PUT_LIMIT))
+    collect_s3_prefix_upload_entries_from_prefix(client, &options.source, Some(S3_SINGLE_PUT_LIMIT))
         .await
 }
 
-async fn collect_s3_prefix_upload_entries_with_size_limit(
+async fn collect_s3_prefix_upload_entries_from_prefix(
     client: &Client,
-    options: &S3PrefixUploadOptions,
+    source: &S3Prefix,
     max_file_size: Option<u64>,
 ) -> Result<Vec<UploadEntry>> {
     let mut entries = Vec::new();
     let mut seen_zip_paths = HashSet::new();
     let mut continuation = None::<String>;
-    let list_prefix = normalized_list_prefix(&options.source.prefix);
+    let list_prefix = normalized_list_prefix(&source.prefix);
 
     loop {
         let mut request = client
             .list_objects_v2()
-            .bucket(&options.source.bucket)
+            .bucket(&source.bucket)
             .prefix(&list_prefix);
 
         if let Some(token) = continuation.take() {
@@ -984,7 +1053,7 @@ async fn collect_s3_prefix_upload_entries_with_size_limit(
 
         let output = request.send().await.map_err(|err| Error::S3 {
             operation: "ListObjectsV2",
-            bucket: options.source.bucket.clone(),
+            bucket: source.bucket.clone(),
             key: list_prefix.clone(),
             message: aws_error_message(&err),
         })?;
@@ -992,25 +1061,25 @@ async fn collect_s3_prefix_upload_entries_with_size_limit(
         for object in output.contents() {
             let key = object.key().ok_or_else(|| Error::S3 {
                 operation: "ListObjectsV2",
-                bucket: options.source.bucket.clone(),
+                bucket: source.bucket.clone(),
                 key: list_prefix.clone(),
                 message: "listed object did not include a key".to_string(),
             })?;
             let size = object.size().ok_or_else(|| Error::S3 {
                 operation: "ListObjectsV2",
-                bucket: options.source.bucket.clone(),
+                bucket: source.bucket.clone(),
                 key: key.to_string(),
                 message: "listed object did not include a size".to_string(),
             })?;
             let size = u64::try_from(size).map_err(|_| Error::S3 {
                 operation: "ListObjectsV2",
-                bucket: options.source.bucket.clone(),
+                bucket: source.bucket.clone(),
                 key: key.to_string(),
                 message: format!("listed object had negative size {size}"),
             })?;
 
             if let Some(entry) = s3_prefix_upload_entry(
-                &options.source,
+                source,
                 key,
                 size,
                 object.e_tag(),
@@ -1026,7 +1095,7 @@ async fn collect_s3_prefix_upload_entries_with_size_limit(
             if continuation.is_none() {
                 return Err(Error::S3 {
                     operation: "ListObjectsV2",
-                    bucket: options.source.bucket.clone(),
+                    bucket: source.bucket.clone(),
                     key: list_prefix.clone(),
                     message: "response was truncated without a continuation token".to_string(),
                 });
