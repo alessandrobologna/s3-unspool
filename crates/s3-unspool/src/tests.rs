@@ -668,9 +668,10 @@ async fn dry_run_local_unzip_reports_create_and_replace_without_writing() {
             .await
             .unwrap()
     );
+    let nested_file = Path::new("nested").join("a.txt");
     assert!(report.operations.iter().any(|operation| {
         operation.status == DryRunOperationStatus::WouldUploadChanged
-            && operation.key.ends_with("nested/a.txt")
+            && Path::new(&operation.key).ends_with(&nested_file)
     }));
 
     tokio::fs::remove_dir_all(source_root).await.unwrap();
