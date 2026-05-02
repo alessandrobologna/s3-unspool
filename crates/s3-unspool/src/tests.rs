@@ -680,6 +680,44 @@ async fn dry_run_local_unzip_reports_create_and_replace_without_writing() {
 }
 
 #[tokio::test]
+async fn dry_run_local_unzip_reports_directory_component_error_path() {
+    let zip_dir = unique_temp_dir("unzip-dry-run-component-zip");
+    let destination = unique_temp_dir("unzip-dry-run-component-destination");
+    let source_zip = zip_dir.join("site.zip");
+    tokio::fs::create_dir_all(&zip_dir).await.unwrap();
+    tokio::fs::create_dir_all(&destination).await.unwrap();
+    tokio::fs::write(destination.join("blocked"), b"file")
+        .await
+        .unwrap();
+    let zip_bytes = test_zip(&[("blocked/empty/", Compression::Stored, b"".as_slice())]).await;
+    tokio::fs::write(&source_zip, zip_bytes).await.unwrap();
+
+    let report = dry_run_unzip_file_to_local(LocalUnzipOptions::new(&source_zip, &destination))
+        .await
+        .unwrap();
+
+    assert_eq!(report.summary.errors, 1);
+    let operation = report
+        .operations
+        .iter()
+        .find(|operation| operation.status == DryRunOperationStatus::Error)
+        .unwrap();
+    let blocked = destination.join("blocked");
+    assert_eq!(Path::new(&operation.key), blocked.as_path());
+    assert_eq!(operation.zip_path.as_deref(), Some("blocked/empty/"));
+    assert!(
+        operation
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("exists and is not a directory")
+    );
+
+    tokio::fs::remove_dir_all(zip_dir).await.unwrap();
+    tokio::fs::remove_dir_all(destination).await.unwrap();
+}
+
+#[tokio::test]
 async fn local_unzip_creates_shared_missing_parent_concurrently() {
     let zip_dir = unique_temp_dir("unzip-shared-parent-zip");
     let destination = unique_temp_dir("unzip-shared-parent-destination");

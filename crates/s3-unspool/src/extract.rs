@@ -2250,7 +2250,7 @@ async fn dry_run_local_directory_entry_to_local(
         match tokio::fs::symlink_metadata(&current).await {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return dry_run_local_destination_error(
-                    &destination,
+                    &current,
                     entry,
                     "destination path component cannot be a symbolic link".to_string(),
                 );
@@ -2258,7 +2258,7 @@ async fn dry_run_local_directory_entry_to_local(
             Ok(metadata) if metadata.is_dir() => {}
             Ok(_) => {
                 return dry_run_local_destination_error(
-                    &destination,
+                    &current,
                     entry,
                     "destination path component exists and is not a directory".to_string(),
                 );
@@ -2268,7 +2268,7 @@ async fn dry_run_local_directory_entry_to_local(
             }
             Err(err) => {
                 return dry_run_local_destination_error(
-                    &destination,
+                    &current,
                     entry,
                     format!("cannot inspect destination path component: {err}"),
                 );
@@ -3079,7 +3079,11 @@ async fn reject_local_unzip_source_archive_target(
                 ));
             }
             Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
             Err(err) => {
                 return Err(invalid_local_path(
                     &destination,
