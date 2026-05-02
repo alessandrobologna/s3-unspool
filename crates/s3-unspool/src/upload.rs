@@ -26,7 +26,7 @@ use crate::options::{
     LocalZipOptions, S3PrefixLocalZipOptions, S3PrefixUploadOptions, UploadOptions, UploadProgress,
     UploadProgressHandler,
 };
-use crate::report::{LocalZipReport, S3PrefixUploadReport, UploadReport};
+use crate::report::{LocalZipReport, S3PrefixUploadReport, UploadReport, ZipDryRunReport};
 use crate::s3_uri::{S3Object, S3Prefix};
 use crate::zip_manifest::normalize_zip_entry_path;
 
@@ -175,6 +175,19 @@ pub async fn upload_directory_zip_to_s3(
     })
 }
 
+/// Plans zipping a local directory and uploading it as an S3 object without writing anything.
+pub async fn dry_run_upload_directory_zip_to_s3(options: UploadOptions) -> Result<ZipDryRunReport> {
+    validate_upload_options(&options)?;
+
+    let entries = collect_upload_entries(&options.source_dir).await?;
+    zip_dry_run_report(
+        options.source_dir.display().to_string(),
+        options.destination.uri(),
+        &entries,
+        options.include_catalog,
+    )
+}
+
 /// Zips a local directory into a local ZIP file.
 ///
 /// The destination is written to a temporary sibling file first and renamed into
@@ -218,6 +231,19 @@ pub async fn zip_directory_to_file(options: LocalZipOptions) -> Result<LocalZipR
         uncompressed_bytes,
         zip_bytes,
     })
+}
+
+/// Plans zipping a local directory into a local ZIP file without writing anything.
+pub async fn dry_run_zip_directory_to_file(options: LocalZipOptions) -> Result<ZipDryRunReport> {
+    validate_local_zip_options(&options).await?;
+
+    let entries = collect_upload_entries_with_size_limit(&options.source_dir, None).await?;
+    zip_dry_run_report(
+        options.source_dir.display().to_string(),
+        options.destination_zip.display().to_string(),
+        &entries,
+        options.include_catalog,
+    )
 }
 
 /// Zips an S3 prefix and uploads the archive to S3.
@@ -325,6 +351,22 @@ pub async fn zip_s3_prefix_to_s3(
     })
 }
 
+/// Plans zipping an S3 prefix and uploading it as an S3 object without writing anything.
+pub async fn dry_run_zip_s3_prefix_to_s3(
+    client: &Client,
+    options: S3PrefixUploadOptions,
+) -> Result<ZipDryRunReport> {
+    validate_s3_prefix_upload_options(&options)?;
+
+    let entries = collect_s3_prefix_upload_entries(client, &options).await?;
+    zip_dry_run_report(
+        options.source.uri(),
+        options.destination.uri(),
+        &entries,
+        options.include_catalog,
+    )
+}
+
 /// Zips an S3 prefix into a local ZIP file.
 ///
 /// Source objects are listed and streamed from S3 with `GetObject`. Zero-byte
@@ -385,6 +427,57 @@ pub async fn zip_s3_prefix_to_file(
         entries: entries.len(),
         uncompressed_bytes,
         zip_bytes,
+    })
+}
+
+/// Plans zipping an S3 prefix into a local ZIP file without writing anything.
+pub async fn dry_run_zip_s3_prefix_to_file(
+    client: &Client,
+    options: S3PrefixLocalZipOptions,
+) -> Result<ZipDryRunReport> {
+    validate_local_zip_destination_path(&options.destination_zip).await?;
+
+    let entries = collect_s3_prefix_upload_entries_with_size_limit(
+        client,
+        &S3PrefixUploadOptions {
+            source: options.source.clone(),
+            destination: S3Object {
+                bucket: "__local__".to_string(),
+                key: options.destination_zip.display().to_string(),
+            },
+            include_catalog: options.include_catalog,
+            body_chunk_size: MAX_BODY_CHUNK_SIZE.min(64 * 1024),
+            pipe_capacity: 64 * 1024,
+            progress: options.progress.clone(),
+        },
+        None,
+    )
+    .await?;
+    zip_dry_run_report(
+        options.source.uri(),
+        options.destination_zip.display().to_string(),
+        &entries,
+        options.include_catalog,
+    )
+}
+
+fn zip_dry_run_report(
+    source: String,
+    destination: String,
+    entries: &[UploadEntry],
+    include_catalog: bool,
+) -> Result<ZipDryRunReport> {
+    let files = entries.iter().filter(|entry| entry.is_file()).count();
+    let directories = entries.len().saturating_sub(files);
+    let uncompressed_bytes = upload_entries_uncompressed_bytes(entries)?;
+    Ok(ZipDryRunReport {
+        source,
+        destination,
+        files,
+        directories,
+        entries: entries.len(),
+        uncompressed_bytes,
+        include_catalog,
     })
 }
 

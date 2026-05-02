@@ -1,4 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,9 +46,10 @@ use crate::range::{
     start_source_scheduler,
 };
 use crate::report::{
-    LocalUnzipDiagnostics, LocalUnzipReport, LocalZipToS3Report, ObjectReport, OperationStatus,
-    PutDiagnostics, PutRetryDiagnostics, SyncDiagnostics, SyncReport, SyncSummary,
-    summarize_operation,
+    DryRunDiagnostics, DryRunObjectReport, DryRunOperationStatus, LocalUnzipDiagnostics,
+    LocalUnzipReport, LocalZipToS3Report, ObjectReport, OperationStatus, PutDiagnostics,
+    PutRetryDiagnostics, SyncDiagnostics, SyncReport, SyncSummary, UnzipDryRunReport,
+    UnzipDryRunSummary, summarize_dry_run_operation, summarize_operation,
 };
 use crate::s3_uri::{S3Prefix, normalize_etag};
 use crate::source::head_source;
@@ -867,6 +874,326 @@ pub async fn unzip_file_to_local(options: LocalUnzipOptions) -> Result<LocalUnzi
     })
 }
 
+/// Plans extracting an S3 ZIP object into an S3 prefix without writing or deleting objects.
+pub async fn dry_run_sync_zip_to_s3(
+    client: &Client,
+    options: SyncOptions,
+) -> Result<UnzipDryRunReport> {
+    dry_run_sync_zip_to_s3_with_clients(client, client, options).await
+}
+
+/// Plans extracting an S3 ZIP object into an S3 prefix with separate source and destination clients.
+pub async fn dry_run_sync_zip_to_s3_with_clients(
+    source_client: &Client,
+    destination_client: &Client,
+    mut options: SyncOptions,
+) -> Result<UnzipDryRunReport> {
+    validate_options(&options)?;
+    let source_head = head_source(source_client, &options.source).await?;
+    let diagnostics = options
+        .collect_diagnostics
+        .then(|| Arc::new(SourceDiagnosticsCollector::new(source_head.len)));
+    let source = Arc::new(SourceClient {
+        client: source_client.clone(),
+        bucket: options.source.bucket.clone(),
+        key: options.source.key.clone(),
+        len: source_head.len,
+        etag: source_head.etag,
+        diagnostics: diagnostics.clone(),
+    });
+
+    let manifest = load_zip_manifest(
+        Arc::clone(&source),
+        &options.destination,
+        options.ignore_embedded_catalog,
+        options.source_block_size,
+        Some(crate::constants::S3_SINGLE_PUT_LIMIT),
+    )
+    .await?;
+    resolve_source_window_capacity(&mut options, source_head.len, manifest.entries.len());
+    validate_source_range_options(&options, source_head.len)?;
+
+    let destination_objects = list_destination(destination_client, &options.destination).await?;
+    let entries = manifest.entries;
+    let total_entries = entries.len();
+    let expected_keys = options.delete_extra.then(|| {
+        entries
+            .iter()
+            .map(|entry| entry.key.clone())
+            .collect::<HashSet<_>>()
+    });
+    let classified = classify_entries(entries, &destination_objects);
+    let mut summary = UnzipDryRunSummary {
+        zip_files: total_entries,
+        destination_objects: destination_objects.len(),
+        ..UnzipDryRunSummary::default()
+    };
+    let mut operations = Vec::new();
+
+    for operation in classified.reports {
+        record_dry_run_operation(
+            &mut summary,
+            &mut operations,
+            options.collect_operations,
+            dry_run_report_from_object_report(operation),
+        );
+    }
+
+    let mut upload_jobs = classified.upload_jobs;
+    if !classified.hash_jobs.is_empty() {
+        let hash_results = run_hash_phase(
+            Arc::clone(&source),
+            classified.hash_jobs,
+            &options,
+            source_head.len,
+            diagnostics.clone(),
+        )
+        .await;
+        for result in hash_results {
+            match result {
+                HashPhaseResult::Operation(operation) => record_dry_run_operation(
+                    &mut summary,
+                    &mut operations,
+                    options.collect_operations,
+                    dry_run_report_from_object_report(operation),
+                ),
+                HashPhaseResult::Upload(job) => upload_jobs.push(job),
+            }
+        }
+    }
+
+    for job in upload_jobs {
+        record_dry_run_operation(
+            &mut summary,
+            &mut operations,
+            options.collect_operations,
+            dry_run_upload_job_report(job),
+        );
+    }
+
+    if options.delete_extra {
+        let expected_keys = expected_keys.expect("delete-extra expected keys are prepared");
+        for key in destination_objects
+            .keys()
+            .filter(|key| !expected_keys.contains(*key))
+        {
+            record_dry_run_operation(
+                &mut summary,
+                &mut operations,
+                options.collect_operations,
+                dry_run_delete_extra_report(key.clone(), destination_objects.get(key)),
+            );
+        }
+    }
+
+    Ok(UnzipDryRunReport {
+        source_zip: options.source.uri(),
+        destination: options.destination.uri(),
+        summary,
+        diagnostics: diagnostics.map(|diagnostics| DryRunDiagnostics {
+            concurrency: options.concurrency,
+            source_block_size: options.source_block_size,
+            source_block_merge_gap: options.source_block_merge_gap,
+            source_get_concurrency: options.source_get_concurrency,
+            source_window_capacity: options.source_window_capacity,
+            source: diagnostics.snapshot(),
+        }),
+        operations,
+    })
+}
+
+/// Plans extracting a local ZIP file into an S3 prefix without writing or deleting objects.
+pub async fn dry_run_unzip_file_to_s3(
+    client: &Client,
+    options: LocalZipSyncOptions,
+) -> Result<UnzipDryRunReport> {
+    validate_local_zip_sync_options(&options)?;
+    let reader = open_local_zip_reader(&options.source_zip).await?;
+    let source_len = tokio::fs::metadata(&options.source_zip).await?.len();
+    let mut entries = local_zip_entries_for_s3(
+        reader.file().entries(),
+        &options.destination,
+        source_len,
+        true,
+    )?;
+    if !options.ignore_embedded_catalog {
+        let catalog = load_local_embedded_catalog(&reader, entries.catalog_index).await;
+        apply_local_catalog(&mut entries.entries, catalog);
+    }
+
+    let destination_objects = list_destination(client, &options.destination).await?;
+    let expected_keys = options.delete_extra.then(|| {
+        entries
+            .entries
+            .iter()
+            .map(|entry| entry.destination.clone())
+            .collect::<HashSet<_>>()
+    });
+    let total_entries = entries.entries.len();
+    let mut summary = UnzipDryRunSummary {
+        zip_files: total_entries,
+        destination_objects: destination_objects.len(),
+        ..UnzipDryRunSummary::default()
+    };
+    let mut operations = Vec::new();
+
+    let mut stream = stream::iter(entries.entries)
+        .map(|entry| dry_run_local_zip_entry_to_s3(&reader, entry, &destination_objects))
+        .buffer_unordered(options.concurrency);
+
+    while let Some(operation) = stream.next().await {
+        record_dry_run_operation(
+            &mut summary,
+            &mut operations,
+            options.collect_operations,
+            operation,
+        );
+    }
+    drop(stream);
+
+    if options.delete_extra {
+        let expected_keys = expected_keys.expect("delete-extra expected keys are prepared");
+        for key in destination_objects
+            .keys()
+            .filter(|key| !expected_keys.contains(*key))
+        {
+            record_dry_run_operation(
+                &mut summary,
+                &mut operations,
+                options.collect_operations,
+                dry_run_delete_extra_report(key.clone(), destination_objects.get(key)),
+            );
+        }
+    }
+
+    Ok(UnzipDryRunReport {
+        source_zip: options.source_zip.display().to_string(),
+        destination: options.destination.uri(),
+        summary,
+        diagnostics: None,
+        operations,
+    })
+}
+
+/// Plans extracting an S3 ZIP object into a local directory without writing files.
+pub async fn dry_run_unzip_s3_zip_to_local(
+    client: &Client,
+    mut options: S3ZipLocalUnzipOptions,
+) -> Result<UnzipDryRunReport> {
+    validate_s3_zip_local_unzip_options(&options)?;
+    let destination_root =
+        validate_local_destination_root_for_dry_run(&options.destination_dir).await?;
+    let source_head = head_source(client, &options.source).await?;
+    let diagnostics = options
+        .collect_diagnostics
+        .then(|| Arc::new(SourceDiagnosticsCollector::new(source_head.len)));
+    let source = Arc::new(SourceClient {
+        client: client.clone(),
+        bucket: options.source.bucket.clone(),
+        key: options.source.key.clone(),
+        len: source_head.len,
+        etag: source_head.etag,
+        diagnostics: diagnostics.clone(),
+    });
+    let local_destination = S3Prefix {
+        bucket: "__local__".to_string(),
+        prefix: String::new(),
+    };
+    let manifest = load_zip_manifest(
+        Arc::clone(&source),
+        &local_destination,
+        options.ignore_embedded_catalog,
+        options.source_block_size,
+        None,
+    )
+    .await?;
+    resolve_s3_zip_local_window_capacity(&mut options, source_head.len, manifest.entries.len());
+    validate_s3_zip_local_source_range_options(&options, source_head.len)?;
+
+    let entries = manifest.entries;
+    validate_local_destination_zip_paths(entries.iter().map(|entry| entry.zip_path.as_str()))?;
+    let destination_case_insensitive =
+        destination_uses_case_insensitive_paths_for_dry_run(&options.destination_dir).await?;
+    validate_local_destination_path_collisions(
+        entries
+            .iter()
+            .map(|entry| (entry.zip_path.as_str(), entry.is_directory)),
+        destination_case_insensitive,
+    )?;
+
+    let mut summary = UnzipDryRunSummary {
+        zip_files: entries.len(),
+        ..UnzipDryRunSummary::default()
+    };
+    let mut operations = Vec::new();
+    for entry in entries {
+        record_dry_run_operation(
+            &mut summary,
+            &mut operations,
+            options.collect_operations,
+            dry_run_manifest_entry_to_local(&destination_root, entry).await,
+        );
+    }
+
+    Ok(UnzipDryRunReport {
+        source_zip: options.source.uri(),
+        destination: options.destination_dir.display().to_string(),
+        summary,
+        diagnostics: diagnostics.map(|diagnostics| DryRunDiagnostics {
+            concurrency: options.concurrency,
+            source_block_size: options.source_block_size,
+            source_block_merge_gap: options.source_block_merge_gap,
+            source_get_concurrency: options.source_get_concurrency,
+            source_window_capacity: options.source_window_capacity,
+            source: diagnostics.snapshot(),
+        }),
+        operations,
+    })
+}
+
+/// Plans extracting a local ZIP file into a local directory without writing files.
+pub async fn dry_run_unzip_file_to_local(options: LocalUnzipOptions) -> Result<UnzipDryRunReport> {
+    validate_local_unzip_options(&options)?;
+    let destination_root =
+        validate_local_destination_root_for_dry_run(&options.destination_dir).await?;
+    let reader = open_local_zip_reader(&options.source_zip).await?;
+    let source_len = tokio::fs::metadata(&options.source_zip).await?.len();
+    let entries = local_zip_entries_for_local(reader.file().entries(), source_len, false)?.entries;
+    validate_local_destination_zip_paths(entries.iter().map(|entry| entry.zip_path.as_str()))?;
+    let destination_case_insensitive =
+        destination_uses_case_insensitive_paths_for_dry_run(&options.destination_dir).await?;
+    validate_local_destination_path_collisions(
+        entries
+            .iter()
+            .map(|entry| (entry.zip_path.as_str(), entry.is_directory)),
+        destination_case_insensitive,
+    )?;
+    reject_local_unzip_source_archive_target(&options.source_zip, &destination_root, &entries)
+        .await?;
+
+    let mut summary = UnzipDryRunSummary {
+        zip_files: entries.len(),
+        ..UnzipDryRunSummary::default()
+    };
+    let mut operations = Vec::new();
+    for entry in entries {
+        record_dry_run_operation(
+            &mut summary,
+            &mut operations,
+            options.collect_operations,
+            dry_run_local_zip_entry_to_local(&destination_root, &entry).await,
+        );
+    }
+
+    Ok(UnzipDryRunReport {
+        source_zip: options.source_zip.display().to_string(),
+        destination: options.destination_dir.display().to_string(),
+        summary,
+        diagnostics: None,
+        operations,
+    })
+}
+
 type LocalZipReader = ZipFileReader;
 
 #[derive(Clone, Debug)]
@@ -1649,6 +1976,369 @@ fn local_destination_error(
     }
 }
 
+fn record_dry_run_operation(
+    summary: &mut UnzipDryRunSummary,
+    operations: &mut Vec<DryRunObjectReport>,
+    collect_operations: bool,
+    operation: DryRunObjectReport,
+) {
+    summarize_dry_run_operation(summary, &operation);
+    if collect_operations {
+        operations.push(operation);
+    }
+}
+
+fn dry_run_report_from_object_report(operation: ObjectReport) -> DryRunObjectReport {
+    let status = match operation.status {
+        OperationStatus::UploadedNew => DryRunOperationStatus::WouldUploadNew,
+        OperationStatus::UploadedChanged => DryRunOperationStatus::WouldUploadChanged,
+        OperationStatus::SkippedUnchanged => DryRunOperationStatus::SkippedUnchanged,
+        OperationStatus::DeletedExtra => DryRunOperationStatus::WouldDeleteExtra,
+        OperationStatus::ConditionalConflict | OperationStatus::Error => {
+            DryRunOperationStatus::Error
+        }
+    };
+    DryRunObjectReport {
+        status,
+        key: operation.key,
+        zip_path: operation.zip_path,
+        size: operation.size,
+        md5: operation.md5,
+        destination_etag: operation.destination_etag,
+        message: operation.message,
+    }
+}
+
+fn dry_run_upload_job_report(job: UploadJob) -> DryRunObjectReport {
+    let (status, destination_etag) = match job.condition {
+        PutCondition::IfNoneMatch => (DryRunOperationStatus::WouldUploadNew, None),
+        PutCondition::IfMatch(etag) => (DryRunOperationStatus::WouldUploadChanged, Some(etag)),
+    };
+    DryRunObjectReport {
+        status,
+        key: job.entry.key,
+        zip_path: Some(job.entry.zip_path),
+        size: job
+            .comparison_digest
+            .as_ref()
+            .map(|digest| digest.bytes)
+            .or(Some(job.entry.size)),
+        md5: job
+            .comparison_digest
+            .map(|digest| digest.md5)
+            .or(job.entry.catalog_md5),
+        destination_etag,
+        message: None,
+    }
+}
+
+fn dry_run_delete_extra_report(
+    key: String,
+    destination: Option<&DestinationObject>,
+) -> DryRunObjectReport {
+    DryRunObjectReport {
+        status: DryRunOperationStatus::WouldDeleteExtra,
+        key,
+        zip_path: None,
+        size: destination.and_then(|destination| destination.size),
+        md5: None,
+        destination_etag: destination.and_then(|destination| destination.etag.clone()),
+        message: None,
+    }
+}
+
+async fn dry_run_local_zip_entry_to_s3(
+    reader: &LocalZipReader,
+    entry: LocalZipEntry,
+    destination_objects: &HashMap<String, DestinationObject>,
+) -> DryRunObjectReport {
+    let existing = destination_objects.get(&entry.destination);
+    if entry.is_directory {
+        return dry_run_local_directory_marker(entry, existing);
+    }
+
+    let destination_etag = existing.and_then(|destination| destination.etag.clone());
+    if let (Some(catalog_md5), Some(destination_etag)) =
+        (entry.catalog_md5.as_ref(), destination_etag.as_ref())
+        && normalize_etag(destination_etag).as_ref() == Some(catalog_md5)
+        && existing.and_then(|destination| destination.size) == Some(entry.size)
+    {
+        return DryRunObjectReport {
+            status: DryRunOperationStatus::SkippedUnchanged,
+            key: entry.destination,
+            zip_path: Some(entry.zip_path),
+            size: Some(entry.size),
+            md5: Some(catalog_md5.clone()),
+            destination_etag: Some(destination_etag.clone()),
+            message: None,
+        };
+    }
+
+    let Some(destination) = existing else {
+        return DryRunObjectReport {
+            status: DryRunOperationStatus::WouldUploadNew,
+            key: entry.destination,
+            zip_path: Some(entry.zip_path),
+            size: Some(entry.size),
+            md5: entry.catalog_md5,
+            destination_etag: None,
+            message: None,
+        };
+    };
+    let Some(destination_etag) = destination.etag.clone() else {
+        return dry_run_local_entry_error(
+            &entry,
+            None,
+            "destination object was listed without an ETag".to_string(),
+        );
+    };
+
+    if let Some(destination_md5) = comparable_destination_md5(
+        destination,
+        &destination_etag,
+        &local_manifest_entry(&entry),
+    ) {
+        let entry_reader = match reader.reader_without_entry(entry.index).await {
+            Ok(reader) => reader.compat(),
+            Err(err) => {
+                return dry_run_local_entry_error(&entry, Some(destination_etag), err.to_string());
+            }
+        };
+        match digest_local_reader(entry_reader, &entry).await {
+            Ok(digest) if digest.md5 == destination_md5 => {
+                return DryRunObjectReport {
+                    status: DryRunOperationStatus::SkippedUnchanged,
+                    key: entry.destination,
+                    zip_path: Some(entry.zip_path),
+                    size: Some(digest.bytes),
+                    md5: Some(digest.md5),
+                    destination_etag: Some(destination_etag),
+                    message: None,
+                };
+            }
+            Ok(digest) => {
+                return DryRunObjectReport {
+                    status: DryRunOperationStatus::WouldUploadChanged,
+                    key: entry.destination,
+                    zip_path: Some(entry.zip_path),
+                    size: Some(digest.bytes),
+                    md5: Some(digest.md5),
+                    destination_etag: Some(destination_etag),
+                    message: None,
+                };
+            }
+            Err(err) => {
+                return dry_run_local_entry_error(&entry, Some(destination_etag), err.to_string());
+            }
+        }
+    }
+
+    DryRunObjectReport {
+        status: DryRunOperationStatus::WouldUploadChanged,
+        key: entry.destination,
+        zip_path: Some(entry.zip_path),
+        size: Some(entry.size),
+        md5: entry.catalog_md5,
+        destination_etag: Some(destination_etag),
+        message: None,
+    }
+}
+
+fn dry_run_local_directory_marker(
+    entry: LocalZipEntry,
+    existing: Option<&DestinationObject>,
+) -> DryRunObjectReport {
+    let Some(existing) = existing else {
+        return DryRunObjectReport {
+            status: DryRunOperationStatus::WouldUploadNew,
+            key: entry.destination,
+            zip_path: Some(entry.zip_path),
+            size: Some(0),
+            md5: Some(empty_md5()),
+            destination_etag: None,
+            message: None,
+        };
+    };
+
+    match existing.size {
+        Some(0) => DryRunObjectReport {
+            status: DryRunOperationStatus::SkippedUnchanged,
+            key: entry.destination,
+            zip_path: Some(entry.zip_path),
+            size: Some(0),
+            md5: Some(empty_md5()),
+            destination_etag: existing.etag.clone(),
+            message: None,
+        },
+        Some(size) => dry_run_local_entry_error(
+            &entry,
+            existing.etag.clone(),
+            format!("destination directory marker key exists with nonzero size {size}"),
+        ),
+        None => dry_run_local_entry_error(
+            &entry,
+            existing.etag.clone(),
+            "destination directory marker was listed without a size".to_string(),
+        ),
+    }
+}
+
+fn dry_run_local_entry_error(
+    entry: &LocalZipEntry,
+    destination_etag: Option<String>,
+    message: String,
+) -> DryRunObjectReport {
+    DryRunObjectReport {
+        status: DryRunOperationStatus::Error,
+        key: entry.destination.clone(),
+        zip_path: Some(entry.zip_path.clone()),
+        size: Some(entry.size),
+        md5: entry.catalog_md5.clone(),
+        destination_etag,
+        message: Some(message),
+    }
+}
+
+async fn dry_run_manifest_entry_to_local(
+    destination_root: &Path,
+    entry: ManifestEntry,
+) -> DryRunObjectReport {
+    let entry = local_entry_from_manifest(&entry);
+    dry_run_local_zip_entry_to_local(destination_root, &entry).await
+}
+
+async fn dry_run_local_zip_entry_to_local(
+    destination_root: &Path,
+    entry: &LocalZipEntry,
+) -> DryRunObjectReport {
+    if entry.is_directory {
+        dry_run_local_directory_entry_to_local(destination_root, entry).await
+    } else {
+        dry_run_local_file_entry_to_local(destination_root, entry).await
+    }
+}
+
+async fn dry_run_local_directory_entry_to_local(
+    destination_root: &Path,
+    entry: &LocalZipEntry,
+) -> DryRunObjectReport {
+    let destination = local_destination_path(destination_root, &entry.zip_path);
+    let mut current = destination_root.to_path_buf();
+    let mut missing_component = false;
+    for component in entry.zip_path.trim_end_matches('/').split('/') {
+        if component.is_empty() {
+            continue;
+        }
+        current.push(component);
+        if missing_component {
+            continue;
+        }
+        match tokio::fs::symlink_metadata(&current).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return dry_run_local_destination_error(
+                    &destination,
+                    entry,
+                    "destination path component cannot be a symbolic link".to_string(),
+                );
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return dry_run_local_destination_error(
+                    &destination,
+                    entry,
+                    "destination path component exists and is not a directory".to_string(),
+                );
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                missing_component = true;
+            }
+            Err(err) => {
+                return dry_run_local_destination_error(
+                    &destination,
+                    entry,
+                    format!("cannot inspect destination path component: {err}"),
+                );
+            }
+        }
+    }
+
+    DryRunObjectReport {
+        status: if missing_component {
+            DryRunOperationStatus::WouldUploadNew
+        } else {
+            DryRunOperationStatus::SkippedUnchanged
+        },
+        key: destination.display().to_string(),
+        zip_path: Some(entry.zip_path.clone()),
+        size: Some(0),
+        md5: Some(empty_md5()),
+        destination_etag: None,
+        message: None,
+    }
+}
+
+async fn dry_run_local_file_entry_to_local(
+    destination_root: &Path,
+    entry: &LocalZipEntry,
+) -> DryRunObjectReport {
+    let destination = local_destination_path(destination_root, &entry.zip_path);
+    if let Err(err) = validate_parent_dirs_for_dry_run(destination_root, &entry.zip_path).await {
+        return dry_run_local_destination_error(&destination, entry, err.to_string());
+    }
+
+    match tokio::fs::symlink_metadata(&destination).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => dry_run_local_destination_error(
+            &destination,
+            entry,
+            "destination file cannot be a symbolic link".to_string(),
+        ),
+        Ok(metadata) if metadata.is_dir() => dry_run_local_destination_error(
+            &destination,
+            entry,
+            "destination file path is a directory".to_string(),
+        ),
+        Ok(_) => DryRunObjectReport {
+            status: DryRunOperationStatus::WouldUploadChanged,
+            key: destination.display().to_string(),
+            zip_path: Some(entry.zip_path.clone()),
+            size: Some(entry.size),
+            md5: entry.catalog_md5.clone(),
+            destination_etag: None,
+            message: None,
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => DryRunObjectReport {
+            status: DryRunOperationStatus::WouldUploadNew,
+            key: destination.display().to_string(),
+            zip_path: Some(entry.zip_path.clone()),
+            size: Some(entry.size),
+            md5: entry.catalog_md5.clone(),
+            destination_etag: None,
+            message: None,
+        },
+        Err(err) => dry_run_local_destination_error(
+            &destination,
+            entry,
+            format!("cannot inspect destination file: {err}"),
+        ),
+    }
+}
+
+fn dry_run_local_destination_error(
+    destination: &Path,
+    entry: &LocalZipEntry,
+    message: String,
+) -> DryRunObjectReport {
+    DryRunObjectReport {
+        status: DryRunOperationStatus::Error,
+        key: destination.display().to_string(),
+        zip_path: Some(entry.zip_path.clone()),
+        size: Some(entry.size),
+        md5: entry.catalog_md5.clone(),
+        destination_etag: None,
+        message: Some(message),
+    }
+}
+
 fn local_entry_from_manifest(entry: &ManifestEntry) -> LocalZipEntry {
     LocalZipEntry {
         index: 0,
@@ -1682,6 +2372,331 @@ fn local_manifest_entry(entry: &LocalZipEntry) -> ManifestEntry {
 async fn prepare_local_destination_root(destination: &Path) -> Result<PathBuf> {
     create_destination_directory_no_symlink(destination).await?;
     Ok(destination.to_path_buf())
+}
+
+async fn validate_local_destination_root_for_dry_run(destination: &Path) -> Result<PathBuf> {
+    match tokio::fs::symlink_metadata(destination).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(invalid_local_path(
+                destination,
+                "destination directory cannot be a symbolic link".to_string(),
+            ));
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            validate_existing_directory_chain_no_symlink(destination).await?;
+        }
+        Ok(_) => {
+            return Err(invalid_local_path(
+                destination,
+                "destination must be a directory".to_string(),
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            validate_missing_destination_parent_chain(destination).await?;
+        }
+        Err(err) => {
+            return Err(invalid_local_path(
+                destination,
+                format!("cannot inspect destination directory: {err}"),
+            ));
+        }
+    }
+
+    Ok(destination.to_path_buf())
+}
+
+async fn validate_missing_destination_parent_chain(destination: &Path) -> Result<()> {
+    let mut current = destination;
+    while let Some(parent) = current.parent() {
+        if parent.as_os_str().is_empty() {
+            break;
+        }
+
+        match tokio::fs::symlink_metadata(parent).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(invalid_local_path(
+                    parent,
+                    "destination path component cannot be a symbolic link".to_string(),
+                ));
+            }
+            Ok(metadata) if metadata.is_dir() => {
+                validate_existing_directory_chain_no_symlink(parent).await?;
+                return Ok(());
+            }
+            Ok(_) => {
+                return Err(invalid_local_path(
+                    parent,
+                    "destination path component exists and is not a directory".to_string(),
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                current = parent;
+            }
+            Err(err) => {
+                return Err(invalid_local_path(
+                    parent,
+                    format!("cannot inspect destination path component: {err}"),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn validate_parent_dirs_for_dry_run(root: &Path, zip_path: &str) -> Result<()> {
+    let Some((parent, _file_name)) = zip_path.rsplit_once('/') else {
+        return Ok(());
+    };
+
+    let mut current = root.to_path_buf();
+    for component in parent.split('/') {
+        if component.is_empty() {
+            continue;
+        }
+        current.push(component);
+        match tokio::fs::symlink_metadata(&current).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(invalid_local_path(
+                    &current,
+                    "destination path component cannot be a symbolic link".to_string(),
+                ));
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(invalid_local_path(
+                    &current,
+                    "destination path component exists and is not a directory".to_string(),
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(invalid_local_path(
+                    &current,
+                    format!("cannot inspect destination path component: {err}"),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn destination_uses_case_insensitive_paths_for_dry_run(destination: &Path) -> Result<bool> {
+    let probe_root = existing_case_probe_root(destination).await?;
+    if let Some(case_insensitive) = platform_case_insensitive_paths(&probe_root)? {
+        return Ok(case_insensitive);
+    }
+    if let Some(case_insensitive) =
+        infer_case_insensitive_paths_from_existing_names(&probe_root).await?
+    {
+        return Ok(case_insensitive);
+    }
+    Ok(default_case_insensitive_paths())
+}
+
+async fn existing_case_probe_root(destination: &Path) -> Result<PathBuf> {
+    match tokio::fs::symlink_metadata(destination).await {
+        Ok(metadata) if metadata.is_dir() => return Ok(destination.to_path_buf()),
+        Ok(_) => {
+            return Err(invalid_local_path(
+                destination,
+                "destination must be a directory".to_string(),
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(invalid_local_path(
+                destination,
+                format!("cannot inspect destination directory: {err}"),
+            ));
+        }
+    }
+
+    let mut current = destination;
+    while let Some(parent) = current.parent() {
+        if parent.as_os_str().is_empty() {
+            break;
+        }
+        match tokio::fs::symlink_metadata(parent).await {
+            Ok(metadata) if metadata.is_dir() => return Ok(parent.to_path_buf()),
+            Ok(_) => {
+                return Err(invalid_local_path(
+                    parent,
+                    "destination path component exists and is not a directory".to_string(),
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                current = parent;
+            }
+            Err(err) => {
+                return Err(invalid_local_path(
+                    parent,
+                    format!("cannot inspect destination path component: {err}"),
+                ));
+            }
+        }
+    }
+
+    Ok(PathBuf::from("."))
+}
+
+#[cfg(target_os = "macos")]
+fn platform_case_insensitive_paths(path: &Path) -> Result<Option<bool>> {
+    let path = c_path(path)?;
+    let result = unsafe { libc::pathconf(path.as_ptr(), libc::_PC_CASE_SENSITIVE) };
+    match result {
+        0 => Ok(Some(true)),
+        1.. => Ok(Some(false)),
+        _ => Ok(None),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn platform_case_insensitive_paths(path: &Path) -> Result<Option<bool>> {
+    if let Some(case_insensitive) = linux_case_insensitive_paths(path)? {
+        return Ok(Some(case_insensitive));
+    }
+    Ok(None)
+}
+
+#[cfg(not(unix))]
+fn platform_case_insensitive_paths(_path: &Path) -> Result<Option<bool>> {
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_case_insensitive_paths(path: &Path) -> Result<Option<bool>> {
+    if linux_directory_has_casefold_flag(path)? {
+        return Ok(Some(true));
+    }
+    let path = c_path(path)?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let result = unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) };
+    if result != 0 {
+        return Ok(None);
+    }
+    let stat = unsafe { stat.assume_init() };
+    let filesystem_type = stat.f_type as i64;
+    if filesystem_type == libc::EXT4_SUPER_MAGIC as i64
+        || filesystem_type == libc::F2FS_SUPER_MAGIC as i64
+    {
+        return Ok(Some(false));
+    }
+    if filesystem_type == libc::MSDOS_SUPER_MAGIC as i64
+        || filesystem_type == libc::SMB_SUPER_MAGIC as i64
+        || filesystem_type == 0x2011_bab0
+        || filesystem_type == 0x5346_544e
+        || filesystem_type == 0xff53_4d42
+    {
+        return Ok(Some(true));
+    }
+    Ok(None)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn linux_case_insensitive_paths(_path: &Path) -> Result<Option<bool>> {
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_directory_has_casefold_flag(path: &Path) -> Result<bool> {
+    const FS_CASEFOLD_FL: libc::c_int = 0x4000_0000;
+    let display_path = path.to_path_buf();
+    let path = c_path(path)?;
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Ok(false);
+    }
+    let mut flags = 0 as libc::c_int;
+    let result = unsafe { libc::ioctl(fd, libc::FS_IOC_GETFLAGS, &mut flags) };
+    let close_result = unsafe { libc::close(fd) };
+    if close_result != 0 {
+        return Err(invalid_local_path(
+            display_path,
+            "cannot close destination directory after case-sensitivity probe".to_string(),
+        ));
+    }
+    Ok(result == 0 && flags & FS_CASEFOLD_FL != 0)
+}
+
+#[cfg(unix)]
+async fn infer_case_insensitive_paths_from_existing_names(path: &Path) -> Result<Option<bool>> {
+    let mut entries = match tokio::fs::read_dir(path).await {
+        Ok(entries) => entries,
+        Err(_) => return Ok(None),
+    };
+    while let Some(entry) = entries.next_entry().await.map_err(|err| {
+        invalid_local_path(
+            path,
+            format!("cannot read destination directory entry: {err}"),
+        )
+    })? {
+        let name = entry.file_name();
+        let Some(alternate_name) = alternate_case_name(&name) else {
+            continue;
+        };
+        let alternate_path = path.join(alternate_name);
+        let original_metadata = tokio::fs::symlink_metadata(entry.path())
+            .await
+            .map_err(|err| {
+                invalid_local_path(
+                    &entry.path(),
+                    format!("cannot inspect destination directory entry: {err}"),
+                )
+            })?;
+        match tokio::fs::symlink_metadata(&alternate_path).await {
+            Ok(alternate_metadata) => {
+                return Ok(Some(
+                    original_metadata.dev() == alternate_metadata.dev()
+                        && original_metadata.ino() == alternate_metadata.ino(),
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Some(false)),
+            Err(_) => continue,
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(not(unix))]
+async fn infer_case_insensitive_paths_from_existing_names(_path: &Path) -> Result<Option<bool>> {
+    Ok(None)
+}
+
+fn alternate_case_name(name: &std::ffi::OsStr) -> Option<String> {
+    let name = name.to_str()?;
+    let mut changed = false;
+    let alternate = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_lowercase() {
+                changed = true;
+                character.to_ascii_uppercase()
+            } else if character.is_ascii_uppercase() {
+                changed = true;
+                character.to_ascii_lowercase()
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    changed.then_some(alternate)
+}
+
+fn default_case_insensitive_paths() -> bool {
+    cfg!(windows)
+}
+
+#[cfg(unix)]
+fn c_path(path: &Path) -> Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| invalid_local_path(path, "path contains an interior NUL byte".to_string()))
 }
 
 async fn destination_uses_case_insensitive_paths(root: &Path) -> Result<bool> {
@@ -3628,6 +4643,166 @@ mod tests {
         assert_eq!(classified.reports[0].status, OperationStatus::Error);
     }
 
+    #[test]
+    fn dry_run_s3_classification_reports_would_statuses_and_delete_extra() {
+        let new_entry = manifest_entry("new.txt", 5, None);
+        let changed_entry = manifest_entry("changed.txt", 5, None);
+        let skipped_entry = manifest_entry(
+            "same.txt",
+            5,
+            Some("2c1743a391305fbf367df8e4f069f9f9".to_string()),
+        );
+        let destination_objects = std::collections::HashMap::from([
+            (
+                changed_entry.key.clone(),
+                DestinationObject {
+                    etag: Some("\"different\"".to_string()),
+                    size: Some(99),
+                },
+            ),
+            (
+                skipped_entry.key.clone(),
+                DestinationObject {
+                    etag: Some("\"2c1743a391305fbf367df8e4f069f9f9\"".to_string()),
+                    size: Some(5),
+                },
+            ),
+            (
+                "prefix/extra.txt".to_string(),
+                DestinationObject {
+                    etag: Some("\"extra\"".to_string()),
+                    size: Some(1),
+                },
+            ),
+        ]);
+
+        let expected_keys = [
+            new_entry.key.clone(),
+            changed_entry.key.clone(),
+            skipped_entry.key.clone(),
+        ]
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+        let classified = classify_entries(
+            vec![new_entry, changed_entry, skipped_entry],
+            &destination_objects,
+        );
+        let mut summary = UnzipDryRunSummary {
+            zip_files: 3,
+            destination_objects: destination_objects.len(),
+            ..UnzipDryRunSummary::default()
+        };
+        let mut operations = Vec::new();
+
+        for operation in classified.reports {
+            record_dry_run_operation(
+                &mut summary,
+                &mut operations,
+                true,
+                dry_run_report_from_object_report(operation),
+            );
+        }
+        for job in classified.upload_jobs {
+            record_dry_run_operation(
+                &mut summary,
+                &mut operations,
+                true,
+                dry_run_upload_job_report(job),
+            );
+        }
+        for key in destination_objects
+            .keys()
+            .filter(|key| !expected_keys.contains(*key))
+        {
+            record_dry_run_operation(
+                &mut summary,
+                &mut operations,
+                true,
+                dry_run_delete_extra_report(key.clone(), destination_objects.get(key)),
+            );
+        }
+
+        assert_eq!(summary.would_upload_new, 1);
+        assert_eq!(summary.would_upload_changed, 1);
+        assert_eq!(summary.skipped_unchanged, 1);
+        assert_eq!(summary.would_delete_extra, 1);
+        assert!(operations.iter().any(|operation| {
+            operation.status == DryRunOperationStatus::WouldDeleteExtra
+                && operation.key == "prefix/extra.txt"
+        }));
+    }
+
+    #[tokio::test]
+    async fn dry_run_case_sensitivity_matches_destination_probe() {
+        let destination = unique_test_dir("dry-run-case-probe");
+        tokio::fs::create_dir_all(&destination).await.unwrap();
+        tokio::fs::write(destination.join("sample.txt"), b"sample")
+            .await
+            .unwrap();
+
+        let expected = destination_uses_case_insensitive_paths(&destination)
+            .await
+            .unwrap();
+        let actual = destination_uses_case_insensitive_paths_for_dry_run(&destination)
+            .await
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        tokio::fs::remove_dir_all(destination).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dry_run_case_sensitivity_matches_empty_destination_probe() {
+        let destination = unique_test_dir("dry-run-empty-case-probe");
+        tokio::fs::create_dir_all(&destination).await.unwrap();
+
+        let expected = destination_uses_case_insensitive_paths(&destination)
+            .await
+            .unwrap();
+        let actual = destination_uses_case_insensitive_paths_for_dry_run(&destination)
+            .await
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        tokio::fs::remove_dir_all(destination).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dry_run_case_sensitivity_uses_existing_parent_for_missing_destination() {
+        let destination_parent = unique_test_dir("dry-run-missing-case-probe");
+        tokio::fs::create_dir_all(&destination_parent)
+            .await
+            .unwrap();
+        tokio::fs::write(destination_parent.join("sample.txt"), b"sample")
+            .await
+            .unwrap();
+        let missing_destination = destination_parent.join("missing");
+
+        let expected = destination_uses_case_insensitive_paths(&destination_parent)
+            .await
+            .unwrap();
+        let actual = destination_uses_case_insensitive_paths_for_dry_run(&missing_destination)
+            .await
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        tokio::fs::remove_dir_all(destination_parent).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dry_run_case_sensitivity_uses_current_dir_for_missing_relative_destination() {
+        let missing_destination = PathBuf::from(format!(
+            "s3-unspool-missing-case-probe-{}",
+            std::process::id()
+        ));
+
+        let probe_root = existing_case_probe_root(&missing_destination)
+            .await
+            .unwrap();
+
+        assert_eq!(probe_root, PathBuf::from("."));
+    }
+
     #[tokio::test]
     async fn local_zip_directory_marker_rejects_nonzero_existing_destination() {
         let entry = local_directory_entry("prefix/empty/");
@@ -4148,6 +5323,14 @@ mod tests {
         ))
     }
 
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("s3-unspool-{name}-{}-{nanos}", std::process::id()))
+    }
+
     fn dummy_s3_client() -> Client {
         let config = aws_sdk_s3::Config::builder()
             .behavior_version_latest()
@@ -4161,6 +5344,22 @@ mod tests {
             ))
             .build();
         Client::from_conf(config)
+    }
+
+    fn manifest_entry(path: &str, size: u64, catalog_md5: Option<String>) -> ManifestEntry {
+        ManifestEntry {
+            source_offset: 0,
+            source_span_start: 0,
+            source_span_end: size,
+            zip_path: path.to_string(),
+            key: format!("prefix/{path}"),
+            size,
+            compressed_size: size,
+            compression: Compression::Stored,
+            crc32: 0,
+            catalog_md5,
+            is_directory: false,
+        }
     }
 
     fn local_directory_entry(destination: &str) -> LocalZipEntry {

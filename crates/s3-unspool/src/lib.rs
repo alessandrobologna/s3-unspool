@@ -139,8 +139,9 @@ mod zip_manifest;
 pub use constants::EMBEDDED_CATALOG_PATH;
 pub use error::{Error, Result};
 pub use extract::{
-    sync_zip_to_s3, sync_zip_to_s3_with_clients, unzip_file_to_local, unzip_file_to_s3,
-    unzip_s3_zip_to_local,
+    dry_run_sync_zip_to_s3, dry_run_sync_zip_to_s3_with_clients, dry_run_unzip_file_to_local,
+    dry_run_unzip_file_to_s3, dry_run_unzip_s3_zip_to_local, sync_zip_to_s3,
+    sync_zip_to_s3_with_clients, unzip_file_to_local, unzip_file_to_s3, unzip_s3_zip_to_local,
 };
 pub use inspect::{S3ZipInfo, inspect_s3_zip};
 pub use options::{
@@ -150,13 +151,16 @@ pub use options::{
     adaptive_source_window_capacity,
 };
 pub use report::{
-    LocalUnzipDiagnostics, LocalUnzipReport, LocalZipReport, LocalZipToS3Report, ObjectReport,
-    OperationStatus, PutDiagnostics, PutRetryDiagnostics, S3PrefixUploadReport, SourceDiagnostics,
-    SyncDiagnostics, SyncReport, SyncSummary, UploadReport,
+    DryRunDiagnostics, DryRunObjectReport, DryRunOperationStatus, LocalUnzipDiagnostics,
+    LocalUnzipReport, LocalZipReport, LocalZipToS3Report, ObjectReport, OperationStatus,
+    PutDiagnostics, PutRetryDiagnostics, S3PrefixUploadReport, SourceDiagnostics, SyncDiagnostics,
+    SyncReport, SyncSummary, UnzipDryRunReport, UnzipDryRunSummary, UploadReport, ZipDryRunReport,
 };
 pub use s3_uri::{S3Object, S3Prefix};
 pub use upload::{
-    upload_directory_zip_to_s3, zip_directory_to_file, zip_s3_prefix_to_file, zip_s3_prefix_to_s3,
+    dry_run_upload_directory_zip_to_s3, dry_run_zip_directory_to_file,
+    dry_run_zip_s3_prefix_to_file, dry_run_zip_s3_prefix_to_s3, upload_directory_zip_to_s3,
+    zip_directory_to_file, zip_s3_prefix_to_file, zip_s3_prefix_to_s3,
 };
 
 #[cfg(test)]

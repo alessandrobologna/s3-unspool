@@ -2025,6 +2025,7 @@ dependencies = [
  "hex",
  "http-body 1.0.1",
  "http-body-util",
+ "libc",
  "md-5",
  "serde",
  "serde_json",
