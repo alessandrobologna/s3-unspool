@@ -15,12 +15,12 @@ use s3_unspool::{
     OperationStatus, PutDiagnostics, S3Object, S3Prefix, S3PrefixLocalZipOptions,
     S3PrefixUploadOptions, S3PrefixUploadReport, S3ZipLocalUnzipOptions, SyncDiagnostics,
     SyncOptions, SyncReport, SyncSummary, UnzipDryRunReport, UnzipDryRunSummary, UploadOptions,
-    UploadProgress, UploadProgressHandler, UploadReport, ZipDryRunReport, dry_run_sync_zip_to_s3,
-    dry_run_unzip_file_to_local, dry_run_unzip_file_to_s3, dry_run_unzip_s3_zip_to_local,
-    dry_run_upload_directory_zip_to_s3, dry_run_zip_directory_to_file,
-    dry_run_zip_s3_prefix_to_file, dry_run_zip_s3_prefix_to_s3, sync_zip_to_s3,
-    unzip_file_to_local, unzip_file_to_s3, unzip_s3_zip_to_local, upload_directory_zip_to_s3,
-    zip_directory_to_file, zip_s3_prefix_to_file, zip_s3_prefix_to_s3,
+    UploadProgress, UploadProgressHandler, UploadReport, ZipCompression, ZipDryRunReport,
+    dry_run_sync_zip_to_s3, dry_run_unzip_file_to_local, dry_run_unzip_file_to_s3,
+    dry_run_unzip_s3_zip_to_local, dry_run_upload_directory_zip_to_s3,
+    dry_run_zip_directory_to_file, dry_run_zip_s3_prefix_to_file, dry_run_zip_s3_prefix_to_s3,
+    sync_zip_to_s3, unzip_file_to_local, unzip_file_to_s3, unzip_s3_zip_to_local,
+    upload_directory_zip_to_s3, zip_directory_to_file, zip_s3_prefix_to_file, zip_s3_prefix_to_s3,
 };
 use serde::Serialize;
 use terminal_size::{Width, terminal_size};
@@ -187,6 +187,7 @@ async fn run_zip(matches: &ArgMatches, output: &Output) -> Result<(), Box<dyn st
         .expect("required by clap");
     let dry_run = matches.get_flag("dry-run");
     let include_catalog = !matches.get_flag("no-catalog");
+    let compression = parse_zip_compression(matches)?;
     let report_destination = ReportDestination::from_cli_value(matches.get_one::<String>("report"));
     let source = parse_tree_source(source)?;
     let destination = parse_zip_destination(destination)?;
@@ -196,12 +197,13 @@ async fn run_zip(matches: &ArgMatches, output: &Output) -> Result<(), Box<dyn st
         vec![
             format!("{} -> {}", source.display(), destination.display()),
             format!(
-                "catalog {}{}",
+                "catalog {}, compression {}{}",
                 if include_catalog {
                     "enabled"
                 } else {
                     "disabled"
                 },
+                compression.as_str(),
                 if dry_run { ", no changes" } else { "" }
             ),
         ],
@@ -221,6 +223,7 @@ async fn run_zip(matches: &ArgMatches, output: &Output) -> Result<(), Box<dyn st
         (TreeSource::Local(source_dir), ZipDestination::S3(destination)) => {
             let mut options = UploadOptions::new(source_dir, destination);
             options.include_catalog = include_catalog;
+            options.compression = compression;
             if dry_run {
                 ZipCommandReport::DryRun(dry_run_upload_directory_zip_to_s3(options).await?)
             } else {
@@ -232,6 +235,7 @@ async fn run_zip(matches: &ArgMatches, output: &Output) -> Result<(), Box<dyn st
         (TreeSource::Local(source_dir), ZipDestination::Local(destination_zip)) => {
             let mut options = LocalZipOptions::new(source_dir, destination_zip);
             options.include_catalog = include_catalog;
+            options.compression = compression;
             if dry_run {
                 ZipCommandReport::DryRun(dry_run_zip_directory_to_file(options).await?)
             } else {
@@ -243,6 +247,7 @@ async fn run_zip(matches: &ArgMatches, output: &Output) -> Result<(), Box<dyn st
             let client = s3_client().await;
             let mut options = S3PrefixUploadOptions::new(source, destination);
             options.include_catalog = include_catalog;
+            options.compression = compression;
             if dry_run {
                 ZipCommandReport::DryRun(dry_run_zip_s3_prefix_to_s3(&client, options).await?)
             } else {
@@ -254,6 +259,7 @@ async fn run_zip(matches: &ArgMatches, output: &Output) -> Result<(), Box<dyn st
             let client = s3_client().await;
             let mut options = S3PrefixLocalZipOptions::new(source, destination_zip);
             options.include_catalog = include_catalog;
+            options.compression = compression;
             if dry_run {
                 ZipCommandReport::DryRun(dry_run_zip_s3_prefix_to_file(&client, options).await?)
             } else {
@@ -543,8 +549,39 @@ fn cli() -> Command {
                         .long("no-catalog")
                         .help("Do not include the embedded MD5 catalog in the ZIP")
                         .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("compression")
+                        .long("compression")
+                        .value_name("METHOD")
+                        .help("Compression method for regular file entries")
+                        .value_parser(["deflate", "zstd"])
+                        .default_value("deflate"),
                 ),
         )
+}
+
+fn parse_zip_compression(
+    matches: &ArgMatches,
+) -> Result<ZipCompression, Box<dyn std::error::Error>> {
+    match matches
+        .get_one::<String>("compression")
+        .map(String::as_str)
+        .unwrap_or("deflate")
+    {
+        "deflate" => Ok(ZipCompression::Deflate),
+        "zstd" => {
+            #[cfg(feature = "zstd")]
+            {
+                Ok(ZipCompression::Zstd)
+            }
+            #[cfg(not(feature = "zstd"))]
+            {
+                Err("zstd compression requires the s3-unspool-cli `zstd` feature".into())
+            }
+        }
+        other => Err(format!("unsupported ZIP compression method {other:?}").into()),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1821,6 +1858,37 @@ mod tests {
         };
         assert!(upload.get_flag("dry-run"));
         assert!(upload.get_flag("no-catalog"));
+    }
+
+    #[test]
+    fn parses_zip_compression() {
+        let matches = cli()
+            .try_get_matches_from([
+                "s3-unspool",
+                "zip",
+                "--compression",
+                "zstd",
+                "/tmp/site",
+                "s3://destination-bucket/site.zip",
+            ])
+            .unwrap();
+
+        let Some(("zip", upload)) = matches.subcommand() else {
+            panic!("expected zip subcommand");
+        };
+        assert_eq!(
+            upload.get_one::<String>("compression").map(String::as_str),
+            Some("zstd")
+        );
+        #[cfg(feature = "zstd")]
+        assert_eq!(parse_zip_compression(upload).unwrap(), ZipCompression::Zstd);
+        #[cfg(not(feature = "zstd"))]
+        assert!(
+            parse_zip_compression(upload)
+                .unwrap_err()
+                .to_string()
+                .contains("requires the s3-unspool-cli `zstd` feature")
+        );
     }
 
     #[test]
