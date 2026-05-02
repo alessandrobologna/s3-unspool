@@ -219,12 +219,12 @@ async fn run_zip(matches: &ArgMatches, output: &Output) -> Result<(), Box<dyn st
     let zip_started = Instant::now();
     let report = match (source, destination) {
         (TreeSource::Local(source_dir), ZipDestination::S3(destination)) => {
-            let client = s3_client().await;
             let mut options = UploadOptions::new(source_dir, destination);
             options.include_catalog = include_catalog;
             if dry_run {
                 ZipCommandReport::DryRun(dry_run_upload_directory_zip_to_s3(options).await?)
             } else {
+                let client = s3_client().await;
                 options.progress = Some(progress);
                 ZipCommandReport::Upload(upload_directory_zip_to_s3(&client, options).await?)
             }

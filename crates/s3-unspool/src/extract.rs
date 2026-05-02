@@ -2618,7 +2618,7 @@ fn linux_directory_has_casefold_flag(path: &Path) -> Result<bool> {
     let close_result = unsafe { libc::close(fd) };
     if close_result != 0 {
         return Err(invalid_local_path(
-            display_path,
+            &display_path,
             "cannot close destination directory after case-sensitivity probe".to_string(),
         ));
     }
