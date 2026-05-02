@@ -2577,17 +2577,18 @@ fn linux_case_insensitive_paths(path: &Path) -> Result<Option<bool>> {
         return Ok(None);
     }
     let stat = unsafe { stat.assume_init() };
-    let filesystem_type = stat.f_type as i64;
-    if filesystem_type == libc::EXT4_SUPER_MAGIC as i64
-        || filesystem_type == libc::F2FS_SUPER_MAGIC as i64
-    {
+    let filesystem_type = stat.f_type;
+    if filesystem_type == libc::EXT4_SUPER_MAGIC || filesystem_type == libc::F2FS_SUPER_MAGIC {
         return Ok(Some(false));
     }
-    if filesystem_type == libc::MSDOS_SUPER_MAGIC as i64
-        || filesystem_type == libc::SMB_SUPER_MAGIC as i64
-        || filesystem_type == 0x2011_bab0
-        || filesystem_type == 0x5346_544e
-        || filesystem_type == 0xff53_4d42
+    const EXFAT_SUPER_MAGIC: libc::c_long = 0x2011_bab0;
+    const NTFS_SB_MAGIC: libc::c_long = 0x5346_544e;
+    const CIFS_SUPER_MAGIC: libc::c_long = 0xff53_4d42;
+    if filesystem_type == libc::MSDOS_SUPER_MAGIC
+        || filesystem_type == libc::SMB_SUPER_MAGIC
+        || filesystem_type == EXFAT_SUPER_MAGIC
+        || filesystem_type == NTFS_SB_MAGIC
+        || filesystem_type == CIFS_SUPER_MAGIC
     {
         return Ok(Some(true));
     }
