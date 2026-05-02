@@ -17,6 +17,9 @@ pub struct UploadReport {
     /// Number of preserved directory entries included in the ZIP.
     #[serde(default)]
     pub directories: usize,
+    /// Whether the embedded update catalog was included.
+    #[serde(default = "default_include_catalog")]
+    pub include_catalog: bool,
     /// Total uncompressed payload bytes.
     pub uncompressed_bytes: u64,
     /// Total uploaded ZIP object bytes.
@@ -34,6 +37,9 @@ pub struct S3PrefixUploadReport {
     pub files: usize,
     /// Number of zero-byte trailing-slash source objects included as ZIP directories.
     pub directories: usize,
+    /// Whether the embedded update catalog was included.
+    #[serde(default = "default_include_catalog")]
+    pub include_catalog: bool,
     /// Total number of ZIP entries written, excluding the embedded catalog.
     pub entries: usize,
     /// Total uncompressed payload bytes across regular file entries.
@@ -53,6 +59,9 @@ pub struct LocalZipReport {
     pub files: usize,
     /// Number of preserved directory entries included in the ZIP.
     pub directories: usize,
+    /// Whether the embedded update catalog was included.
+    #[serde(default = "default_include_catalog")]
+    pub include_catalog: bool,
     /// Total number of ZIP entries written, excluding the embedded catalog.
     pub entries: usize,
     /// Total uncompressed payload bytes across regular file entries.
@@ -78,6 +87,10 @@ pub struct ZipDryRunReport {
     pub uncompressed_bytes: u64,
     /// Whether the embedded update catalog would be included.
     pub include_catalog: bool,
+}
+
+fn default_include_catalog() -> bool {
+    true
 }
 
 /// Aggregate counters for an extract run.

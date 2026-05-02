@@ -533,7 +533,8 @@ async fn local_zip_can_disable_embedded_catalog() {
 
     let mut options = LocalZipOptions::new(&root, &destination_zip);
     options.include_catalog = false;
-    zip_directory_to_file(options).await.unwrap();
+    let report = zip_directory_to_file(options).await.unwrap();
+    assert!(!report.include_catalog);
 
     let data = tokio::fs::read(&destination_zip).await.unwrap();
     let zip = async_zip::base::read::mem::ZipFileReader::new(data)

@@ -934,8 +934,10 @@ impl ZipCommandReport {
 
     fn include_catalog(&self) -> Option<bool> {
         match self {
+            Self::Upload(report) => Some(report.include_catalog),
+            Self::S3Prefix(report) => Some(report.include_catalog),
+            Self::Local(report) => Some(report.include_catalog),
             Self::DryRun(report) => Some(report.include_catalog),
-            Self::Upload(_) | Self::S3Prefix(_) | Self::Local(_) => None,
         }
     }
 }
@@ -2098,6 +2100,7 @@ mod tests {
             destination: S3Object::parse("s3://bucket/site.zip").unwrap(),
             files: 2,
             directories: 0,
+            include_catalog: true,
             uncompressed_bytes: 1536,
             zip_bytes: 768,
         };
@@ -2121,6 +2124,7 @@ mod tests {
             destination: S3Object::parse("s3://bucket/site.zip").unwrap(),
             files: 2,
             directories: 1,
+            include_catalog: true,
             uncompressed_bytes: 4 * 1024 * 1024,
             zip_bytes: 3 * 1024 * 1024,
         };
@@ -2133,7 +2137,7 @@ mod tests {
 
         assert_eq!(
             transcript.render(Theme { color: false }),
-            "✓ Zip complete\n  └ 2 files, 1 directory, 4.0 MiB uncompressed, 3.0 MiB ZIP\n    s3://bucket/site.zip\n    Report:\n      Source: ./site\n      Destination: s3://bucket/site.zip\n      Files: 2 files\n      Directories: 1 directory\n      Uncompressed: 4.0 MiB\n      ZIP: 3.0 MiB\n      Wall time: 00:02\n      Zip speed: 1.50 MiB/s"
+            "✓ Zip complete\n  └ 2 files, 1 directory, 4.0 MiB uncompressed, 3.0 MiB ZIP\n    s3://bucket/site.zip\n    Report:\n      Source: ./site\n      Destination: s3://bucket/site.zip\n      Files: 2 files\n      Directories: 1 directory\n      Uncompressed: 4.0 MiB\n      Catalog: included\n      ZIP: 3.0 MiB\n      Wall time: 00:02\n      Zip speed: 1.50 MiB/s"
         );
     }
 
