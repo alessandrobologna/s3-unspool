@@ -377,22 +377,8 @@ pub async fn zip_s3_prefix_to_file(
 ) -> Result<LocalZipReport> {
     validate_local_zip_destination_path(&options.destination_zip).await?;
 
-    let entries = collect_s3_prefix_upload_entries_with_size_limit(
-        client,
-        &S3PrefixUploadOptions {
-            source: options.source.clone(),
-            destination: S3Object {
-                bucket: "__local__".to_string(),
-                key: options.destination_zip.display().to_string(),
-            },
-            include_catalog: options.include_catalog,
-            body_chunk_size: MAX_BODY_CHUNK_SIZE.min(64 * 1024),
-            pipe_capacity: 64 * 1024,
-            progress: options.progress.clone(),
-        },
-        None,
-    )
-    .await?;
+    let entries =
+        collect_s3_prefix_upload_entries_from_prefix(client, &options.source, None).await?;
     let files = entries.iter().filter(|entry| entry.is_file()).count();
     let directories = entries.len().saturating_sub(files);
     let uncompressed_bytes = upload_entries_uncompressed_bytes(&entries)?;
@@ -437,22 +423,8 @@ pub async fn dry_run_zip_s3_prefix_to_file(
 ) -> Result<ZipDryRunReport> {
     validate_local_zip_destination_path(&options.destination_zip).await?;
 
-    let entries = collect_s3_prefix_upload_entries_with_size_limit(
-        client,
-        &S3PrefixUploadOptions {
-            source: options.source.clone(),
-            destination: S3Object {
-                bucket: "__local__".to_string(),
-                key: options.destination_zip.display().to_string(),
-            },
-            include_catalog: options.include_catalog,
-            body_chunk_size: MAX_BODY_CHUNK_SIZE.min(64 * 1024),
-            pipe_capacity: 64 * 1024,
-            progress: options.progress.clone(),
-        },
-        None,
-    )
-    .await?;
+    let entries =
+        collect_s3_prefix_upload_entries_from_prefix(client, &options.source, None).await?;
     zip_dry_run_report(
         options.source.uri(),
         options.destination_zip.display().to_string(),
@@ -1051,24 +1023,24 @@ pub(crate) async fn collect_s3_prefix_upload_entries(
     client: &Client,
     options: &S3PrefixUploadOptions,
 ) -> Result<Vec<UploadEntry>> {
-    collect_s3_prefix_upload_entries_with_size_limit(client, options, Some(S3_SINGLE_PUT_LIMIT))
+    collect_s3_prefix_upload_entries_from_prefix(client, &options.source, Some(S3_SINGLE_PUT_LIMIT))
         .await
 }
 
-async fn collect_s3_prefix_upload_entries_with_size_limit(
+async fn collect_s3_prefix_upload_entries_from_prefix(
     client: &Client,
-    options: &S3PrefixUploadOptions,
+    source: &S3Prefix,
     max_file_size: Option<u64>,
 ) -> Result<Vec<UploadEntry>> {
     let mut entries = Vec::new();
     let mut seen_zip_paths = HashSet::new();
     let mut continuation = None::<String>;
-    let list_prefix = normalized_list_prefix(&options.source.prefix);
+    let list_prefix = normalized_list_prefix(&source.prefix);
 
     loop {
         let mut request = client
             .list_objects_v2()
-            .bucket(&options.source.bucket)
+            .bucket(&source.bucket)
             .prefix(&list_prefix);
 
         if let Some(token) = continuation.take() {
@@ -1077,7 +1049,7 @@ async fn collect_s3_prefix_upload_entries_with_size_limit(
 
         let output = request.send().await.map_err(|err| Error::S3 {
             operation: "ListObjectsV2",
-            bucket: options.source.bucket.clone(),
+            bucket: source.bucket.clone(),
             key: list_prefix.clone(),
             message: aws_error_message(&err),
         })?;
@@ -1085,25 +1057,25 @@ async fn collect_s3_prefix_upload_entries_with_size_limit(
         for object in output.contents() {
             let key = object.key().ok_or_else(|| Error::S3 {
                 operation: "ListObjectsV2",
-                bucket: options.source.bucket.clone(),
+                bucket: source.bucket.clone(),
                 key: list_prefix.clone(),
                 message: "listed object did not include a key".to_string(),
             })?;
             let size = object.size().ok_or_else(|| Error::S3 {
                 operation: "ListObjectsV2",
-                bucket: options.source.bucket.clone(),
+                bucket: source.bucket.clone(),
                 key: key.to_string(),
                 message: "listed object did not include a size".to_string(),
             })?;
             let size = u64::try_from(size).map_err(|_| Error::S3 {
                 operation: "ListObjectsV2",
-                bucket: options.source.bucket.clone(),
+                bucket: source.bucket.clone(),
                 key: key.to_string(),
                 message: format!("listed object had negative size {size}"),
             })?;
 
             if let Some(entry) = s3_prefix_upload_entry(
-                &options.source,
+                source,
                 key,
                 size,
                 object.e_tag(),
@@ -1119,7 +1091,7 @@ async fn collect_s3_prefix_upload_entries_with_size_limit(
             if continuation.is_none() {
                 return Err(Error::S3 {
                     operation: "ListObjectsV2",
-                    bucket: options.source.bucket.clone(),
+                    bucket: source.bucket.clone(),
                     key: list_prefix.clone(),
                     message: "response was truncated without a continuation token".to_string(),
                 });

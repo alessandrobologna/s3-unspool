@@ -2618,9 +2618,12 @@ fn linux_directory_has_casefold_flag(path: &Path) -> Result<bool> {
     let result = unsafe { libc::ioctl(fd, libc::FS_IOC_GETFLAGS, &mut flags) };
     let close_result = unsafe { libc::close(fd) };
     if close_result != 0 {
+        let close_error = std::io::Error::last_os_error();
         return Err(invalid_local_path(
             &display_path,
-            "cannot close destination directory after case-sensitivity probe".to_string(),
+            format!(
+                "cannot close destination directory after case-sensitivity probe: {close_error}"
+            ),
         ));
     }
     Ok(result == 0 && flags & FS_CASEFOLD_FL != 0)
