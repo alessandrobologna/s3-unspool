@@ -184,7 +184,7 @@ pub use inspect::{S3ZipInfo, inspect_s3_zip};
 pub use options::{
     LocalUnzipOptions, LocalZipOptions, LocalZipSyncOptions, PutRetryPolicy, RetryJitter,
     S3PrefixLocalZipOptions, S3PrefixUploadOptions, S3ZipLocalUnzipOptions, SyncOptions,
-    UnzipSelection, UploadOptions, UploadProgress, UploadProgressHandler,
+    UnzipSelection, UploadOptions, UploadProgress, UploadProgressHandler, ZipCompression,
     adaptive_source_get_concurrency, adaptive_source_window_capacity,
 };
 pub use report::{

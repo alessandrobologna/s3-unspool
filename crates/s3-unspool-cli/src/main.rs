@@ -9,19 +9,7 @@ use std::time::{Duration, Instant};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::StalledStreamProtectionConfig;
 use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
-use s3_unspool::{
-    DryRunObjectReport, DryRunOperationStatus, LocalUnzipOptions, LocalUnzipReport,
-    LocalZipOptions, LocalZipReport, LocalZipSyncOptions, LocalZipToS3Report, ObjectReport,
-    OperationStatus, PutDiagnostics, S3Object, S3Prefix, S3PrefixLocalZipOptions,
-    S3PrefixUploadOptions, S3PrefixUploadReport, S3ZipLocalUnzipOptions, SyncDiagnostics,
-    SyncOptions, SyncReport, SyncSummary, UnzipDryRunReport, UnzipDryRunSummary, UnzipSelection,
-    UploadOptions, UploadProgress, UploadProgressHandler, UploadReport, ZipDryRunReport,
-    dry_run_sync_zip_to_s3, dry_run_unzip_file_to_local, dry_run_unzip_file_to_s3,
-    dry_run_unzip_s3_zip_to_local, dry_run_upload_directory_zip_to_s3,
-    dry_run_zip_directory_to_file, dry_run_zip_s3_prefix_to_file, dry_run_zip_s3_prefix_to_s3,
-    sync_zip_to_s3, unzip_file_to_local, unzip_file_to_s3, unzip_s3_zip_to_local,
-    upload_directory_zip_to_s3, zip_directory_to_file, zip_s3_prefix_to_file, zip_s3_prefix_to_s3,
-};
+use s3_unspool as unspool;
 use serde::Serialize;
 use terminal_size::{Width, terminal_size};
 
@@ -122,7 +110,7 @@ async fn run_unzip(
     let report = match (source, destination) {
         (ZipSource::S3(source), TreeDestination::S3(destination)) => {
             let client = s3_client().await;
-            let mut options = SyncOptions::new(source, destination);
+            let mut options = unspool::SyncOptions::new(source, destination);
             options.concurrency = concurrency;
             options.delete_extra = delete_extra;
             options.collect_diagnostics = diagnostics;
@@ -130,49 +118,53 @@ async fn run_unzip(
             options.ignore_embedded_catalog = ignore_catalog;
             options.selection = selection;
             if dry_run {
-                UnzipCommandReport::DryRun(dry_run_sync_zip_to_s3(&client, options).await?)
+                UnzipCommandReport::DryRun(unspool::dry_run_sync_zip_to_s3(&client, options).await?)
             } else {
-                UnzipCommandReport::S3(sync_zip_to_s3(&client, options).await?)
+                UnzipCommandReport::S3(unspool::sync_zip_to_s3(&client, options).await?)
             }
         }
         (ZipSource::Local(source_zip), TreeDestination::S3(destination)) => {
             let client = s3_client().await;
-            let mut options = LocalZipSyncOptions::new(source_zip, destination);
+            let mut options = unspool::LocalZipSyncOptions::new(source_zip, destination);
             options.concurrency = concurrency;
             options.delete_extra = delete_extra;
             options.collect_operations = !matches!(report_destination, ReportDestination::None);
             options.ignore_embedded_catalog = ignore_catalog;
             options.selection = selection;
             if dry_run {
-                UnzipCommandReport::DryRun(dry_run_unzip_file_to_s3(&client, options).await?)
+                UnzipCommandReport::DryRun(
+                    unspool::dry_run_unzip_file_to_s3(&client, options).await?,
+                )
             } else {
-                UnzipCommandReport::LocalZipToS3(unzip_file_to_s3(&client, options).await?)
+                UnzipCommandReport::LocalZipToS3(unspool::unzip_file_to_s3(&client, options).await?)
             }
         }
         (ZipSource::S3(source), TreeDestination::Local(destination_dir)) => {
             let client = s3_client().await;
-            let mut options = S3ZipLocalUnzipOptions::new(source, destination_dir);
+            let mut options = unspool::S3ZipLocalUnzipOptions::new(source, destination_dir);
             options.concurrency = concurrency;
             options.collect_diagnostics = diagnostics;
             options.collect_operations = !matches!(report_destination, ReportDestination::None);
             options.ignore_embedded_catalog = ignore_catalog;
             options.selection = selection;
             if dry_run {
-                UnzipCommandReport::DryRun(dry_run_unzip_s3_zip_to_local(&client, options).await?)
+                UnzipCommandReport::DryRun(
+                    unspool::dry_run_unzip_s3_zip_to_local(&client, options).await?,
+                )
             } else {
-                UnzipCommandReport::Local(unzip_s3_zip_to_local(&client, options).await?)
+                UnzipCommandReport::Local(unspool::unzip_s3_zip_to_local(&client, options).await?)
             }
         }
         (ZipSource::Local(source_zip), TreeDestination::Local(destination_dir)) => {
-            let mut options = LocalUnzipOptions::new(source_zip, destination_dir);
+            let mut options = unspool::LocalUnzipOptions::new(source_zip, destination_dir);
             options.concurrency = concurrency;
             options.collect_operations = !matches!(report_destination, ReportDestination::None);
             options.ignore_embedded_catalog = ignore_catalog;
             options.selection = selection;
             if dry_run {
-                UnzipCommandReport::DryRun(dry_run_unzip_file_to_local(options).await?)
+                UnzipCommandReport::DryRun(unspool::dry_run_unzip_file_to_local(options).await?)
             } else {
-                UnzipCommandReport::Local(unzip_file_to_local(options).await?)
+                UnzipCommandReport::Local(unspool::unzip_file_to_local(options).await?)
             }
         }
     };
@@ -201,6 +193,7 @@ async fn run_zip(matches: &ArgMatches, output: &Output) -> Result<(), Box<dyn st
         .expect("required by clap");
     let dry_run = matches.get_flag("dry-run");
     let include_catalog = !matches.get_flag("no-catalog");
+    let compression = parse_zip_compression(matches)?;
     let report_destination = ReportDestination::from_cli_value(matches.get_one::<String>("report"));
     let source = parse_tree_source(source)?;
     let destination = parse_zip_destination(destination)?;
@@ -210,12 +203,13 @@ async fn run_zip(matches: &ArgMatches, output: &Output) -> Result<(), Box<dyn st
         vec![
             format!("{} -> {}", source.display(), destination.display()),
             format!(
-                "catalog {}{}",
+                "catalog {}, compression {}{}",
                 if include_catalog {
                     "enabled"
                 } else {
                     "disabled"
                 },
+                compression.as_str(),
                 if dry_run { ", no changes" } else { "" }
             ),
         ],
@@ -223,7 +217,7 @@ async fn run_zip(matches: &ArgMatches, output: &Output) -> Result<(), Box<dyn st
 
     let progress_detail = ActivityDetail::default();
     let progress_sink = progress_detail.clone();
-    let progress = UploadProgressHandler::new(move |progress| {
+    let progress = unspool::UploadProgressHandler::new(move |progress| {
         progress_sink.set(upload_progress_state(&progress));
     });
     let activity = output.start_activity(
@@ -233,46 +227,58 @@ async fn run_zip(matches: &ArgMatches, output: &Output) -> Result<(), Box<dyn st
     let zip_started = Instant::now();
     let report = match (source, destination) {
         (TreeSource::Local(source_dir), ZipDestination::S3(destination)) => {
-            let mut options = UploadOptions::new(source_dir, destination);
+            let mut options = unspool::UploadOptions::new(source_dir, destination);
             options.include_catalog = include_catalog;
+            options.compression = compression;
             if dry_run {
-                ZipCommandReport::DryRun(dry_run_upload_directory_zip_to_s3(options).await?)
+                ZipCommandReport::DryRun(
+                    unspool::dry_run_upload_directory_zip_to_s3(options).await?,
+                )
             } else {
                 let client = s3_client().await;
                 options.progress = Some(progress);
-                ZipCommandReport::Upload(upload_directory_zip_to_s3(&client, options).await?)
+                ZipCommandReport::Upload(
+                    unspool::upload_directory_zip_to_s3(&client, options).await?,
+                )
             }
         }
         (TreeSource::Local(source_dir), ZipDestination::Local(destination_zip)) => {
-            let mut options = LocalZipOptions::new(source_dir, destination_zip);
+            let mut options = unspool::LocalZipOptions::new(source_dir, destination_zip);
             options.include_catalog = include_catalog;
+            options.compression = compression;
             if dry_run {
-                ZipCommandReport::DryRun(dry_run_zip_directory_to_file(options).await?)
+                ZipCommandReport::DryRun(unspool::dry_run_zip_directory_to_file(options).await?)
             } else {
                 options.progress = Some(progress);
-                ZipCommandReport::Local(zip_directory_to_file(options).await?)
+                ZipCommandReport::Local(unspool::zip_directory_to_file(options).await?)
             }
         }
         (TreeSource::S3(source), ZipDestination::S3(destination)) => {
             let client = s3_client().await;
-            let mut options = S3PrefixUploadOptions::new(source, destination);
+            let mut options = unspool::S3PrefixUploadOptions::new(source, destination);
             options.include_catalog = include_catalog;
+            options.compression = compression;
             if dry_run {
-                ZipCommandReport::DryRun(dry_run_zip_s3_prefix_to_s3(&client, options).await?)
+                ZipCommandReport::DryRun(
+                    unspool::dry_run_zip_s3_prefix_to_s3(&client, options).await?,
+                )
             } else {
                 options.progress = Some(progress);
-                ZipCommandReport::S3Prefix(zip_s3_prefix_to_s3(&client, options).await?)
+                ZipCommandReport::S3Prefix(unspool::zip_s3_prefix_to_s3(&client, options).await?)
             }
         }
         (TreeSource::S3(source), ZipDestination::Local(destination_zip)) => {
             let client = s3_client().await;
-            let mut options = S3PrefixLocalZipOptions::new(source, destination_zip);
+            let mut options = unspool::S3PrefixLocalZipOptions::new(source, destination_zip);
             options.include_catalog = include_catalog;
+            options.compression = compression;
             if dry_run {
-                ZipCommandReport::DryRun(dry_run_zip_s3_prefix_to_file(&client, options).await?)
+                ZipCommandReport::DryRun(
+                    unspool::dry_run_zip_s3_prefix_to_file(&client, options).await?,
+                )
             } else {
                 options.progress = Some(progress);
-                ZipCommandReport::Local(zip_s3_prefix_to_file(&client, options).await?)
+                ZipCommandReport::Local(unspool::zip_s3_prefix_to_file(&client, options).await?)
             }
         }
     };
@@ -315,7 +321,7 @@ impl ReportDestination {
 
 enum TreeSource {
     Local(PathBuf),
-    S3(S3Prefix),
+    S3(unspool::S3Prefix),
 }
 
 impl TreeSource {
@@ -329,7 +335,7 @@ impl TreeSource {
 
 enum TreeDestination {
     Local(PathBuf),
-    S3(S3Prefix),
+    S3(unspool::S3Prefix),
 }
 
 impl TreeDestination {
@@ -343,7 +349,7 @@ impl TreeDestination {
 
 enum ZipSource {
     Local(PathBuf),
-    S3(S3Object),
+    S3(unspool::S3Object),
 }
 
 impl ZipSource {
@@ -357,7 +363,7 @@ impl ZipSource {
 
 enum ZipDestination {
     Local(PathBuf),
-    S3(S3Object),
+    S3(unspool::S3Object),
 }
 
 impl ZipDestination {
@@ -372,7 +378,7 @@ impl ZipDestination {
 fn parse_tree_source(value: &str) -> Result<TreeSource, Box<dyn std::error::Error>> {
     reject_file_uri(value)?;
     if value.starts_with("s3://") {
-        Ok(TreeSource::S3(S3Prefix::parse(value)?))
+        Ok(TreeSource::S3(unspool::S3Prefix::parse(value)?))
     } else {
         Ok(TreeSource::Local(PathBuf::from(value)))
     }
@@ -381,7 +387,7 @@ fn parse_tree_source(value: &str) -> Result<TreeSource, Box<dyn std::error::Erro
 fn parse_tree_destination(value: &str) -> Result<TreeDestination, Box<dyn std::error::Error>> {
     reject_file_uri(value)?;
     if value.starts_with("s3://") {
-        Ok(TreeDestination::S3(S3Prefix::parse(value)?))
+        Ok(TreeDestination::S3(unspool::S3Prefix::parse(value)?))
     } else {
         Ok(TreeDestination::Local(PathBuf::from(value)))
     }
@@ -390,7 +396,7 @@ fn parse_tree_destination(value: &str) -> Result<TreeDestination, Box<dyn std::e
 fn parse_zip_source(value: &str) -> Result<ZipSource, Box<dyn std::error::Error>> {
     reject_file_uri(value)?;
     if value.starts_with("s3://") {
-        Ok(ZipSource::S3(S3Object::parse(value)?))
+        Ok(ZipSource::S3(unspool::S3Object::parse(value)?))
     } else {
         Ok(ZipSource::Local(PathBuf::from(value)))
     }
@@ -399,7 +405,7 @@ fn parse_zip_source(value: &str) -> Result<ZipSource, Box<dyn std::error::Error>
 fn parse_zip_destination(value: &str) -> Result<ZipDestination, Box<dyn std::error::Error>> {
     reject_file_uri(value)?;
     if value.starts_with("s3://") {
-        Ok(ZipDestination::S3(S3Object::parse(value)?))
+        Ok(ZipDestination::S3(unspool::S3Object::parse(value)?))
     } else {
         Ok(ZipDestination::Local(PathBuf::from(value)))
     }
@@ -424,8 +430,8 @@ fn validate_delete_extra_destination(
     }
 }
 
-fn unzip_selection_from_matches(matches: &ArgMatches) -> UnzipSelection {
-    let mut selection = UnzipSelection::new();
+fn unzip_selection_from_matches(matches: &ArgMatches) -> unspool::UnzipSelection {
+    let mut selection = unspool::UnzipSelection::new();
     if let Some(includes) = matches.get_many::<String>("include") {
         for include in includes {
             selection = selection.include(include.clone());
@@ -441,7 +447,7 @@ fn unzip_selection_from_matches(matches: &ArgMatches) -> UnzipSelection {
 
 fn validate_delete_extra_selection(
     delete_extra: bool,
-    selection: &UnzipSelection,
+    selection: &unspool::UnzipSelection,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if delete_extra && !selection.is_empty() {
         Err("--delete-extra cannot be combined with --include or --exclude".into())
@@ -597,8 +603,49 @@ fn cli() -> Command {
                         .long("no-catalog")
                         .help("Do not include the embedded MD5 catalog in the ZIP")
                         .action(ArgAction::SetTrue),
-                ),
+                )
+                .arg(zip_compression_arg()),
         )
+}
+
+fn zip_compression_arg() -> Arg {
+    let arg = Arg::new("compression")
+        .long("compression")
+        .value_name("METHOD")
+        .help("Compression method for regular file entries")
+        .default_value("deflate");
+
+    #[cfg(feature = "zstd")]
+    {
+        arg.value_parser(["deflate", "zstd"])
+    }
+    #[cfg(not(feature = "zstd"))]
+    {
+        arg.value_parser(["deflate"])
+    }
+}
+
+fn parse_zip_compression(
+    matches: &ArgMatches,
+) -> Result<unspool::ZipCompression, Box<dyn std::error::Error>> {
+    match matches
+        .get_one::<String>("compression")
+        .map(String::as_str)
+        .unwrap_or("deflate")
+    {
+        "deflate" => Ok(unspool::ZipCompression::Deflate),
+        "zstd" => {
+            #[cfg(feature = "zstd")]
+            {
+                Ok(unspool::ZipCompression::Zstd)
+            }
+            #[cfg(not(feature = "zstd"))]
+            {
+                Err("zstd compression requires the s3-unspool-cli `zstd` feature".into())
+            }
+        }
+        other => Err(format!("unsupported ZIP compression method {other:?}").into()),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -913,10 +960,10 @@ impl Transcript {
 }
 
 enum ZipCommandReport {
-    Upload(UploadReport),
-    S3Prefix(S3PrefixUploadReport),
-    Local(LocalZipReport),
-    DryRun(ZipDryRunReport),
+    Upload(unspool::UploadReport),
+    S3Prefix(unspool::S3PrefixUploadReport),
+    Local(unspool::LocalZipReport),
+    DryRun(unspool::ZipDryRunReport),
 }
 
 impl ZipCommandReport {
@@ -997,10 +1044,10 @@ impl ZipCommandReport {
 }
 
 enum UnzipCommandReport {
-    S3(SyncReport),
-    LocalZipToS3(LocalZipToS3Report),
-    Local(LocalUnzipReport),
-    DryRun(UnzipDryRunReport),
+    S3(unspool::SyncReport),
+    LocalZipToS3(unspool::LocalZipToS3Report),
+    Local(unspool::LocalUnzipReport),
+    DryRun(unspool::UnzipDryRunReport),
 }
 
 impl UnzipCommandReport {
@@ -1025,7 +1072,7 @@ impl UnzipCommandReport {
         }
     }
 
-    fn summary(&self) -> Option<&SyncSummary> {
+    fn summary(&self) -> Option<&unspool::SyncSummary> {
         match self {
             Self::S3(report) => Some(&report.summary),
             Self::LocalZipToS3(report) => Some(&report.summary),
@@ -1034,7 +1081,7 @@ impl UnzipCommandReport {
         }
     }
 
-    fn dry_run_summary(&self) -> Option<&UnzipDryRunSummary> {
+    fn dry_run_summary(&self) -> Option<&unspool::UnzipDryRunSummary> {
         match self {
             Self::DryRun(report) => Some(&report.summary),
             Self::S3(_) | Self::LocalZipToS3(_) | Self::Local(_) => None,
@@ -1059,7 +1106,7 @@ impl UnzipCommandReport {
         }
     }
 
-    fn operations(&self) -> &[ObjectReport] {
+    fn operations(&self) -> &[unspool::ObjectReport] {
         match self {
             Self::S3(report) => &report.operations,
             Self::LocalZipToS3(report) => &report.operations,
@@ -1068,7 +1115,7 @@ impl UnzipCommandReport {
         }
     }
 
-    fn dry_run_operations(&self) -> &[DryRunObjectReport] {
+    fn dry_run_operations(&self) -> &[unspool::DryRunObjectReport] {
         match self {
             Self::DryRun(report) => &report.operations,
             Self::S3(_) | Self::LocalZipToS3(_) | Self::Local(_) => &[],
@@ -1231,7 +1278,7 @@ fn unzip_transcript(
 
 fn unzip_dry_run_transcript(
     report: &UnzipCommandReport,
-    summary: &UnzipDryRunSummary,
+    summary: &unspool::UnzipDryRunSummary,
     report_destination: &ReportDestination,
 ) -> Transcript {
     let mut details = if summary.would_upload_new == 0
@@ -1367,7 +1414,7 @@ fn unzip_report_details(report: &UnzipCommandReport) -> Vec<String> {
 
 fn unzip_dry_run_report_details(
     report: &UnzipCommandReport,
-    summary: &UnzipDryRunSummary,
+    summary: &unspool::UnzipDryRunSummary,
 ) -> Vec<String> {
     let mut details = vec![
         "Report:".to_string(),
@@ -1405,10 +1452,10 @@ fn unzip_dry_run_report_details(
     details
 }
 
-fn operation_report_details(operations: &[ObjectReport]) -> Vec<String> {
+fn operation_report_details(operations: &[unspool::ObjectReport]) -> Vec<String> {
     let noteworthy = operations
         .iter()
-        .filter(|operation| operation.status != OperationStatus::SkippedUnchanged)
+        .filter(|operation| operation.status != unspool::OperationStatus::SkippedUnchanged)
         .collect::<Vec<_>>();
 
     if noteworthy.is_empty() {
@@ -1432,10 +1479,10 @@ fn operation_report_details(operations: &[ObjectReport]) -> Vec<String> {
     details
 }
 
-fn dry_run_operation_report_details(operations: &[DryRunObjectReport]) -> Vec<String> {
+fn dry_run_operation_report_details(operations: &[unspool::DryRunObjectReport]) -> Vec<String> {
     let noteworthy = operations
         .iter()
-        .filter(|operation| operation.status != DryRunOperationStatus::SkippedUnchanged)
+        .filter(|operation| operation.status != unspool::DryRunOperationStatus::SkippedUnchanged)
         .collect::<Vec<_>>();
 
     if noteworthy.is_empty() {
@@ -1459,14 +1506,14 @@ fn dry_run_operation_report_details(operations: &[DryRunObjectReport]) -> Vec<St
     details
 }
 
-fn operation_report_line(operation: &ObjectReport) -> String {
+fn operation_report_line(operation: &unspool::ObjectReport) -> String {
     let status = match operation.status {
-        OperationStatus::UploadedNew => "uploaded new",
-        OperationStatus::UploadedChanged => "uploaded changed",
-        OperationStatus::SkippedUnchanged => "unchanged",
-        OperationStatus::ConditionalConflict => "conflict",
-        OperationStatus::DeletedExtra => "deleted extra",
-        OperationStatus::Error => "error",
+        unspool::OperationStatus::UploadedNew => "uploaded new",
+        unspool::OperationStatus::UploadedChanged => "uploaded changed",
+        unspool::OperationStatus::SkippedUnchanged => "unchanged",
+        unspool::OperationStatus::ConditionalConflict => "conflict",
+        unspool::OperationStatus::DeletedExtra => "deleted extra",
+        unspool::OperationStatus::Error => "error",
     };
     let size = operation
         .size
@@ -1481,13 +1528,13 @@ fn operation_report_line(operation: &ObjectReport) -> String {
     format!("{status}: {}{size}{message}", operation.key)
 }
 
-fn dry_run_operation_report_line(operation: &DryRunObjectReport) -> String {
+fn dry_run_operation_report_line(operation: &unspool::DryRunObjectReport) -> String {
     let status = match operation.status {
-        DryRunOperationStatus::WouldUploadNew => "would create",
-        DryRunOperationStatus::WouldUploadChanged => "would replace",
-        DryRunOperationStatus::SkippedUnchanged => "unchanged",
-        DryRunOperationStatus::WouldDeleteExtra => "would delete extra",
-        DryRunOperationStatus::Error => "error",
+        unspool::DryRunOperationStatus::WouldUploadNew => "would create",
+        unspool::DryRunOperationStatus::WouldUploadChanged => "would replace",
+        unspool::DryRunOperationStatus::SkippedUnchanged => "unchanged",
+        unspool::DryRunOperationStatus::WouldDeleteExtra => "would delete extra",
+        unspool::DryRunOperationStatus::Error => "error",
     };
     let size = operation
         .size
@@ -1502,7 +1549,7 @@ fn dry_run_operation_report_line(operation: &DryRunObjectReport) -> String {
     format!("{status}: {}{size}{message}", operation.key)
 }
 
-fn diagnostics_line(diagnostics: &SyncDiagnostics) -> String {
+fn diagnostics_line(diagnostics: &unspool::SyncDiagnostics) -> String {
     let mut line = format!(
         "Source: {} GET attempts, {} blocks fetched, {} waits, {:.2}x amplification",
         diagnostics.source.source_get_attempts,
@@ -1521,7 +1568,7 @@ fn diagnostics_line(diagnostics: &SyncDiagnostics) -> String {
     line
 }
 
-fn format_put_failure_codes(diagnostics: &PutDiagnostics) -> String {
+fn format_put_failure_codes(diagnostics: &unspool::PutDiagnostics) -> String {
     diagnostics
         .failures_by_error_code
         .iter()
@@ -1530,9 +1577,9 @@ fn format_put_failure_codes(diagnostics: &PutDiagnostics) -> String {
         .join(", ")
 }
 
-fn upload_progress_state(progress: &UploadProgress) -> ActivityProgress {
+fn upload_progress_state(progress: &unspool::UploadProgress) -> ActivityProgress {
     match progress {
-        UploadProgress::Planned {
+        unspool::UploadProgress::Planned {
             total_files,
             total_bytes,
         } => ActivityProgress {
@@ -1542,7 +1589,7 @@ fn upload_progress_state(progress: &UploadProgress) -> ActivityProgress {
             processed_bytes: 0,
             total_bytes: *total_bytes,
         },
-        UploadProgress::FileStarted {
+        unspool::UploadProgress::FileStarted {
             current_file,
             total_files,
             processed_files,
@@ -1556,7 +1603,7 @@ fn upload_progress_state(progress: &UploadProgress) -> ActivityProgress {
             processed_bytes: *processed_bytes,
             total_bytes: *total_bytes,
         },
-        UploadProgress::FileProgress {
+        unspool::UploadProgress::FileProgress {
             current_file,
             total_files,
             processed_files,
@@ -1570,7 +1617,7 @@ fn upload_progress_state(progress: &UploadProgress) -> ActivityProgress {
             processed_bytes: *processed_bytes,
             total_bytes: *total_bytes,
         },
-        UploadProgress::FileFinished {
+        unspool::UploadProgress::FileFinished {
             processed_files,
             total_files,
             processed_bytes,
@@ -1583,7 +1630,7 @@ fn upload_progress_state(progress: &UploadProgress) -> ActivityProgress {
             processed_bytes: *processed_bytes,
             total_bytes: *total_bytes,
         },
-        UploadProgress::Finished {
+        unspool::UploadProgress::Finished {
             total_files,
             total_bytes,
         } => ActivityProgress {
@@ -1796,10 +1843,6 @@ fn format_upload_speed(bytes: u64, elapsed: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use s3_unspool::{
-        PutRetryDiagnostics, RetryJitter, SourceDiagnostics, SyncDiagnostics, SyncSummary,
-    };
-
     use super::*;
 
     #[test]
@@ -1895,6 +1938,50 @@ mod tests {
         assert!(upload.get_flag("no-catalog"));
     }
 
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn parses_zip_compression() {
+        let matches = cli()
+            .try_get_matches_from([
+                "s3-unspool",
+                "zip",
+                "--compression",
+                "zstd",
+                "/tmp/site",
+                "s3://destination-bucket/site.zip",
+            ])
+            .unwrap();
+
+        let Some(("zip", upload)) = matches.subcommand() else {
+            panic!("expected zip subcommand");
+        };
+        assert_eq!(
+            upload.get_one::<String>("compression").map(String::as_str),
+            Some("zstd")
+        );
+        assert_eq!(
+            parse_zip_compression(upload).unwrap(),
+            unspool::ZipCompression::Zstd
+        );
+    }
+
+    #[cfg(not(feature = "zstd"))]
+    #[test]
+    fn rejects_zstd_zip_compression_without_feature() {
+        let error = cli()
+            .try_get_matches_from([
+                "s3-unspool",
+                "zip",
+                "--compression",
+                "zstd",
+                "/tmp/site",
+                "s3://destination-bucket/site.zip",
+            ])
+            .unwrap_err();
+
+        assert!(error.to_string().contains("possible values: deflate"));
+    }
+
     #[test]
     fn parses_unzip_dry_run() {
         let matches = cli()
@@ -1967,7 +2054,7 @@ mod tests {
 
     #[test]
     fn rejects_delete_extra_with_unzip_selection() {
-        let selection = UnzipSelection::new().include("index.md");
+        let selection = unspool::UnzipSelection::new().include("index.md");
 
         let err = validate_delete_extra_selection(true, &selection).unwrap_err();
 
@@ -2174,9 +2261,9 @@ mod tests {
 
     #[test]
     fn renders_zip_transcript() {
-        let report = UploadReport {
+        let report = unspool::UploadReport {
             source_dir: "./site".to_string(),
-            destination: S3Object::parse("s3://bucket/site.zip").unwrap(),
+            destination: unspool::S3Object::parse("s3://bucket/site.zip").unwrap(),
             files: 2,
             directories: 0,
             include_catalog: true,
@@ -2198,9 +2285,9 @@ mod tests {
 
     #[test]
     fn renders_zip_transcript_with_human_report() {
-        let report = UploadReport {
+        let report = unspool::UploadReport {
             source_dir: "./site".to_string(),
-            destination: S3Object::parse("s3://bucket/site.zip").unwrap(),
+            destination: unspool::S3Object::parse("s3://bucket/site.zip").unwrap(),
             files: 2,
             directories: 1,
             include_catalog: true,
@@ -2222,7 +2309,7 @@ mod tests {
 
     #[test]
     fn renders_zip_dry_run_transcript() {
-        let report = ZipDryRunReport {
+        let report = unspool::ZipDryRunReport {
             source: "./site".to_string(),
             destination: "s3://bucket/site.zip".to_string(),
             files: 2,
@@ -2246,14 +2333,14 @@ mod tests {
 
     #[test]
     fn renders_up_to_date_unzip_transcript() {
-        let report = SyncReport {
-            source: S3Object::parse("s3://bucket/site.zip").unwrap(),
-            destination: S3Prefix::parse("s3://bucket/www/").unwrap(),
-            summary: SyncSummary {
+        let report = unspool::SyncReport {
+            source: unspool::S3Object::parse("s3://bucket/site.zip").unwrap(),
+            destination: unspool::S3Prefix::parse("s3://bucket/www/").unwrap(),
+            summary: unspool::SyncSummary {
                 zip_files: 10,
                 destination_objects: 10,
                 skipped_unchanged: 10,
-                ..SyncSummary::default()
+                ..unspool::SyncSummary::default()
             },
             diagnostics: None,
             operations: Vec::new(),
@@ -2270,34 +2357,34 @@ mod tests {
 
     #[test]
     fn renders_changed_unzip_transcript_with_diagnostics() {
-        let report = SyncReport {
-            source: S3Object::parse("s3://bucket/site.zip").unwrap(),
-            destination: S3Prefix::parse("s3://bucket/www/").unwrap(),
-            summary: SyncSummary {
+        let report = unspool::SyncReport {
+            source: unspool::S3Object::parse("s3://bucket/site.zip").unwrap(),
+            destination: unspool::S3Prefix::parse("s3://bucket/www/").unwrap(),
+            summary: unspool::SyncSummary {
                 zip_files: 10,
                 destination_objects: 12,
                 uploaded_new: 1,
                 uploaded_changed: 2,
                 skipped_unchanged: 7,
                 deleted_extra: 1,
-                ..SyncSummary::default()
+                ..unspool::SyncSummary::default()
             },
-            diagnostics: Some(SyncDiagnostics {
+            diagnostics: Some(unspool::SyncDiagnostics {
                 concurrency: 64,
                 put_concurrency: 8,
-                put_retry: PutRetryDiagnostics {
+                put_retry: unspool::PutRetryDiagnostics {
                     max_attempts: 6,
                     base_delay_ms: 250,
                     max_delay_ms: 5_000,
                     slowdown_base_delay_ms: 1_000,
                     slowdown_max_delay_ms: 30_000,
-                    jitter: RetryJitter::Full,
+                    jitter: unspool::RetryJitter::Full,
                 },
                 source_block_size: 8192,
                 source_block_merge_gap: 1024,
                 source_get_concurrency: 4,
                 source_window_capacity: 4096,
-                source: SourceDiagnostics {
+                source: unspool::SourceDiagnostics {
                     source_zip_bytes: 100,
                     planned_entries: 3,
                     planned_blocks: 2,
@@ -2319,7 +2406,7 @@ mod tests {
                     block_refetches: 0,
                     active_gets_high_water: 2,
                 },
-                put: PutDiagnostics::default(),
+                put: unspool::PutDiagnostics::default(),
             }),
             operations: Vec::new(),
         };
@@ -2337,10 +2424,10 @@ mod tests {
 
     #[test]
     fn renders_unzip_dry_run_transcript_with_human_report() {
-        let report = UnzipDryRunReport {
+        let report = unspool::UnzipDryRunReport {
             source_zip: "s3://bucket/site.zip".to_string(),
             destination: "s3://bucket/www/".to_string(),
-            summary: UnzipDryRunSummary {
+            summary: unspool::UnzipDryRunSummary {
                 zip_files: 3,
                 destination_objects: 4,
                 would_upload_new: 1,
@@ -2351,8 +2438,8 @@ mod tests {
             },
             diagnostics: None,
             operations: vec![
-                DryRunObjectReport {
-                    status: DryRunOperationStatus::WouldUploadNew,
+                unspool::DryRunObjectReport {
+                    status: unspool::DryRunOperationStatus::WouldUploadNew,
                     key: "www/a.txt".to_string(),
                     zip_path: Some("a.txt".to_string()),
                     size: Some(10),
@@ -2360,8 +2447,8 @@ mod tests {
                     destination_etag: None,
                     message: None,
                 },
-                DryRunObjectReport {
-                    status: DryRunOperationStatus::WouldUploadChanged,
+                unspool::DryRunObjectReport {
+                    status: unspool::DryRunOperationStatus::WouldUploadChanged,
                     key: "www/b.txt".to_string(),
                     zip_path: Some("b.txt".to_string()),
                     size: Some(20),
@@ -2369,8 +2456,8 @@ mod tests {
                     destination_etag: Some("\"etag\"".to_string()),
                     message: None,
                 },
-                DryRunObjectReport {
-                    status: DryRunOperationStatus::SkippedUnchanged,
+                unspool::DryRunObjectReport {
+                    status: unspool::DryRunOperationStatus::SkippedUnchanged,
                     key: "www/c.txt".to_string(),
                     zip_path: Some("c.txt".to_string()),
                     size: Some(30),
@@ -2378,8 +2465,8 @@ mod tests {
                     destination_etag: Some("\"same\"".to_string()),
                     message: None,
                 },
-                DryRunObjectReport {
-                    status: DryRunOperationStatus::WouldDeleteExtra,
+                unspool::DryRunObjectReport {
+                    status: unspool::DryRunOperationStatus::WouldDeleteExtra,
                     key: "www/old.txt".to_string(),
                     zip_path: None,
                     size: None,
@@ -2403,21 +2490,21 @@ mod tests {
 
     #[test]
     fn renders_unzip_transcript_with_human_report() {
-        let report = SyncReport {
-            source: S3Object::parse("s3://bucket/site.zip").unwrap(),
-            destination: S3Prefix::parse("s3://bucket/www/").unwrap(),
-            summary: SyncSummary {
+        let report = unspool::SyncReport {
+            source: unspool::S3Object::parse("s3://bucket/site.zip").unwrap(),
+            destination: unspool::S3Prefix::parse("s3://bucket/www/").unwrap(),
+            summary: unspool::SyncSummary {
                 zip_files: 3,
                 destination_objects: 2,
                 uploaded_new: 1,
                 uploaded_changed: 1,
                 skipped_unchanged: 1,
-                ..SyncSummary::default()
+                ..unspool::SyncSummary::default()
             },
             diagnostics: None,
             operations: vec![
-                ObjectReport {
-                    status: OperationStatus::UploadedNew,
+                unspool::ObjectReport {
+                    status: unspool::OperationStatus::UploadedNew,
                     key: "www/a.txt".to_string(),
                     zip_path: Some("a.txt".to_string()),
                     size: Some(10),
@@ -2425,8 +2512,8 @@ mod tests {
                     destination_etag: None,
                     message: None,
                 },
-                ObjectReport {
-                    status: OperationStatus::UploadedChanged,
+                unspool::ObjectReport {
+                    status: unspool::OperationStatus::UploadedChanged,
                     key: "www/b.txt".to_string(),
                     zip_path: Some("b.txt".to_string()),
                     size: Some(20),
@@ -2434,8 +2521,8 @@ mod tests {
                     destination_etag: Some("old".to_string()),
                     message: None,
                 },
-                ObjectReport {
-                    status: OperationStatus::SkippedUnchanged,
+                unspool::ObjectReport {
+                    status: unspool::OperationStatus::SkippedUnchanged,
                     key: "www/c.txt".to_string(),
                     zip_path: Some("c.txt".to_string()),
                     size: Some(30),
@@ -2457,16 +2544,16 @@ mod tests {
 
     #[test]
     fn renders_conflict_unzip_transcript() {
-        let report = SyncReport {
-            source: S3Object::parse("s3://bucket/site.zip").unwrap(),
-            destination: S3Prefix::parse("s3://bucket/www/").unwrap(),
-            summary: SyncSummary {
+        let report = unspool::SyncReport {
+            source: unspool::S3Object::parse("s3://bucket/site.zip").unwrap(),
+            destination: unspool::S3Prefix::parse("s3://bucket/www/").unwrap(),
+            summary: unspool::SyncSummary {
                 zip_files: 3,
                 destination_objects: 3,
                 uploaded_changed: 1,
                 skipped_unchanged: 1,
                 conditional_conflicts: 1,
-                ..SyncSummary::default()
+                ..unspool::SyncSummary::default()
             },
             diagnostics: None,
             operations: Vec::new(),
@@ -2562,7 +2649,7 @@ mod tests {
         assert_eq!(
             render_progress(
                 Theme { color: false },
-                &upload_progress_state(&UploadProgress::Planned {
+                &upload_progress_state(&unspool::UploadProgress::Planned {
                     total_files: 10,
                     total_bytes: 100,
                 }),
@@ -2574,7 +2661,7 @@ mod tests {
         assert_eq!(
             render_progress(
                 Theme { color: false },
-                &upload_progress_state(&UploadProgress::FileFinished {
+                &upload_progress_state(&unspool::UploadProgress::FileFinished {
                     processed_files: 3,
                     total_files: 10,
                     processed_bytes: 30,
@@ -2589,7 +2676,7 @@ mod tests {
         assert_eq!(
             render_progress(
                 Theme { color: false },
-                &upload_progress_state(&UploadProgress::FileStarted {
+                &upload_progress_state(&unspool::UploadProgress::FileStarted {
                     current_file: 4,
                     total_files: 10,
                     processed_files: 3,
@@ -2605,7 +2692,7 @@ mod tests {
         assert_eq!(
             render_progress(
                 Theme { color: false },
-                &upload_progress_state(&UploadProgress::FileProgress {
+                &upload_progress_state(&unspool::UploadProgress::FileProgress {
                     current_file: 4,
                     total_files: 10,
                     processed_files: 3,
@@ -2621,7 +2708,7 @@ mod tests {
         assert_eq!(
             render_progress(
                 Theme { color: false },
-                &upload_progress_state(&UploadProgress::Finished {
+                &upload_progress_state(&unspool::UploadProgress::Finished {
                     total_files: 10,
                     total_bytes: 100,
                 }),
@@ -2635,7 +2722,7 @@ mod tests {
     #[test]
     fn maps_upload_progress_events_to_activity_state() {
         assert_eq!(
-            upload_progress_state(&UploadProgress::Planned {
+            upload_progress_state(&unspool::UploadProgress::Planned {
                 total_files: 10,
                 total_bytes: 100,
             }),
@@ -2648,7 +2735,7 @@ mod tests {
             }
         );
         assert_eq!(
-            upload_progress_state(&UploadProgress::FileFinished {
+            upload_progress_state(&unspool::UploadProgress::FileFinished {
                 processed_files: 3,
                 total_files: 10,
                 processed_bytes: 30,
@@ -2664,7 +2751,7 @@ mod tests {
             }
         );
         assert_eq!(
-            upload_progress_state(&UploadProgress::FileStarted {
+            upload_progress_state(&unspool::UploadProgress::FileStarted {
                 current_file: 4,
                 total_files: 10,
                 processed_files: 3,
@@ -2681,7 +2768,7 @@ mod tests {
             }
         );
         assert_eq!(
-            upload_progress_state(&UploadProgress::Finished {
+            upload_progress_state(&unspool::UploadProgress::Finished {
                 total_files: 10,
                 total_bytes: 100,
             }),
@@ -2727,7 +2814,7 @@ mod tests {
         assert_eq!(
             render_progress(
                 Theme { color: false },
-                &upload_progress_state(&UploadProgress::FileProgress {
+                &upload_progress_state(&unspool::UploadProgress::FileProgress {
                     current_file: 4,
                     total_files: 10,
                     processed_files: 3,
@@ -2743,7 +2830,7 @@ mod tests {
         assert_eq!(
             render_progress(
                 Theme { color: false },
-                &upload_progress_state(&UploadProgress::FileProgress {
+                &upload_progress_state(&unspool::UploadProgress::FileProgress {
                     current_file: 4,
                     total_files: 10,
                     processed_files: 3,
