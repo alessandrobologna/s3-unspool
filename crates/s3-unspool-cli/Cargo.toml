@@ -24,10 +24,6 @@ bin-dir = "{ bin }{ binary-ext }"
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.zip"
 pkg-fmt = "zip"
 
-[features]
-default = ["zstd"]
-zstd = ["s3-unspool/zstd"]
-
 [dependencies]
 aws-config.workspace = true
 aws-sdk-s3.workspace = true

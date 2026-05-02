@@ -17,7 +17,7 @@ aws-config.workspace = true
 aws-sdk-s3.workspace = true
 lambda_runtime.workspace = true
 libc.workspace = true
-s3-unspool = { workspace = true, features = ["zstd"] }
+s3-unspool.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true

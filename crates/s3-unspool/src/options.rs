@@ -2,41 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_zip::Compression;
 use serde::{Deserialize, Serialize};
 
 use crate::constants::*;
 use crate::s3_uri::{S3Object, S3Prefix};
-
-/// Compression method used for regular file entries when creating ZIP archives.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ZipCompression {
-    /// Use Deflate, the default ZIP compression method supported by common tools.
-    #[default]
-    Deflate,
-    /// Use Zstandard method 93 for regular file entries.
-    #[cfg(feature = "zstd")]
-    Zstd,
-}
-
-impl ZipCompression {
-    pub(crate) fn to_async_zip(self) -> Compression {
-        match self {
-            ZipCompression::Deflate => Compression::Deflate,
-            #[cfg(feature = "zstd")]
-            ZipCompression::Zstd => Compression::Zstd,
-        }
-    }
-
-    /// Returns a stable lowercase name for display or configuration.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ZipCompression::Deflate => "deflate",
-            #[cfg(feature = "zstd")]
-            ZipCompression::Zstd => "zstd",
-        }
-    }
-}
 
 /// Options for extracting a ZIP object from S3 into an S3 prefix.
 #[derive(Clone, Debug)]
@@ -240,8 +209,6 @@ pub struct UploadOptions {
     pub destination: S3Object,
     /// Include the embedded update catalog at [`crate::EMBEDDED_CATALOG_PATH`].
     pub include_catalog: bool,
-    /// Compression method for regular file entries.
-    pub compression: ZipCompression,
     /// Buffer size used when streaming the ZIP body to S3.
     ///
     /// Must be greater than zero and no larger than 16 MiB.
@@ -263,8 +230,6 @@ pub struct LocalZipOptions {
     pub destination_zip: PathBuf,
     /// Include the embedded update catalog at [`crate::EMBEDDED_CATALOG_PATH`].
     pub include_catalog: bool,
-    /// Compression method for regular file entries.
-    pub compression: ZipCompression,
     /// Optional progress callback invoked during upload preparation and ZIP streaming.
     pub progress: Option<UploadProgressHandler>,
 }
@@ -278,8 +243,6 @@ pub struct S3PrefixUploadOptions {
     pub destination: S3Object,
     /// Include the embedded update catalog at [`crate::EMBEDDED_CATALOG_PATH`].
     pub include_catalog: bool,
-    /// Compression method for regular file entries.
-    pub compression: ZipCompression,
     /// Buffer size used when streaming the ZIP body to S3.
     ///
     /// Must be greater than zero and no larger than 16 MiB.
@@ -301,8 +264,6 @@ pub struct S3PrefixLocalZipOptions {
     pub destination_zip: PathBuf,
     /// Include the embedded update catalog at [`crate::EMBEDDED_CATALOG_PATH`].
     pub include_catalog: bool,
-    /// Compression method for regular file entries.
-    pub compression: ZipCompression,
     /// Optional progress callback invoked during source listing and ZIP streaming.
     pub progress: Option<UploadProgressHandler>,
 }
@@ -380,7 +341,6 @@ impl S3PrefixUploadOptions {
             source,
             destination,
             include_catalog: true,
-            compression: ZipCompression::Deflate,
             body_chunk_size: DEFAULT_BODY_CHUNK_SIZE,
             pipe_capacity: DEFAULT_PIPE_CAPACITY,
             progress: None,
@@ -395,7 +355,6 @@ impl LocalZipOptions {
             source_dir: source_dir.into(),
             destination_zip: destination_zip.into(),
             include_catalog: true,
-            compression: ZipCompression::Deflate,
             progress: None,
         }
     }
@@ -408,7 +367,6 @@ impl std::fmt::Debug for LocalZipOptions {
             .field("source_dir", &self.source_dir)
             .field("destination_zip", &self.destination_zip)
             .field("include_catalog", &self.include_catalog)
-            .field("compression", &self.compression)
             .field(
                 "progress",
                 &self.progress.as_ref().map(|_| "UploadProgressHandler"),
@@ -424,7 +382,6 @@ impl std::fmt::Debug for S3PrefixUploadOptions {
             .field("source", &self.source)
             .field("destination", &self.destination)
             .field("include_catalog", &self.include_catalog)
-            .field("compression", &self.compression)
             .field("body_chunk_size", &self.body_chunk_size)
             .field("pipe_capacity", &self.pipe_capacity)
             .field(
@@ -442,7 +399,6 @@ impl S3PrefixLocalZipOptions {
             source,
             destination_zip: destination_zip.into(),
             include_catalog: true,
-            compression: ZipCompression::Deflate,
             progress: None,
         }
     }
@@ -455,7 +411,6 @@ impl std::fmt::Debug for S3PrefixLocalZipOptions {
             .field("source", &self.source)
             .field("destination_zip", &self.destination_zip)
             .field("include_catalog", &self.include_catalog)
-            .field("compression", &self.compression)
             .field(
                 "progress",
                 &self.progress.as_ref().map(|_| "UploadProgressHandler"),
@@ -471,7 +426,6 @@ impl UploadOptions {
             source_dir: source_dir.into(),
             destination,
             include_catalog: true,
-            compression: ZipCompression::Deflate,
             body_chunk_size: DEFAULT_BODY_CHUNK_SIZE,
             pipe_capacity: DEFAULT_PIPE_CAPACITY,
             progress: None,
@@ -585,7 +539,6 @@ impl std::fmt::Debug for UploadOptions {
             .field("source_dir", &self.source_dir)
             .field("destination", &self.destination)
             .field("include_catalog", &self.include_catalog)
-            .field("compression", &self.compression)
             .field("body_chunk_size", &self.body_chunk_size)
             .field("pipe_capacity", &self.pipe_capacity)
             .field(

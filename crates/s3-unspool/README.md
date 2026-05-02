@@ -111,8 +111,7 @@ async fn main() -> s3_unspool::Result<()> {
 - Uploads missing files with `If-None-Match: *`.
 - Uploads changed files with `If-Match: <listed destination ETag>`.
 - Optionally deletes destination objects that are not present in the ZIP.
-- Supports Stored, Deflate, and Zstandard method 93 ZIP entries when default
-  features are enabled.
+- Supports Stored and Deflate ZIP entries.
 - Uploads generated source ZIPs with S3 multipart upload.
 - Uploads existing S3 prefixes into generated ZIPs without local object storage.
 - Preserves ZIP directory entries and zero-byte S3 folder marker objects.
@@ -170,14 +169,6 @@ download stalled-stream protection enabled for source reads.
 ZIPs created by `upload_directory_zip_to_s3` include an embedded catalog at
 `.s3-unspool/catalog.v1.json`. The catalog stores each file path and MD5 digest
 so later extracts can skip unchanged files before decompressing them.
-
-Generated ZIPs use Deflate for regular file entries by default. With default
-features enabled, set `UploadOptions::compression`,
-`LocalZipOptions::compression`, `S3PrefixUploadOptions::compression`, or
-`S3PrefixLocalZipOptions::compression` to `ZipCompression::Zstd` to write
-Zstandard method 93 entries. Use `default-features = false` to compile without
-Zstd support. Zstd-in-ZIP support is not universal in OS-native ZIP tools, so
-prefer Deflate when broad compatibility matters.
 
 Directory markers are preserved explicitly. ZIP directory entries such as
 `assets/empty/` extract to zero-byte S3 objects with trailing-slash keys, and

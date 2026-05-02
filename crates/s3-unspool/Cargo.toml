@@ -12,10 +12,6 @@ documentation = "https://docs.rs/s3-unspool"
 keywords = ["aws", "s3", "zip", "archive", "deployment"]
 categories = ["compression", "filesystem"]
 
-[features]
-default = ["zstd"]
-zstd = ["async-compression/zstd", "async_zip/zstd"]
-
 [dependencies]
 async-compression.workspace = true
 async_zip.workspace = true

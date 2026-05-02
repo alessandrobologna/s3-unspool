@@ -39,10 +39,9 @@ Use `s3-unspool` when you need to deploy or synchronize many files from a ZIP
 archive already stored in S3, especially when repeated runs should touch only
 changed files.
 
-It is not a general archive library. ZIP extraction currently supports Stored,
-Deflate, and Zstandard method 93 entries when default features are enabled;
-destination writes are single `PutObject` requests, and destination ETags are
-expected to be single-part MD5 ETags.
+It is not a general archive library. ZIP extraction currently supports Stored
+and Deflate entries, destination writes are single `PutObject` requests, and
+destination ETags are expected to be single-part MD5 ETags.
 
 ## Lambda Benchmark Snapshot
 
@@ -180,10 +179,6 @@ async fn main() -> s3_unspool::Result<()> {
 
 `UploadOptions::include_catalog` is `true` by default. Set it to `false` only
 when you need a plain ZIP without the update-skip catalog.
-Regular file entries use Deflate by default. Build with default features and set
-`UploadOptions::compression = ZipCompression::Zstd` to generate Zstandard
-method 93 entries; use `default-features = false` to compile without Zstd
-support.
 
 ### Upload an S3 Prefix as a Cataloged ZIP
 
@@ -404,8 +399,6 @@ Useful zip options:
 - `--dry-run`: inspect the source tree and report what would be archived
   without creating a local ZIP or uploading an S3 object.
 - `--no-catalog`: create a plain ZIP without `.s3-unspool/catalog.v1.json`.
-- `--compression deflate|zstd`: choose the compression method for regular file
-  entries. Zstd writes ZIP method 93 and may not open in OS-native ZIP tools.
 - `--report`: add a formatted zip report to the CLI transcript.
 - `--report=PATH`: write the JSON zip report to a file.
 
@@ -676,9 +669,7 @@ crates.io to trust this repository's `publish-s3-unspool.yml` workflow and the
 ## Assumptions and Limits
 
 - The crate is built for Rust 1.95 and edition 2024.
-- ZIP extraction supports Stored, Deflate, and Zstandard method 93 entries when
-  default features are enabled. Build with `default-features = false` to omit
-  Zstd support.
+- ZIP extraction supports Stored and Deflate entries.
 - Local zip sources must be local directories and include regular files plus
   empty directories recursively.
 - S3-prefix zip sources include regular objects and zero-byte trailing-slash

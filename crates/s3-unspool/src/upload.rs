@@ -24,7 +24,7 @@ use crate::error::{Error, Result, aws_error_message};
 use crate::extract::normalized_list_prefix;
 use crate::options::{
     LocalZipOptions, S3PrefixLocalZipOptions, S3PrefixUploadOptions, UploadOptions, UploadProgress,
-    UploadProgressHandler, ZipCompression,
+    UploadProgressHandler,
 };
 use crate::report::{LocalZipReport, S3PrefixUploadReport, UploadReport, ZipDryRunReport};
 use crate::s3_uri::{S3Object, S3Prefix};
@@ -105,27 +105,20 @@ pub async fn upload_directory_zip_to_s3(
     let upload_id = create_upload(client, &options.destination).await?;
     let (writer, reader) = tokio::io::duplex(options.pipe_capacity);
     let include_catalog = options.include_catalog;
-    let compression = options.compression;
     let progress = options.progress.clone();
     let finish_progress = progress.clone();
     let total_bytes = uncompressed_bytes;
     let producer = tokio::spawn(async move {
-        write_upload_zip(
-            writer.compat_write(),
-            &entries,
-            include_catalog,
-            compression,
-            progress,
-        )
-        .await
-        .inspect(|_| {
-            if let Some(progress) = &finish_progress {
-                progress.emit(UploadProgress::Finished {
-                    total_files: total_entries,
-                    total_bytes,
-                });
-            }
-        })
+        write_upload_zip(writer.compat_write(), &entries, include_catalog, progress)
+            .await
+            .inspect(|_| {
+                if let Some(progress) = &finish_progress {
+                    progress.emit(UploadProgress::Finished {
+                        total_files: total_entries,
+                        total_bytes,
+                    });
+                }
+            })
     });
 
     let upload_result = upload_parts(
@@ -217,7 +210,6 @@ pub async fn zip_directory_to_file(options: LocalZipOptions) -> Result<LocalZipR
         &options.destination_zip,
         &entries,
         options.include_catalog,
-        options.compression,
         options.progress.clone(),
         None,
     )
@@ -280,7 +272,6 @@ pub async fn zip_s3_prefix_to_s3(
     let upload_id = create_upload(client, &options.destination).await?;
     let (writer, reader) = tokio::io::duplex(options.pipe_capacity);
     let include_catalog = options.include_catalog;
-    let compression = options.compression;
     let progress = options.progress.clone();
     let finish_progress = progress.clone();
     let total_entries = entries.len();
@@ -291,7 +282,6 @@ pub async fn zip_s3_prefix_to_s3(
             writer.compat_write(),
             &entries,
             include_catalog,
-            compression,
             progress,
             &producer_client,
         )
@@ -403,7 +393,6 @@ pub async fn zip_s3_prefix_to_file(
         &options.destination_zip,
         &entries,
         options.include_catalog,
-        options.compression,
         options.progress.clone(),
         Some(client),
     )
@@ -480,7 +469,6 @@ async fn write_upload_zip_to_local_file(
     destination: &Path,
     entries: &[UploadEntry],
     include_catalog: bool,
-    compression: ZipCompression,
     progress: Option<UploadProgressHandler>,
     s3_client: Option<&Client>,
 ) -> Result<u64> {
@@ -496,7 +484,6 @@ async fn write_upload_zip_to_local_file(
         file.compat_write(),
         entries,
         include_catalog,
-        compression,
         progress,
         s3_client,
     )
@@ -1214,50 +1201,31 @@ pub(crate) async fn write_upload_zip<W>(
     writer: W,
     entries: &[UploadEntry],
     include_catalog: bool,
-    compression: ZipCompression,
     progress: Option<UploadProgressHandler>,
 ) -> Result<Vec<EmbeddedCatalogEntry>>
 where
     W: AsyncWrite + Unpin,
 {
-    write_upload_zip_entries(
-        writer,
-        entries,
-        include_catalog,
-        compression,
-        progress,
-        None,
-    )
-    .await
+    write_upload_zip_entries(writer, entries, include_catalog, progress, None).await
 }
 
 async fn write_upload_zip_with_s3_client<W>(
     writer: W,
     entries: &[UploadEntry],
     include_catalog: bool,
-    compression: ZipCompression,
     progress: Option<UploadProgressHandler>,
     client: &Client,
 ) -> Result<Vec<EmbeddedCatalogEntry>>
 where
     W: AsyncWrite + Unpin,
 {
-    write_upload_zip_entries(
-        writer,
-        entries,
-        include_catalog,
-        compression,
-        progress,
-        Some(client),
-    )
-    .await
+    write_upload_zip_entries(writer, entries, include_catalog, progress, Some(client)).await
 }
 
 async fn write_upload_zip_entries<W>(
     writer: W,
     entries: &[UploadEntry],
     include_catalog: bool,
-    compression: ZipCompression,
     progress: Option<UploadProgressHandler>,
     s3_client: Option<&Client>,
 ) -> Result<Vec<EmbeddedCatalogEntry>>
@@ -1287,7 +1255,6 @@ where
             &mut zip_writer,
             entry,
             include_catalog,
-            compression,
             &progress,
             UploadProgressContext {
                 current_file,
@@ -1349,7 +1316,6 @@ async fn write_zip_entry<W>(
     zip_writer: &mut ZipFileWriter<W>,
     entry: &UploadEntry,
     hash_entry: bool,
-    compression: ZipCompression,
     progress: &Option<UploadProgressHandler>,
     progress_context: UploadProgressContext,
     s3_client: Option<&Client>,
@@ -1363,7 +1329,7 @@ where
         return Ok((0, None));
     }
 
-    let builder = ZipEntryBuilder::new(entry.zip_path.clone().into(), compression.to_async_zip());
+    let builder = ZipEntryBuilder::new(entry.zip_path.clone().into(), Compression::Deflate);
     let mut entry_writer = zip_writer.write_entry_stream(builder).await?;
     let mut state = UploadEntryWriteState {
         hasher: hash_entry.then(Md5::new),
