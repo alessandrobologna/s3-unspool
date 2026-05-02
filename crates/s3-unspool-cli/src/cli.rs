@@ -177,7 +177,6 @@ pub(crate) fn parse_zip_compression(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use s3_unspool as unspool;
 
     #[test]
     fn parses_unzip_subcommand() {
@@ -295,7 +294,7 @@ mod tests {
         );
         assert_eq!(
             parse_zip_compression(upload).unwrap(),
-            unspool::ZipCompression::Zstd
+            s3_unspool::ZipCompression::Zstd
         );
     }
 
