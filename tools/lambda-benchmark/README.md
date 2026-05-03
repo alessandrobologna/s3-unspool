@@ -3,6 +3,10 @@
 This folder contains the optional Lambda benchmark harness for `s3-unspool`.
 It is repository tooling, not a published package.
 
+Use this guide when you need to deploy the harness, invoke it directly, or run
+the automated benchmark matrix that feeds the checked-in benchmark snapshots.
+For the published results, see [Benchmark Snapshots](../../docs/benchmark.md).
+
 The harness includes:
 
 - a SAM template that deploys one direct-invoke Lambda function
@@ -10,7 +14,7 @@ The harness includes:
 - an example invoke event
 - a local `uv` package for automated benchmark runs and chart generation
 
-## Build And Deploy
+## Build and Deploy
 
 Validate and build the SAM app from the repository root:
 
@@ -37,6 +41,8 @@ The SAM template deploys:
   and optional deletes
 
 ## Direct Invoke
+
+Use direct invokes for smoke tests and one-off payload checks.
 
 Find the generated bucket and function:
 
@@ -105,7 +111,9 @@ invokes stay below the synchronous invoke response limit. Set
 
 ## Automated Benchmarks
 
-The benchmark runner is a local `uv` package.
+The benchmark runner is a local `uv` package. It invokes the deployed Lambda
+function, collects CloudWatch `REPORT` durations, and writes local benchmark
+artifacts under `benchmark-results/<run-id>` by default.
 
 ```sh
 uv run --project tools/lambda-benchmark s3-unspool-benchmark \
@@ -133,9 +141,6 @@ uv run --project tools/lambda-benchmark s3-unspool-benchmark \
   --no-results-md \
   --region us-east-1
 ```
-
-Generated benchmark artifacts default to `benchmark-results/<run-id>` under the
-current working directory.
 
 ## Test
 
