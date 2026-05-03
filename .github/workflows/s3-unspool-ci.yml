@@ -13,6 +13,7 @@ on:
       - "crates/s3-unspool-cli/**"
       - "dist-workspace.toml"
       - "rust-toolchain.toml"
+      - "scripts/check-crates-io-publish-target.sh"
 
 permissions: {}
 

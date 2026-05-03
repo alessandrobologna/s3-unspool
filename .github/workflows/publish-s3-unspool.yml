@@ -12,6 +12,7 @@ on:
       - "crates/s3-unspool-cli/**"
       - "dist-workspace.toml"
       - "rust-toolchain.toml"
+      - "scripts/check-crates-io-publish-target.sh"
   workflow_dispatch:
 
 permissions: {}
@@ -112,6 +113,12 @@ jobs:
             echo "tag-flag=${tag_flag}"
             echo "publishing=${publishing}"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Validate crates.io publish target
+        if: ${{ steps.release.outputs.publishing == 'true' }}
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: scripts/check-crates-io-publish-target.sh s3-unspool s3-unspool-cli
 
       - name: Install dist
         shell: bash
@@ -448,36 +455,10 @@ jobs:
             echo "tag=v${version}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Reject existing crate versions
-        shell: bash
+      - name: Recheck crates.io publish target
         env:
           VERSION: ${{ steps.crate.outputs.version }}
-        run: |
-          set -euo pipefail
-          check_absent() {
-            crate="$1"
-            status="$(curl -L -sS \
-              --connect-timeout 10 \
-              --max-time 30 \
-              --retry 3 \
-              --retry-delay 2 \
-              --retry-all-errors \
-              -o response.json \
-              -w "%{http_code}" \
-              -H "User-Agent: alessandrobologna/s3-unspool release workflow" \
-              "https://crates.io/api/v1/crates/${crate}/${VERSION}")"
-            if [ "$status" = "200" ]; then
-              echo "crate ${crate} ${VERSION} is already published" >&2
-              exit 1
-            fi
-            if [ "$status" != "404" ]; then
-              cat response.json >&2
-              echo "unexpected crates.io response ${status} for ${crate} ${VERSION}" >&2
-              exit 1
-            fi
-          }
-          check_absent s3-unspool
-          check_absent s3-unspool-cli
+        run: scripts/check-crates-io-publish-target.sh s3-unspool s3-unspool-cli
 
       - name: Dry-run library publish
         run: cargo publish -p s3-unspool --dry-run
