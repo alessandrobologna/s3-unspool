@@ -55,7 +55,7 @@ Resources:
       BuildProperties:
         Binary: s3-unspool-lambda
     Properties:
-      CodeUri: .
+      CodeUri: ../..
       Handler: bootstrap
       Runtime: provided.al2023
       Environment:

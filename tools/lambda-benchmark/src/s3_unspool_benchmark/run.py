@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-# /// script
-# requires-python = ">=3.12"
-# dependencies = [
-#   "boto3",
-#   "matplotlib",
-# ]
-# ///
 """Run s3-unspool Lambda extraction benchmarks.
 
 The harness updates one Lambda memory size at a time, then runs independent
@@ -1039,7 +1032,8 @@ def update_results_markdown(path: Path, section: str) -> None:
     else:
         text = (
             "# Benchmark Results\n\n"
-            "This file contains generated benchmark output from `scripts/benchmark.py`.\n\n"
+            "This file contains generated benchmark output from "
+            "`s3-unspool-benchmark`.\n\n"
         )
     start = text.find(BENCHMARK_SECTION_START)
     end = text.find(BENCHMARK_SECTION_END)

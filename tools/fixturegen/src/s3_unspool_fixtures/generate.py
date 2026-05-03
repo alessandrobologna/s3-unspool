@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate deterministic mixed-compressibility fixture directories."""
+"""Generate deterministic repository-shaped benchmark fixture directories."""
 
 from __future__ import annotations
 
@@ -11,6 +11,12 @@ import re
 import shutil
 import sys
 from pathlib import Path
+
+from s3_unspool_fixtures.content import (
+    FixtureContentStream,
+    allocate_profiles,
+    generated_fixture_path,
+)
 
 
 SIZE_RE = re.compile(r"^(\d+(?:\.\d+)?)([a-zA-Z]*)$")
@@ -46,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Create a deterministic directory tree containing a random-looking "
-            "mix of compressible, incompressible, and mixed files."
+            "mix of structured text/code, binary assets, and mixed files."
         )
     )
     parser.add_argument("output_dir", type=Path, help="directory to create")
@@ -81,7 +87,7 @@ def parse_args() -> argparse.Namespace:
         "--compressible-ratio",
         type=float,
         default=DEFAULT_COMPRESSIBLE_RATIO,
-        help="fraction of files filled with repeated text-like content",
+        help="fraction of files filled with structured Markdown, code, config, and logs",
     )
     parser.add_argument(
         "--incompressible-ratio",
@@ -140,18 +146,21 @@ def generate_fixture(
     rng = random.Random(seed)
     sizes = allocate_sizes(file_count, total_size, rng)
     kinds = allocate_kinds(file_count, compressible_ratio, incompressible_ratio, rng)
+    profiles = allocate_profiles(kinds, seed)
     entries = []
     totals_by_kind: dict[str, dict[str, int]] = {}
+    totals_by_profile: dict[str, dict[str, int]] = {}
 
-    for index, (size, kind) in enumerate(zip(sizes, kinds, strict=True)):
-        relative_path = generated_path(index, kind, size, max_depth, rng)
+    for index, (size, kind, profile) in enumerate(zip(sizes, kinds, profiles, strict=True)):
+        relative_path = generated_fixture_path(index, kind, size, max_depth, rng, profile)
         path = output_dir / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        digest = write_file(path, index, kind, size, seed, chunk_size)
+        digest = write_file(path, index, kind, profile, size, seed, chunk_size)
         entries.append(
             {
                 "path": relative_path.as_posix(),
                 "kind": kind,
+                "profile": profile,
                 "size": size,
                 "sha256": digest,
             }
@@ -159,6 +168,9 @@ def generate_fixture(
         stats = totals_by_kind.setdefault(kind, {"files": 0, "bytes": 0})
         stats["files"] += 1
         stats["bytes"] += size
+        profile_stats = totals_by_profile.setdefault(profile, {"files": 0, "bytes": 0})
+        profile_stats["files"] += 1
+        profile_stats["bytes"] += size
 
     manifest = {
         "version": 1,
@@ -169,6 +181,7 @@ def generate_fixture(
         "incompressible_ratio": incompressible_ratio,
         "mixed_ratio": 1.0 - compressible_ratio - incompressible_ratio,
         "classes": totals_by_kind,
+        "profiles": totals_by_profile,
         "entries": entries,
     }
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -182,6 +195,7 @@ def generate_fixture(
                 "files": file_count,
                 "total_size": total_size,
                 "classes": totals_by_kind,
+                "profiles": totals_by_profile,
             },
             indent=2,
             sort_keys=True,
@@ -283,34 +297,17 @@ def allocate_kinds(
     return kinds
 
 
-def generated_path(
-    index: int,
-    kind: str,
-    size: int,
-    max_depth: int,
-    rng: random.Random,
-) -> Path:
-    depth = 1 + rng.randrange(max_depth)
-    dirs = [f"group-{rng.randrange(64):02x}" for _ in range(depth)]
-    extension = {
-        "compressible": "txt",
-        "incompressible": "bin",
-        "mixed": "dat",
-    }[kind]
-    filename = f"{kind}-{index:06d}-{size}.{extension}"
-    return Path(*dirs, filename)
-
-
 def write_file(
     path: Path,
     index: int,
     kind: str,
+    profile: str,
     size: int,
     seed: int,
     chunk_size: int,
 ) -> str:
     digest = hashlib.sha256()
-    stream = ContentStream(seed=seed, index=index, kind=kind)
+    stream = FixtureContentStream(seed=seed, index=index, kind=kind, profile=profile)
     remaining = size
     with path.open("wb") as file:
         while remaining:
@@ -320,59 +317,6 @@ def write_file(
             digest.update(data)
             remaining -= length
     return digest.hexdigest()
-
-
-def random_bytes(rng: random.Random, length: int) -> bytes:
-    if hasattr(rng, "randbytes"):
-        return rng.randbytes(length)
-    return rng.getrandbits(length * 8).to_bytes(length, "little")
-
-
-class ContentStream:
-    def __init__(self, *, seed: int, index: int, kind: str) -> None:
-        self.kind = kind
-        self.rng = random.Random((seed << 32) ^ index)
-        self.offset = 0
-        self.pattern = (
-            f"file={index:08d} "
-            "status=ok route=/assets/app.js method=GET "
-            "message='repeated deployment fixture content'\n"
-        ).encode()
-
-    def next_bytes(self, length: int) -> bytes:
-        if self.kind == "incompressible":
-            return random_bytes(self.rng, length)
-        if self.kind == "compressible":
-            return self._compressible(length)
-        return self._mixed(length)
-
-    def _compressible(self, length: int) -> bytes:
-        data = bytearray()
-        while len(data) < length:
-            data.extend(self.pattern)
-        self.offset += length
-        return bytes(data[:length])
-
-    def _mixed(self, length: int) -> bytes:
-        data = bytearray()
-        block_index = self.offset // 4096
-        while len(data) < length:
-            block_remaining = 4096 - ((self.offset + len(data)) % 4096)
-            want = min(block_remaining, length - len(data))
-            if block_index % 4 == 3:
-                data.extend(random_bytes(self.rng, want))
-            else:
-                data.extend(self._pattern_slice(want))
-            if (self.offset + len(data)) % 4096 == 0:
-                block_index += 1
-        self.offset += length
-        return bytes(data)
-
-    def _pattern_slice(self, length: int) -> bytes:
-        data = bytearray()
-        while len(data) < length:
-            data.extend(self.pattern)
-        return bytes(data[:length])
 
 
 class FixtureError(Exception):

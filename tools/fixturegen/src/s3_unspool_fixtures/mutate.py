@@ -14,6 +14,12 @@ import shutil
 import sys
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
+from s3_unspool_fixtures.content import (
+    FixtureContentError,
+    FixtureContentStream,
+    profile_for_manifest_entry,
+)
+
 
 SIZE_RE = re.compile(r"^(\d+(?:\.\d+)?)([a-zA-Z]*)$")
 DEFAULT_CHUNK_SIZE = 1024 * 1024
@@ -45,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Copy an existing generated fixture and rewrite a deterministic "
-            "subset of files while preserving paths, sizes, and file classes."
+            "subset of files while preserving paths, sizes, classes, and profiles."
         )
     )
     parser.add_argument("source_dir", type=Path, help="existing fixture directory")
@@ -149,10 +155,12 @@ def mutate_fixture(
     mutated_entries = []
     changed_bytes = 0
     classes: dict[str, dict[str, int]] = {}
+    profiles: dict[str, dict[str, int]] = {}
 
     for index, entry in enumerate(entries):
         relative_path = safe_manifest_path(entry)
         kind = entry_string(entry, "kind")
+        profile = entry_profile(entry, kind, relative_path)
         size = entry_int(entry, "size")
         original_sha256 = entry_string(entry, "sha256")
         path = output_dir / relative_path
@@ -166,6 +174,7 @@ def mutate_fixture(
                 path=path,
                 index=index,
                 kind=kind,
+                profile=profile,
                 size=size,
                 seed=seed,
                 chunk_size=chunk_size,
@@ -177,9 +186,13 @@ def mutate_fixture(
         stats = classes.setdefault(kind, {"files": 0, "bytes": 0})
         stats["files"] += 1
         stats["bytes"] += size
+        profile_stats = profiles.setdefault(profile, {"files": 0, "bytes": 0})
+        profile_stats["files"] += 1
+        profile_stats["bytes"] += size
         mutated_entries.append(
             {
                 **entry,
+                "profile": profile,
                 "sha256": new_sha256,
                 "changed": changed,
                 "original_sha256": original_sha256,
@@ -191,6 +204,7 @@ def mutate_fixture(
         "version": 2,
         "entries": mutated_entries,
         "classes": classes,
+        "profiles": profiles,
         "mutation": {
             "source_dir": str(source_dir),
             "source_manifest": str(manifest_path),
@@ -285,18 +299,37 @@ def entry_int(entry: object, key: str) -> int:
     return value
 
 
+def entry_profile(entry: object, kind: str, relative_path: Path) -> str:
+    profile = None
+    if isinstance(entry, dict):
+        raw_profile = entry.get("profile")
+        if isinstance(raw_profile, str) and raw_profile:
+            profile = raw_profile
+    try:
+        return profile_for_manifest_entry(kind, profile, relative_path.as_posix())
+    except FixtureContentError as err:
+        raise FixtureMutationError(str(err)) from err
+
+
 def write_changed_file(
     *,
     path: Path,
     index: int,
     kind: str,
+    profile: str,
     size: int,
     seed: int,
     chunk_size: int,
 ) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256()
-    stream = MutatedContentStream(seed=seed, index=index, kind=kind)
+    stream = FixtureContentStream(
+        seed=seed,
+        index=index,
+        kind=kind,
+        profile=profile,
+        mutation=True,
+    )
     remaining = size
     with path.open("wb") as file:
         while remaining:
@@ -306,61 +339,6 @@ def write_changed_file(
             digest.update(data)
             remaining -= length
     return digest.hexdigest()
-
-
-def random_bytes(rng: random.Random, length: int) -> bytes:
-    if hasattr(rng, "randbytes"):
-        return rng.randbytes(length)
-    return rng.getrandbits(length * 8).to_bytes(length, "little")
-
-
-class MutatedContentStream:
-    def __init__(self, *, seed: int, index: int, kind: str) -> None:
-        if kind not in {"compressible", "incompressible", "mixed"}:
-            raise FixtureMutationError(f"unsupported file kind: {kind}")
-        self.kind = kind
-        self.rng = random.Random((seed << 48) ^ (index << 8) ^ 0xA5A5)
-        self.offset = 0
-        self.pattern = (
-            f"file={index:08d} mutation_seed={seed:08d} "
-            "status=updated route=/assets/app.js method=GET "
-            "message='changed deployment fixture content'\n"
-        ).encode()
-
-    def next_bytes(self, length: int) -> bytes:
-        if self.kind == "incompressible":
-            return random_bytes(self.rng, length)
-        if self.kind == "compressible":
-            return self._compressible(length)
-        return self._mixed(length)
-
-    def _compressible(self, length: int) -> bytes:
-        data = bytearray()
-        while len(data) < length:
-            data.extend(self.pattern)
-        self.offset += length
-        return bytes(data[:length])
-
-    def _mixed(self, length: int) -> bytes:
-        data = bytearray()
-        block_index = self.offset // 4096
-        while len(data) < length:
-            block_remaining = 4096 - ((self.offset + len(data)) % 4096)
-            want = min(block_remaining, length - len(data))
-            if block_index % 4 == 3:
-                data.extend(random_bytes(self.rng, want))
-            else:
-                data.extend(self._pattern_slice(want))
-            if (self.offset + len(data)) % 4096 == 0:
-                block_index += 1
-        self.offset += length
-        return bytes(data)
-
-    def _pattern_slice(self, length: int) -> bytes:
-        data = bytearray()
-        while len(data) < length:
-            data.extend(self.pattern)
-        return bytes(data[:length])
 
 
 def parse_size(value: str) -> int:
