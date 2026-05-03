@@ -2949,6 +2949,7 @@ fn windows_path(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
+#[cfg(unix)]
 fn alternate_case_name(name: &std::ffi::OsStr) -> Option<String> {
     let name = name.to_str()?;
     let mut changed = false;
