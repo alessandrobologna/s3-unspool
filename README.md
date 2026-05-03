@@ -81,8 +81,7 @@ successfully.
 - [Fast Updates](#fast-updates)
 - [Command-Line Testing](#command-line-testing)
 - [Performance and Architecture](#performance-and-architecture)
-- [Benchmarking With Lambda](#benchmarking-with-lambda)
-- [Fixture Tools](#fixture-tools)
+- [Benchmark Tools](#benchmark-tools)
 - [Assumptions and Limits](#assumptions-and-limits)
 
 ## Install
@@ -561,137 +560,15 @@ memory budget.
 See [Architecture](docs/architecture.md) for the extraction flow, source
 scheduler behavior, and diagnostics glossary.
 
-## Benchmarking With Lambda
+## Benchmark Tools
 
-The included SAM template deploys:
+Optional benchmark tooling lives under `tools/` so the repository root stays
+focused on the Rust crates:
 
-- One direct-invoke Lambda function built with Cargo Lambda.
-- One test S3 bucket with a one-day object lifecycle rule for benchmark cleanup.
-- A Lambda role that can list, read, write, and optionally delete objects in
-  that test bucket.
-- Optional benchmark-bucket access scoped to `BenchmarkFixturePrefix` for
-  fixture reads and `BenchmarkDestinationPrefix` for benchmark reads, writes,
-  and optional deletes.
-
-Validate and build:
-
-```sh
-sam validate --lint
-PATH="$HOME/.cargo/bin:$PATH" RUSTUP_TOOLCHAIN=1.95.0 sam build --beta-features
-```
-
-Deploy:
-
-```sh
-sam deploy --guided
-```
-
-Find the generated bucket and function:
-
-```sh
-STACK=s3-unspool
-
-BUCKET=$(aws cloudformation describe-stacks \
-  --stack-name "$STACK" \
-  --query 'Stacks[0].Outputs[?OutputKey==`TestBucketName`].OutputValue' \
-  --output text)
-
-FUNCTION=$(aws cloudformation describe-stacks \
-  --stack-name "$STACK" \
-  --query 'Stacks[0].Outputs[?OutputKey==`FunctionName`].OutputValue' \
-  --output text)
-```
-
-Upload a ZIP and invoke the Lambda:
-
-```sh
-aws s3 cp site.zip "s3://$BUCKET/source/site.zip"
-
-aws lambda invoke \
-  --cli-binary-format raw-in-base64-out \
-  --function-name "$FUNCTION" \
-  --payload "{\"source\":\"s3://$BUCKET/source/site.zip\",\"destinationPrefix\":\"s3://$BUCKET/www/\",\"diagnostics\":true}" \
-  /tmp/s3-unspool-response.json
-```
-
-Payload fields:
-
-```json
-{
-  "source": "s3://bucket/source/site.zip",
-  "destinationPrefix": "s3://bucket/www/",
-  "deleteExtra": false,
-  "diagnostics": false,
-  "ignoreCatalog": false,
-  "includeOperations": false,
-  "includePatterns": [],
-  "excludePatterns": []
-}
-```
-
-When invoking against the benchmark bucket, keep the source under the configured
-fixture prefix and the destination under the configured destination prefix. The
-template scopes benchmark-bucket object permissions to those prefixes, including
-destination `s3:GetObject` for conditional overwrites.
-
-`concurrency` is optional. When it is omitted, the Lambda picks a default from
-the configured memory size: `4` workers at `128` MB, `6` at `256` MB, `8` at
-`512` MB, `11` at `1024` MB, and `16` at `2048` MB and above.
-
-Set `"ignoreCatalog": true` to force extraction to ignore the embedded MD5
-catalog and measure the fallback extract-and-hash path. The payload also accepts
-`"ignoreEmbeddedCatalog": true`.
-
-Set `"includePatterns"` or `"excludePatterns"` to restore only selected ZIP
-entries from the archive. Selected Lambda extracts use the same source-range
-planning as full extracts, and they reject `"deleteExtra": true` for the same
-reason as the CLI: unselected destination objects are outside the restore scope.
-
-Lambda responses omit per-object `operations` by default so large benchmark
-invokes stay below the synchronous invoke response limit. Set
-`"includeOperations": true` only when you need the full per-object report.
-
-## Fixture Tools
-
-Create deterministic local test data:
-
-```sh
-scripts/generate-fixture.py ./tmp/fixture \
-  --files 1000 \
-  --total-size 512MiB \
-  --seed 42 \
-  --clean
-```
-
-The generator creates nested directories with a mix of compressible,
-incompressible, and mixed-content files. It writes a manifest next to the output
-directory by default:
-
-```text
-./tmp/fixture.manifest.json
-```
-
-Create an update fixture with about 10 percent of files changed:
-
-```sh
-scripts/mutate-fixture.py ./tmp/fixture ./tmp/fixture-10pct \
-  --change-ratio 0.10 \
-  --seed 2 \
-  --clean
-```
-
-Zip and unzip the fixtures:
-
-```sh
-s3-unspool zip ./tmp/fixture s3://my-bucket/fixtures/fixture.zip
-s3-unspool unzip s3://my-bucket/fixtures/fixture.zip s3://my-bucket/fixture-out/
-
-s3-unspool zip ./tmp/fixture-10pct s3://my-bucket/fixtures/fixture-10pct.zip
-s3-unspool unzip s3://my-bucket/fixtures/fixture-10pct.zip s3://my-bucket/fixture-out/
-```
-
-Use these scripts to compare full deploys, no-op deploys, and update deploys
-with a known mix of file sizes and compressibility.
+- [`tools/lambda-benchmark`](tools/lambda-benchmark/README.md): SAM/Cargo
+  Lambda benchmark app plus the `s3-unspool-benchmark` runner.
+- [`tools/fixturegen`](tools/fixturegen/README.md): deterministic fixture and
+  update-fixture generator used by the benchmark harness.
 
 ## Repository Layout
 
@@ -699,8 +576,8 @@ with a known mix of file sizes and compressibility.
 | --- | --- |
 | `crates/s3-unspool` | Published Rust library crate |
 | `crates/s3-unspool-cli` | Published pre-release CLI crate; installs `s3-unspool` |
-| `lambda/s3-unspool-lambda` | SAM/Cargo Lambda benchmark harness |
-| `scripts/` | Fixture generation and benchmark helpers |
+| `tools/lambda-benchmark` | SAM/Cargo Lambda benchmark harness and runner |
+| `tools/fixturegen` | Local fixture generation package |
 | `docs/` | Architecture notes and generated benchmark chart assets |
 
 The Lambda package is repository tooling. The published packages are

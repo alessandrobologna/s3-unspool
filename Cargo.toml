@@ -2,7 +2,7 @@
 members = [
     "crates/s3-unspool",
     "crates/s3-unspool-cli",
-    "lambda/s3-unspool-lambda",
+    "tools/lambda-benchmark/lambda/s3-unspool-lambda",
 ]
 resolver = "3"
 
