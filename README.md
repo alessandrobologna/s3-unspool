@@ -99,11 +99,13 @@ Install the CLI with `cargo-binstall` when prebuilt GitHub Release artifacts are
 available:
 
 ```sh
-cargo binstall s3-unspool-cli --version 0.1.0-beta.4
+cargo binstall s3-unspool-cli --version 0.1.0-beta.5
 ```
 
 The CLI crate name is `s3-unspool-cli`, but the installed command is
-`s3-unspool`.
+`s3-unspool`. Because current releases are prereleases, include the explicit
+version; unqualified `cargo binstall s3-unspool-cli` resolves stable versions
+only.
 
 ## Quick Start
 
@@ -399,7 +401,7 @@ The CLI runs the same zip and unzip flows from a terminal. Install the
 pre-release binary with `cargo-binstall`, or build it from a checkout:
 
 ```sh
-cargo binstall s3-unspool-cli --version 0.1.0-beta.4
+cargo binstall s3-unspool-cli --version 0.1.0-beta.5
 ```
 
 ```sh
@@ -590,7 +592,7 @@ identifiers such as `0.1.0-alpha.1`, `0.1.0-beta.1`, or `0.1.0-rc.1`.
 Consumers opt into a pre-release explicitly:
 
 ```sh
-cargo add s3-unspool@0.1.0-beta.4
+cargo add s3-unspool@0.1.0-beta.5
 ```
 
 Releases are published by the manual `Publish s3-unspool` GitHub Actions

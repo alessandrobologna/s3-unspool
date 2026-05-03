@@ -1,6 +1,6 @@
 [package]
 name = "s3-unspool-cli"
-version = "0.1.0-beta.4"
+version = "0.1.0-beta.5"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -18,11 +18,12 @@ path = "src/main.rs"
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.xz"
 pkg-fmt = "txz"
-bin-dir = "{ bin }{ binary-ext }"
+bin-dir = "{ name }-{ target }/{ bin }{ binary-ext }"
 
 [package.metadata.binstall.overrides.'cfg(windows)']
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.zip"
 pkg-fmt = "zip"
+bin-dir = "{ bin }{ binary-ext }"
 
 [features]
 default = ["zstd"]
