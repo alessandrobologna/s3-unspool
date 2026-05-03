@@ -12,12 +12,16 @@
 `s3-unspool` is a Rust crate for fast, bounded-memory ZIP extraction from S3
 into S3.
 
-It is built for deployment-style archives, Lambda jobs, and other low-scratch
-environments where downloading a ZIP to local disk is either slow or impossible.
-The extractor reads the source archive with ranged S3 `GetObject` requests,
-lists the destination prefix once, skips unchanged files when a catalog is
-available, and writes missing or changed files with conditional `PutObject`
-requests.
+This README is the project overview. It is meant to help you decide whether the
+library, CLI, and repository tooling fit your workload, then point you to the
+right deeper document.
+
+`s3-unspool` is built for deployment-style archives, Lambda jobs, and other
+low-scratch environments where downloading a ZIP to local disk is either slow or
+impossible. The extractor reads the source archive with ranged S3 `GetObject`
+requests, lists the destination prefix once, skips unchanged files when a
+catalog is available, and writes missing or changed files with conditional
+`PutObject` requests.
 
 The crate also includes zip helpers that stream either a local directory or an
 existing S3 prefix into a cataloged local or S3 ZIP. ZIPs produced by those
@@ -46,34 +50,17 @@ expected to be single-part MD5 ETags.
 
 ## Lambda Benchmark Snapshot
 
-The latest benchmark uses a 1,000-file fixture with a 40% compressible, 40%
-incompressible, and 20% mixed-content split. The archive is 4,506 MiB when
-extracted and 2,071 MiB as a ZIP, so every memory size below extracts a source
-archive much larger than available Lambda memory.
+The large Lambda benchmark extracts a 4,506 MiB fixture from a 2,071 MiB ZIP,
+with medians from three CloudWatch `REPORT` samples per memory configuration.
+At Lambda 512 MB, full extraction completed in 78.99s and a 5% update with the
+embedded catalog completed in 4.03s.
 
-Timings are Lambda CloudWatch `REPORT` duration medians from three samples per
-configuration. Cold-start init time and local AWS CLI round-trip time are not
-included.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmarks/streaming-20260430T011727Z/duration-streaming-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="docs/assets/benchmarks/streaming-20260430T011727Z/duration-streaming-light.svg">
-  <img alt="Lambda benchmark duration for the streaming fixture" src="docs/assets/benchmarks/streaming-20260430T011727Z/duration-streaming-light.svg">
-</picture>
-
-| Lambda memory | Full extract | 5% update with catalog | 5% update without catalog | Median max memory |
-| ---: | ---: | ---: | ---: | ---: |
-| 128 MB | 340.31s | 14.09s | 260.73s | 92-103 MB |
-| 256 MB | 153.54s | 7.71s | 121.60s | 115-202 MB |
-| 512 MB | 78.99s | 4.03s | 58.57s | 200-511 MB |
-
-All 27 measured invokes completed with zero reported extraction errors, zero S3
-throttles, and zero source `GetObject` errors. Four destination `PutObject`
-dispatch failures occurred in the 256 MB full-extract samples and were retried
-successfully.
+See [Benchmark Snapshots](docs/benchmark.md) for the large-fixture chart, a 10
+MiB / 100-file mixed-fixture run, full timing tables, and reproduction links.
 
 ## Contents
 
+- [Documentation Map](#documentation-map)
 - [Install](#install)
 - [Quick Start](#quick-start)
 - [Extraction Model](#extraction-model)
@@ -81,8 +68,24 @@ successfully.
 - [Fast Updates](#fast-updates)
 - [Command-Line Testing](#command-line-testing)
 - [Performance and Architecture](#performance-and-architecture)
+- [Storage Compression Economics](#storage-compression-economics)
 - [Benchmark Tools](#benchmark-tools)
+- [Repository Layout](#repository-layout)
+- [Versioning](#versioning)
 - [Assumptions and Limits](#assumptions-and-limits)
+- [Live S3 Test](#live-s3-test)
+
+## Documentation Map
+
+| Read this | When you need |
+| --- | --- |
+| This README | A quick evaluation path, first examples, and project layout. |
+| [`crates/s3-unspool/README.md`](crates/s3-unspool/README.md) | The published Rust library API surface and focused crate examples. |
+| [`docs/architecture.md`](docs/architecture.md) | The extraction flow, scheduler model, Lambda defaults, and diagnostics glossary. |
+| [`docs/benchmark.md`](docs/benchmark.md) | Reproducible Lambda benchmark snapshots and timing methodology. |
+| [`docs/storage-compression-economics.md`](docs/storage-compression-economics.md) | The storage-cost model for compressed ZIP snapshots and selective extraction. |
+| [`tools/lambda-benchmark/README.md`](tools/lambda-benchmark/README.md) | How to deploy and run the optional benchmark Lambda harness. |
+| [`tools/fixturegen/README.md`](tools/fixturegen/README.md) | How to generate deterministic mixed-content benchmark fixtures. |
 
 ## Install
 
@@ -397,8 +400,9 @@ and upload sources cannot contain a file at that path.
 
 ## Command-Line Testing
 
-The CLI runs the same zip and unzip flows from a terminal. Install the
-pre-release binary with `cargo-binstall`, or build it from a checkout:
+The CLI is useful for smoke tests, local workflows, and exercising the same zip
+and unzip paths the library exposes. Install the pre-release binary with
+`cargo-binstall`, or build it from a checkout:
 
 ```sh
 cargo binstall s3-unspool-cli --version 0.1.0-beta.5
@@ -477,8 +481,8 @@ Global CLI options:
 
 ## CLI Output and Reports
 
-Interactive zip and unzip commands show a single-line spinner with elapsed
-time and progress where available:
+Interactive zip and unzip commands show a single-line spinner with elapsed time
+and progress where available:
 
 ```text
 • Zipping 00:03 [█████▍            ] 30% 18 MiB/512 MiB file 42/1000
@@ -555,17 +559,32 @@ The most important tuning knobs are:
 | `SyncOptions::put_retry_policy` | 6 attempts | Destination PUT retry and `SlowDown` backoff behavior. |
 
 The repository Lambda harness derives those settings from Lambda memory because
-Lambda memory also buys CPU. For example, it uses 4 entry workers at 128 MB, 6
-at 256 MB, and 8 at 512 MB, while keeping the source block window bounded by the
-memory budget.
+Lambda memory also buys CPU. For example, it uses 4 entry workers at Lambda
+128 MB, 6 at Lambda 256 MB, and 8 at Lambda 512 MB, while keeping the source
+block window bounded by the memory budget.
 
 See [Architecture](docs/architecture.md) for the extraction flow, source
 scheduler behavior, and diagnostics glossary.
 
+## Storage Compression Economics
+
+For compressible Markdown, code, logs, reports, and generated data corpora,
+storing sharded ZIPs in S3 Standard and extracting selected globs on demand can
+be cheaper than storing uncompressed individual S3 objects. Small files are the
+strongest case because IA-style storage classes and Glacier Instant Retrieval
+have 128 KiB minimum billable object sizes, while S3 Intelligent-Tiering does
+not auto-tier objects smaller than 128 KiB. Megabyte-scale files can still
+benefit when compression is strong and access is naturally grouped by archive
+entry selection.
+
+See [Storage Compression Economics](docs/storage-compression-economics.md) for
+the scenario model, pricing assumptions, and visual cost comparisons.
+
 ## Benchmark Tools
 
 Optional benchmark tooling lives under `tools/` so the repository root stays
-focused on the Rust crates:
+focused on the Rust crates. These tools are for maintainers and evaluators; they
+are not part of the published library crate:
 
 - [`tools/lambda-benchmark`](tools/lambda-benchmark/README.md): SAM/Cargo
   Lambda benchmark app plus the `s3-unspool-benchmark` runner.
@@ -580,7 +599,7 @@ focused on the Rust crates:
 | `crates/s3-unspool-cli` | Published pre-release CLI crate; installs `s3-unspool` |
 | `tools/lambda-benchmark` | SAM/Cargo Lambda benchmark harness and runner |
 | `tools/fixturegen` | Local fixture generation package |
-| `docs/` | Architecture notes and generated benchmark chart assets |
+| `docs/` | Architecture notes, benchmark snapshots, storage economics, and generated chart assets |
 
 The Lambda package is repository tooling. The published packages are
 `s3-unspool` for the library and `s3-unspool-cli` for the command-line binary.

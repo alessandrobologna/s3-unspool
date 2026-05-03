@@ -1,9 +1,18 @@
-# Architecture
+# Architecture and Runtime Model
+
+This document explains how `s3-unspool` extracts ZIP archives with bounded
+memory. It is written for maintainers, operators, and library users who need to
+understand performance, failure modes, or diagnostics beyond the quick-start
+examples.
 
 `s3-unspool` extracts ZIP archives from S3 to S3 without downloading the archive
 to local storage. Source bytes are read with ranged `GetObject` requests,
 destination state is read with one `ListObjectsV2` pass, and destination writes
 use conditional `PutObject` requests.
+
+For API examples, see the [project README](../README.md) or the
+[crate README](../crates/s3-unspool/README.md). For measured Lambda behavior,
+see [Benchmark Snapshots](benchmark.md).
 
 ## Extract Flow
 
@@ -36,7 +45,7 @@ flowchart TD
   Put --> Conflict["Condition failed; report conflict"]
 ```
 
-The important properties are:
+This flow has a few important properties:
 
 - The source ZIP is never materialized on disk.
 - The destination prefix is listed once; listed ETags drive comparisons and
@@ -64,6 +73,11 @@ The catalog stores each file path and MD5 digest. During extraction, a catalog
 entry can be compared directly with a destination ETag from `ListObjectsV2`.
 When they match, the file is counted as unchanged and the extractor does not
 decompress that entry.
+
+Selective extraction is layered on top of the same manifest and source-planning
+model. Include and exclude patterns filter ZIP entries before source blocks are
+planned, so selected restores still benefit from ranged reads and block
+coalescing.
 
 External ZIP files still work. If the catalog is missing or ignored, existing
 destination files with comparable single-part ETags are handled in a hash phase.
@@ -121,11 +135,11 @@ available CPU. The current policy is:
 
 | Lambda memory | Entry workers | Source block | Source GETs | PUTs |
 | ---: | ---: | ---: | ---: | ---: |
-| 128 MB | 4 | 8 MiB | 1 | 4 |
-| 256 MB | 6 | 8 MiB | 1 | 6 |
-| 512 MB | 8 | 8 MiB | 2 | 8 |
-| 1024 MB | 11 | 8 MiB | 4 | 8 |
-| 2048 MB | 16 | 8 MiB | 8 | 8 |
+| Lambda 128 MB | 4 | 8 MiB | 1 | 4 |
+| Lambda 256 MB | 6 | 8 MiB | 1 | 6 |
+| Lambda 512 MB | 8 | 8 MiB | 2 | 8 |
+| Lambda 1024 MB | 11 | 8 MiB | 4 | 8 |
+| Lambda 2048 MB | 16 | 8 MiB | 8 | 8 |
 
 The default worker count grows with the square root of memory:
 
@@ -181,6 +195,10 @@ tracks source GET failures and destination PUT retries explicitly.
 Source and PUT diagnostics are collected only when `collect_diagnostics`,
 `--diagnostics`, or Lambda payload `"diagnostics": true` is enabled.
 
+Use these fields to explain a run after it completes. They are counters and
+sizes collected from the source scheduler and destination PUT retry logic; they
+are not per-file timing samples.
+
 | Field | Meaning |
 | --- | --- |
 | `source_zip_bytes` | Source ZIP object size in bytes. |
@@ -219,3 +237,8 @@ The upload helper is separate from extraction. It walks a local directory,
 streams a ZIP archive to S3, and includes the embedded catalog by default.
 Unlike extraction writes, source ZIP upload can use multipart upload because the
 source ZIP ETag is not used as a destination file comparison digest.
+
+S3-prefix upload follows the same archive format. It lists source objects,
+streams them into a generated ZIP, preserves zero-byte trailing-slash directory
+markers as ZIP directory entries, and rejects nonzero S3 objects whose keys end
+in `/` as ambiguous.

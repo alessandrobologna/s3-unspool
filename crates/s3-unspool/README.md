@@ -3,12 +3,18 @@
 `s3-unspool` is a Rust crate for fast, streaming extraction of large ZIP
 archives from S3 into S3 prefixes.
 
-It is designed for large archives and low scratch-space environments: the source
-ZIP is read with ranged S3 `GetObject` calls, and extracted files can be
-streamed directly into S3 `PutObject` requests or written to a local directory.
-The crate also includes zip helpers that stream a local directory or existing S3
-prefix into a local or S3 ZIP and embed the catalog used by later incremental
-extracts.
+This is the crate README. It focuses on the Rust API surface and the behavior a
+library consumer needs to know before embedding `s3-unspool`.
+
+The crate is designed for large archives and low scratch-space environments:
+the source ZIP is read with ranged S3 `GetObject` calls, and extracted files can
+be streamed directly into S3 `PutObject` requests or written to a local
+directory. The crate also includes zip helpers that stream a local directory or
+existing S3 prefix into a local or S3 ZIP and embed the catalog used by later
+incremental extracts.
+
+For CLI usage, benchmark tooling, repository layout, and storage-economics
+discussion, see the [project README](../../README.md).
 
 ## Install
 
@@ -17,6 +23,9 @@ cargo add s3-unspool
 ```
 
 ## Examples
+
+These examples show the most common S3 workflows. Local endpoint combinations
+are available through the same crate and through the `s3-unspool` CLI.
 
 ### Extract an S3 ZIP to a Destination Prefix
 
@@ -46,6 +55,45 @@ async fn main() -> s3_unspool::Result<()> {
     Ok(())
 }
 ```
+
+### Extract Selected ZIP Entries
+
+Set `SyncOptions::selection` when only part of an archive should be restored.
+Selection patterns use gitignore-style syntax and are matched against normalized
+ZIP paths before source range planning, so `s3-unspool` only plans source blocks
+needed for selected entries. Exclude-only selections restore every
+non-excluded ZIP entry.
+
+```rust
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::Client;
+use s3_unspool::{S3Object, S3Prefix, SyncOptions, UnzipSelection, sync_zip_to_s3};
+
+#[tokio::main]
+async fn main() -> s3_unspool::Result<()> {
+    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let client = Client::new(&config);
+
+    let extract = SyncOptions::new(
+        S3Object::parse("s3://my-bucket/releases/site.zip")?,
+        S3Prefix::parse("s3://my-bucket/www/")?,
+    )
+    .with_selection(
+        UnzipSelection::new()
+            .include("index.md")
+            .include("docs/**/*.md")
+            .exclude("docs/drafts/**"),
+    );
+
+    let report = sync_zip_to_s3(&client, extract).await?;
+    println!("processed entries: {}", report.summary.zip_files);
+
+    Ok(())
+}
+```
+
+Selected extracts cannot be combined with `delete_extra`, because unselected
+destination objects are outside the restore scope.
 
 ### Upload a Directory as a Cataloged ZIP
 
@@ -104,6 +152,8 @@ async fn main() -> s3_unspool::Result<()> {
 ```
 
 ## Behavior
+
+The high-level extraction contract is:
 
 - Reads source ZIP data with ranged S3 `GetObject` requests.
 - Lists the destination prefix once with `ListObjectsV2`.

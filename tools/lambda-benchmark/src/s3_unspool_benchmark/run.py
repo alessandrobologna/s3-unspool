@@ -42,6 +42,12 @@ FIXTURE_METADATA = {
         "zip": "2,071 MiB ZIP",
         "files": "1,000 files",
     },
+    "small100": {
+        "title": "Small mixed fixture",
+        "uncompressed": "10 MiB",
+        "zip": "5.8 MiB ZIP",
+        "files": "100 files",
+    },
     "small": {
         "title": "Small artifact",
         "uncompressed": "10 MiB",
@@ -763,7 +769,7 @@ def write_charts(aggregate: list[dict[str, Any]], charts_dir: Path) -> dict[str,
         for memory_mb, group_rows in groups:
             header_y = cursor
             tick_positions.append(header_y)
-            tick_labels.append(f"{memory_mb} MB")
+            tick_labels.append(format_lambda_memory(memory_mb))
             cursor += 0.9
             start = header_y
             for row in group_rows:
@@ -966,7 +972,7 @@ def render_markdown(
     lines.extend(
         [
             "",
-            "| Memory | Fixture | Scenario | Samples | Duration min | Duration median | Duration max | Max memory median | GET attempts median | Fetched blocks median | Block waits median | PUT failures median | PUT retries median | PUT throttles median | Errors |",
+            "| Lambda memory | Fixture | Scenario | Samples | Duration min | Duration median | Duration max | Max memory median | GET attempts median | Fetched blocks median | Block waits median | PUT failures median | PUT retries median | PUT throttles median | Errors |",
             "| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
@@ -978,7 +984,7 @@ def render_markdown(
             "| "
             + " | ".join(
                 [
-                    f"{row['memory_mb']} MB",
+                    format_lambda_memory(row["memory_mb"]),
                     row["fixture"],
                     scenario_label(row),
                     f"{row['ok_samples']}/{row['samples']}",
@@ -1022,6 +1028,10 @@ def render_markdown(
                 lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def format_lambda_memory(memory_mb: int | str) -> str:
+    return f"Lambda {int(memory_mb)} MB"
 
 
 def update_results_markdown(path: Path, section: str) -> None:

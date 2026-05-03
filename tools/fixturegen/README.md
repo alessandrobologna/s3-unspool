@@ -3,6 +3,10 @@
 This local Python package generates deterministic benchmark fixtures for
 `s3-unspool`.
 
+Use this guide when you need repeatable input data for local smoke tests or the
+Lambda benchmark harness. The package is repository tooling and is not part of
+the published Rust crates.
+
 The generator creates repository-shaped directory trees with a mix of:
 
 - structured Markdown, code, config, and log files
@@ -14,7 +18,7 @@ profiles, sizes, and SHA-256 digests. The mutation tool copies an existing
 fixture and rewrites a deterministic subset of files while preserving paths,
 sizes, classes, and profiles.
 
-## Run With uv
+## Run with uv
 
 Generate a base fixture:
 
