@@ -1,9 +1,9 @@
 # Benchmark Snapshots
 
 This document records reproducible benchmark snapshots for `s3-unspool` running
-inside the repository Lambda harness. It is intended for readers who want to
-understand observed behavior and reproduce the same benchmark shape, not as a
-guarantee for every archive or AWS account.
+inside the repository Lambda harness. Use it to understand observed behavior and
+reproduce the same benchmark shape; do not treat the numbers as a guarantee for
+every archive or AWS account.
 
 Timings are Lambda CloudWatch `REPORT` duration medians from three samples per
 configuration. Cold-start init time and local AWS CLI round-trip time are not
@@ -16,6 +16,21 @@ The tables compare:
 - a 5% update while ignoring the embedded catalog, which forces the fallback
   extract-and-hash comparison path
 
+## How to Read These Numbers
+
+The catalog matters most when an update run touches a small fraction of a large
+archive. In that shape, unchanged entries can be skipped before decompression
+and upload.
+
+Small fixtures are useful for smoke tests, but they are dominated by fixed
+Lambda invocation and S3 request overhead. At that size, catalog and no-catalog
+update timings can be close even when the catalog path is working.
+
+More Lambda memory generally buys more CPU and network throughput, but it also
+raises the GB-second price and can move a run closer to memory-window limits.
+Use these snapshots as a shape comparison, then benchmark your own corpus before
+choosing production memory settings.
+
 ## Large Streaming Fixture
 
 This benchmark uses a 1,000-file fixture with a 40% compressible, 40%
@@ -24,9 +39,9 @@ extracted and 2,071 MiB as a ZIP, so every memory size below extracts a source
 archive much larger than available Lambda memory.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/streaming-20260430T011727Z/duration-streaming-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="assets/benchmarks/streaming-20260430T011727Z/duration-streaming-light.svg">
-  <img alt="Lambda benchmark duration for the streaming fixture" src="assets/benchmarks/streaming-20260430T011727Z/duration-streaming-light.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="../assets/benchmarks/streaming-20260430T011727Z/duration-streaming-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="../assets/benchmarks/streaming-20260430T011727Z/duration-streaming-light.svg">
+  <img alt="Lambda benchmark duration for the streaming fixture" src="../assets/benchmarks/streaming-20260430T011727Z/duration-streaming-light.svg">
 </picture>
 
 | Lambda memory | Full extract | 5% update with catalog | 5% update without catalog | Median max memory |
@@ -51,9 +66,9 @@ update fixture changed 5 files, totaling 191,590 rewritten bytes.
 Run id: `small100-20260503T073310Z`
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/small100-20260503T073310Z/duration-small100-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="assets/benchmarks/small100-20260503T073310Z/duration-small100-light.svg">
-  <img alt="Lambda benchmark duration for the small mixed fixture" src="assets/benchmarks/small100-20260503T073310Z/duration-small100-light.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="../assets/benchmarks/small100-20260503T073310Z/duration-small100-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="../assets/benchmarks/small100-20260503T073310Z/duration-small100-light.svg">
+  <img alt="Lambda benchmark duration for the small mixed fixture" src="../assets/benchmarks/small100-20260503T073310Z/duration-small100-light.svg">
 </picture>
 
 | Lambda memory | Full extract | 5% update with catalog | 5% update without catalog | Median max memory |
@@ -66,10 +81,9 @@ All 27 measured invokes completed with zero reported extraction errors, zero
 conditional conflicts, zero destination `PutObject` failures, zero retries, and
 zero S3 throttles.
 
-At this size, fixed Lambda invocation and S3 request overhead are a much larger
-share of total time. The embedded catalog still helps at Lambda 256 MB, but by
-Lambda 512 MB the 5% update with and without catalog are effectively tied in
-this sample.
+At this fixture size, fixed Lambda invocation and S3 request overhead dominate
+total time. The embedded catalog still helps at Lambda 256 MB, but by Lambda
+512 MB the 5% update with and without catalog are effectively tied.
 
 ## Parameters
 
@@ -104,10 +118,11 @@ uv run --project tools/fixturegen s3-unspool-mutate-fixture ./base ./mutated-5pc
 
 The Lambda benchmark harness and fixture tooling live under `tools/`:
 
-- [`tools/lambda-benchmark`](../tools/lambda-benchmark/README.md): SAM/Cargo
-  Lambda benchmark app plus the `s3-unspool-benchmark` runner.
-- [`tools/fixturegen`](../tools/fixturegen/README.md): deterministic fixture and
-  update-fixture generator used by the benchmark harness.
+- [Run Lambda Benchmarks](../how-to/run-lambda-benchmarks.md): deploy and run
+  the SAM/Cargo Lambda benchmark app plus the `s3-unspool-benchmark` runner.
+- [Generate Benchmark Fixtures](../how-to/generate-fixtures.md): create the
+  deterministic fixture and update-fixture inputs used by the harness.
 
-See [Architecture](architecture.md) for the extraction flow, source scheduler,
-block window behavior, and diagnostics terminology.
+See [Architecture](../explanation/architecture.md) for the extraction flow and
+source scheduler. See [Diagnostics](diagnostics.md) for diagnostic field
+definitions.
