@@ -3,18 +3,18 @@
 `s3-unspool` is a Rust crate for fast, streaming extraction of large ZIP
 archives from S3 into S3 prefixes.
 
-This is the crate README. It focuses on the Rust API surface and the behavior a
-library consumer needs to know before embedding `s3-unspool`.
+This crate README focuses on the Rust API surface and the behavior a library
+consumer needs to know before embedding `s3-unspool`.
 
-The crate is designed for large archives and low scratch-space environments:
-the source ZIP is read with ranged S3 `GetObject` calls, and extracted files can
-be streamed directly into S3 `PutObject` requests or written to a local
-directory. The crate also includes zip helpers that stream a local directory or
-existing S3 prefix into a local or S3 ZIP and embed the catalog used by later
-incremental extracts.
+The crate is designed for large archives and environments with limited local
+storage. It reads the source ZIP with ranged S3 `GetObject` calls, and streams
+extracted files directly into S3 `PutObject` requests or a local directory. The
+crate also includes zip helpers that stream a local directory or existing S3
+prefix into a local or S3 ZIP and embed the catalog used by later incremental
+extracts.
 
-For CLI usage, benchmark tooling, repository layout, and storage-economics
-discussion, see the [project README](../../README.md).
+For CLI usage, benchmark tooling, repository layout, and economics discussion,
+see the [project README](../../README.md).
 
 ## Install
 
@@ -60,8 +60,8 @@ async fn main() -> s3_unspool::Result<()> {
 
 Set `SyncOptions::selection` when only part of an archive should be restored.
 Selection patterns use gitignore-style syntax and are matched against normalized
-ZIP paths before source range planning, so `s3-unspool` only plans source blocks
-needed for selected entries. Exclude-only selections restore every
+ZIP paths before source range planning, so `s3-unspool` only plans the source
+blocks the selection requires. Exclude-only selections restore every
 non-excluded ZIP entry.
 
 ```rust
@@ -98,8 +98,8 @@ destination objects are outside the restore scope.
 ### Upload a Directory as a Cataloged ZIP
 
 Use `upload_directory_zip_to_s3` when you want the crate to produce the source
-ZIP and embed the catalog used by fast future extracts. Empty local directories
-are written as ZIP directory entries.
+ZIP and embed the catalog used by later incremental extracts. Empty local
+directories are written as ZIP directory entries.
 
 ```rust
 use aws_config::BehaviorVersion;
@@ -168,13 +168,13 @@ The high-level extraction contract is:
 - Uploads generated source ZIPs with S3 multipart upload.
 - Uploads existing S3 prefixes into generated ZIPs without local object storage.
 - Preserves ZIP directory entries and zero-byte S3 folder marker objects.
-- Emits optional upload progress events through upload option progress handlers.
+- Emits optional progress events to handlers configured on upload options.
 - Can ignore the embedded catalog with `SyncOptions::ignore_embedded_catalog`
   when you need to force the fallback extract-and-hash comparison path.
 - Can fail fast on destination write races with
   `SyncOptions::fail_on_conditional_conflict`.
-- Keeps source ZIP blocks in a bounded memory window and reuses cached blocks
-  across destination `PutObject` retries when possible.
+- Keeps source ZIP blocks in a bounded memory window and replays cached blocks
+  across destination `PutObject` retries when they are still resident.
 - Exposes `SyncOptions::put_concurrency` and
   `SyncOptions::put_retry_policy` for destination write backoff, including shared
   throttling for S3 `SlowDown`.
@@ -205,19 +205,15 @@ destination object bodies. S3 authorizes `PutObject` requests with
 
 Use `sync_zip_to_s3_with_clients` when source ranged reads and destination
 streaming writes should use different S3 client configuration. This is useful
-for high-concurrency extraction, where the destination client may disable AWS
-SDK upload stalled-stream protection while the source client keeps download
-protection enabled.
+for high-concurrency extraction, where a destination request body can pause
+while waiting for planned ZIP bytes. Configure the destination client with AWS
+SDK upload stalled-stream protection relaxed or disabled, and keep download
+stalled-stream protection enabled for source reads.
 
 Use `inspect_s3_zip` to read source ZIP size and file count before choosing
 memory settings. `adaptive_source_get_concurrency` and
 `adaptive_source_window_capacity` can then derive scheduler settings for
 memory-bounded runtimes such as Lambda.
-
-For high-concurrency extracts, configure the destination S3 client so AWS SDK
-upload stalled-stream protection is relaxed or disabled. The source scheduler can
-legitimately pause a destination body while waiting for planned ZIP bytes. Keep
-download stalled-stream protection enabled for source reads.
 
 ZIPs created by `upload_directory_zip_to_s3` include an embedded catalog at
 `.s3-unspool/catalog.v1.json`. The catalog stores each file path and MD5 digest
