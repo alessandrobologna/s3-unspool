@@ -796,6 +796,7 @@ pub async fn unzip_file_to_s3(
         ..SyncSummary::default()
     };
     let mut operations = Vec::new();
+    let mut fail_fast_error = None;
 
     let mut stream = stream::iter(entries.entries)
         .map(|entry| {
@@ -805,11 +806,25 @@ pub async fn unzip_file_to_s3(
 
     while let Some(operation) = stream.next().await {
         summarize_operation(&mut summary, &operation);
+        if let Some(err) = conditional_conflict_error(
+            &options.destination,
+            &operation,
+            options.conflict_policy.fails_fast(),
+        ) {
+            fail_fast_error = Some(err);
+        }
         if options.collect_operations {
             operations.push(operation);
         }
+        if fail_fast_error.is_some() {
+            break;
+        }
     }
     drop(stream);
+
+    if let Some(err) = fail_fast_error {
+        return Err(err);
+    }
 
     if options.cleanup.deletes_extra() {
         let expected_keys = expected_keys.expect("delete-extra expected keys are prepared");

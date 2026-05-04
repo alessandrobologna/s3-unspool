@@ -35,9 +35,9 @@ use crate::zip_manifest::{
 };
 use crate::{
     ComparisonMode, ConflictPolicy, DestinationCleanup, DryRunOperationStatus, Error,
-    LocalUnzipOptions, LocalZipOptions, ObjectReport, OperationStatus, PutRetryPolicy, RetryJitter,
-    S3Object, S3Prefix, S3PrefixLocalZipOptions, SyncOptions, SyncReport, SyncSummary,
-    UnzipSelection, UploadProgress, UploadProgressHandler, ZipCompression,
+    LocalUnzipOptions, LocalZipOptions, LocalZipSyncOptions, ObjectReport, OperationStatus,
+    PutRetryPolicy, RetryJitter, S3Object, S3Prefix, S3PrefixLocalZipOptions, SyncOptions,
+    SyncReport, SyncSummary, UnzipSelection, UploadProgress, UploadProgressHandler, ZipCompression,
     dry_run_unzip_file_to_local, dry_run_zip_directory_to_file, unzip_file_to_local,
     zip_directory_to_file, zip_s3_prefix_to_file,
 };
@@ -1951,6 +1951,34 @@ fn conditional_conflict_error_respects_fail_fast_option() {
 
     assert!(conditional_conflict_error(&destination, &operation, false).is_none());
     let err = conditional_conflict_error(&destination, &operation, true).unwrap();
+
+    assert_eq!(
+        err.to_string(),
+        "conditional write failed for s3://bucket/destination/file.txt: PreconditionFailed"
+    );
+}
+
+#[test]
+fn local_zip_sync_options_support_fail_fast_conflict_policy() {
+    let destination = S3Prefix::parse("s3://bucket/destination/").unwrap();
+    let options = LocalZipSyncOptions::new("source.zip", destination.clone()).fail_on_conflict();
+    let operation = ObjectReport {
+        status: OperationStatus::ConditionalConflict,
+        key: "destination/file.txt".to_string(),
+        zip_path: Some("file.txt".to_string()),
+        size: Some(12),
+        md5: None,
+        destination_etag: Some("old-etag".to_string()),
+        message: Some("PreconditionFailed".to_string()),
+    };
+
+    assert_eq!(options.conflict_policy(), ConflictPolicy::FailFast);
+    let err = conditional_conflict_error(
+        &destination,
+        &operation,
+        options.conflict_policy().fails_fast(),
+    )
+    .unwrap();
 
     assert_eq!(
         err.to_string(),

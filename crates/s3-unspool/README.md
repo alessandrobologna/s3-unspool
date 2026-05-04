@@ -171,7 +171,8 @@ The high-level extraction contract is:
 - Emits optional progress events to handlers configured on upload options.
 - Can force the fallback extract-and-hash path with
   `SyncOptions::force_hash_comparison()`.
-- Can fail fast on destination write races with `SyncOptions::fail_on_conflict()`.
+- Can fail fast on destination write races with `SyncOptions::fail_on_conflict()`
+  or `LocalZipSyncOptions::fail_on_conflict()`.
 - Keeps source ZIP blocks in a bounded memory window and replays cached blocks
   across destination `PutObject` retries when they are still resident.
 - Exposes `SyncOptions::with_put_concurrency()` and

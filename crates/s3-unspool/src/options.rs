@@ -783,6 +783,8 @@ pub struct LocalZipSyncOptions {
     pub(crate) selection: UnzipSelection,
     /// Comparison policy for embedded catalogs and entry hashing.
     pub(crate) comparison: ComparisonMode,
+    /// Conditional write conflict handling policy.
+    pub(crate) conflict_policy: ConflictPolicy,
     /// Collect one operation record per processed object in the returned report.
     pub(crate) collect_operations: bool,
     /// Maximum number of ZIP entries processed concurrently.
@@ -1070,6 +1072,7 @@ impl LocalZipSyncOptions {
             cleanup: DestinationCleanup::default(),
             selection: UnzipSelection::default(),
             comparison: ComparisonMode::default(),
+            conflict_policy: ConflictPolicy::default(),
             collect_operations: true,
             concurrency: DEFAULT_CONCURRENCY,
             body_chunk_size: DEFAULT_BODY_CHUNK_SIZE,
@@ -1110,6 +1113,23 @@ impl LocalZipSyncOptions {
         self
     }
 
+    /// Returns the conditional write conflict handling policy.
+    pub fn conflict_policy(&self) -> ConflictPolicy {
+        self.conflict_policy
+    }
+
+    /// Returns an error after the first conditional write conflict is observed.
+    pub fn fail_on_conflict(mut self) -> Self {
+        self.conflict_policy = ConflictPolicy::FailFast;
+        self
+    }
+
+    /// Sets the conditional write conflict handling policy.
+    pub fn with_conflict_policy(mut self, conflict_policy: ConflictPolicy) -> Self {
+        self.conflict_policy = conflict_policy;
+        self
+    }
+
     /// Omits per-object operation records from the returned report.
     pub fn without_operations(mut self) -> Self {
         self.collect_operations = false;
@@ -1144,6 +1164,7 @@ impl std::fmt::Debug for LocalZipSyncOptions {
             .field("cleanup", &self.cleanup)
             .field("selection", &self.selection)
             .field("comparison", &self.comparison)
+            .field("conflict_policy", &self.conflict_policy)
             .field("collect_operations", &self.collect_operations)
             .field("concurrency", &self.concurrency)
             .field("body_chunk_size", &self.body_chunk_size)

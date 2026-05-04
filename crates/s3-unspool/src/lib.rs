@@ -15,8 +15,8 @@
 //! changed objects are uploaded with `If-Match` against the listed destination
 //! ETag so newer destination data is not overwritten accidentally.
 //! Conditional write conflicts are recorded and skipped by default; set
-//! [`SyncOptions::fail_on_conflict`] to return an error on the first observed
-//! conflict.
+//! [`SyncOptions::fail_on_conflict`] or [`LocalZipSyncOptions::fail_on_conflict`]
+//! to return an error on the first observed conflict.
 //!
 //! Conditional overwrites require `s3:GetObject` permission on destination
 //! objects as well as `s3:PutObject`. `s3-unspool` does not issue per-file

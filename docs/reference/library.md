@@ -75,6 +75,10 @@ local and S3 endpoints.
 | `fail_on_conflict()` | disabled | Return an error on the first destination write conflict. |
 | `without_operations()` | disabled | Omit per-object operation records from the returned report. |
 
+`SyncOptions` and `LocalZipSyncOptions` both support the conflict policy
+builders because both write ZIP entries into S3 with conditional `PutObject`
+requests.
+
 ## Scheduler Tuning Options
 
 | Builder | Default | Use it to control |
