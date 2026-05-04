@@ -6,7 +6,8 @@ inside your own Rust application.
 ## Install
 
 ```sh
-cargo add s3-unspool
+cargo add s3-unspool aws-config aws-sdk-s3
+cargo add tokio --features macros,rt-multi-thread
 ```
 
 ## Extract an S3 ZIP to an S3 Prefix

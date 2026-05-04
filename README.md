@@ -47,6 +47,13 @@ Add the library crate:
 cargo add s3-unspool
 ```
 
+For the Rust example below, also add the AWS SDK client crates and Tokio:
+
+```sh
+cargo add aws-config aws-sdk-s3
+cargo add tokio --features macros,rt-multi-thread
+```
+
 Install the pre-release CLI when GitHub Release artifacts are available:
 
 ```sh
