@@ -43,11 +43,11 @@ async fn main() -> s3_unspool::Result<()> {
     let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
     let client = Client::new(&config);
 
-    let mut extract = SyncOptions::new(
+    let extract = SyncOptions::new(
         S3Object::parse("s3://my-bucket/releases/site.zip")?,
         S3Prefix::parse("s3://my-bucket/www/")?,
-    );
-    extract.delete_extra = true;
+    )
+    .delete_extra_objects();
 
     let report = sync_zip_to_s3(&client, extract).await?;
     println!("changed files: {}", report.summary.uploaded_changed);
@@ -58,7 +58,7 @@ async fn main() -> s3_unspool::Result<()> {
 
 ### Extract Selected ZIP Entries
 
-Set `SyncOptions::selection` when only part of an archive should be restored.
+Use `SyncOptions::with_selection()` when only part of an archive should be restored.
 Selection patterns use gitignore-style syntax and are matched against normalized
 ZIP paths before source range planning, so `s3-unspool` only plans the source
 blocks the selection requires. Exclude-only selections restore every
@@ -92,8 +92,8 @@ async fn main() -> s3_unspool::Result<()> {
 }
 ```
 
-Selected extracts cannot be combined with `delete_extra`, because unselected
-destination objects are outside the restore scope.
+Selected extracts cannot be combined with `delete_extra_objects()`, because
+unselected destination objects are outside the restore scope.
 
 ### Upload a Directory as a Cataloged ZIP
 
@@ -169,15 +169,14 @@ The high-level extraction contract is:
 - Uploads existing S3 prefixes into generated ZIPs without local object storage.
 - Preserves ZIP directory entries and zero-byte S3 folder marker objects.
 - Emits optional progress events to handlers configured on upload options.
-- Can ignore the embedded catalog with `SyncOptions::ignore_embedded_catalog`
-  when you need to force the fallback extract-and-hash comparison path.
-- Can fail fast on destination write races with
-  `SyncOptions::fail_on_conditional_conflict`.
+- Can force the fallback extract-and-hash path with
+  `SyncOptions::force_hash_comparison()`.
+- Can fail fast on destination write races with `SyncOptions::fail_on_conflict()`.
 - Keeps source ZIP blocks in a bounded memory window and replays cached blocks
   across destination `PutObject` retries when they are still resident.
-- Exposes `SyncOptions::put_concurrency` and
-  `SyncOptions::put_retry_policy` for destination write backoff, including shared
-  throttling for S3 `SlowDown`.
+- Exposes `SyncOptions::with_put_concurrency()` and
+  `SyncOptions::with_put_retry_policy()` for destination write backoff,
+  including shared throttling for S3 `SlowDown`.
 
 ## Required S3 Permissions
 
@@ -189,7 +188,7 @@ Extraction needs:
 | Destination bucket | `s3:ListBucket` | List destination keys and ETags once. |
 | Destination prefix | `s3:PutObject` | Write missing and changed objects. |
 | Destination prefix | `s3:GetObject` | Authorize conditional overwrites with `If-Match`. |
-| Destination prefix | `s3:DeleteObject` | Only needed when `delete_extra` is enabled. |
+| Destination prefix | `s3:DeleteObject` | Only needed when `delete_extra_objects()` is enabled. |
 
 S3-prefix upload additionally needs `s3:ListBucket` for the source bucket,
 `s3:GetObject` for the source prefix, and multipart-upload write permissions for
@@ -211,21 +210,19 @@ SDK upload stalled-stream protection relaxed or disabled, and keep download
 stalled-stream protection enabled for source reads.
 
 Use `inspect_s3_zip` to read source ZIP size and file count before choosing
-memory settings. `adaptive_source_get_concurrency` and
-`adaptive_source_window_capacity` can then derive scheduler settings for
-memory-bounded runtimes such as Lambda.
+memory settings. `adaptive_source_get_concurrency` and `AdaptiveSourceWindow`
+can then derive scheduler settings for memory-bounded runtimes such as Lambda.
 
 ZIPs created by `upload_directory_zip_to_s3` include an embedded catalog at
 `.s3-unspool/catalog.v1.json`. The catalog stores each file path and MD5 digest
 so later extracts can skip unchanged files before decompressing them.
 
 Generated ZIPs use Deflate for regular file entries by default. With default
-features enabled, set `UploadOptions::compression`,
-`LocalZipOptions::compression`, `S3PrefixUploadOptions::compression`, or
-`S3PrefixLocalZipOptions::compression` to `ZipCompression::Zstd` to write
-Zstandard method 93 entries. Use `default-features = false` to compile without
-Zstd support. Zstd-in-ZIP support is not universal in OS-native ZIP tools, so
-prefer Deflate when broad compatibility matters.
+features enabled, use `with_compression(ZipCompression::Zstd)` on the relevant
+ZIP option type to write Zstandard method 93 entries. Use
+`default-features = false` to compile without Zstd support. Zstd-in-ZIP support
+is not universal in OS-native ZIP tools, so prefer Deflate when broad
+compatibility matters.
 
 Directory markers are preserved explicitly. ZIP directory entries such as
 `assets/empty/` extract to zero-byte S3 objects with trailing-slash keys, and

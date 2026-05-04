@@ -67,8 +67,8 @@ This flow has a few important properties:
   `s3:GetObject` permission because S3 authorizes `If-Match` writes against
   object-read permission.
 - Conditional write conflicts are reported and skipped by default. Library users
-  can set `SyncOptions::fail_on_conditional_conflict` to return an error on the
-  first observed conflict.
+  can set `SyncOptions::fail_on_conflict()` to return an error on the first
+  observed conflict.
 
 ## Embedded Catalog
 

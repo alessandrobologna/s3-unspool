@@ -55,58 +55,89 @@ pub(crate) async fn run_zip(
     let zip_started = Instant::now();
     let report = match (source, destination) {
         (TreeSource::Local(source_dir), ZipDestination::S3(destination)) => {
-            let mut options = unspool::UploadOptions::new(source_dir, destination);
-            options.include_catalog = include_catalog;
-            options.compression = compression;
+            let options =
+                unspool::UploadOptions::new(source_dir, destination).with_compression(compression);
+            let options = if include_catalog {
+                options
+            } else {
+                options.without_catalog()
+            };
             if dry_run {
                 ZipCommandReport::DryRun(
                     unspool::dry_run_upload_directory_zip_to_s3(options).await?,
                 )
             } else {
                 let client = s3_client().await;
-                options.progress = Some(progress);
                 ZipCommandReport::Upload(
-                    unspool::upload_directory_zip_to_s3(&client, options).await?,
+                    unspool::upload_directory_zip_to_s3(
+                        &client,
+                        options.with_progress_handler(progress.clone()),
+                    )
+                    .await?,
                 )
             }
         }
         (TreeSource::Local(source_dir), ZipDestination::Local(destination_zip)) => {
-            let mut options = unspool::LocalZipOptions::new(source_dir, destination_zip);
-            options.include_catalog = include_catalog;
-            options.compression = compression;
+            let options = unspool::LocalZipOptions::new(source_dir, destination_zip)
+                .with_compression(compression);
+            let options = if include_catalog {
+                options
+            } else {
+                options.without_catalog()
+            };
             if dry_run {
                 ZipCommandReport::DryRun(unspool::dry_run_zip_directory_to_file(options).await?)
             } else {
-                options.progress = Some(progress);
-                ZipCommandReport::Local(unspool::zip_directory_to_file(options).await?)
+                ZipCommandReport::Local(
+                    unspool::zip_directory_to_file(options.with_progress_handler(progress.clone()))
+                        .await?,
+                )
             }
         }
         (TreeSource::S3(source), ZipDestination::S3(destination)) => {
             let client = s3_client().await;
-            let mut options = unspool::S3PrefixUploadOptions::new(source, destination);
-            options.include_catalog = include_catalog;
-            options.compression = compression;
+            let options = unspool::S3PrefixUploadOptions::new(source, destination)
+                .with_compression(compression);
+            let options = if include_catalog {
+                options
+            } else {
+                options.without_catalog()
+            };
             if dry_run {
                 ZipCommandReport::DryRun(
                     unspool::dry_run_zip_s3_prefix_to_s3(&client, options).await?,
                 )
             } else {
-                options.progress = Some(progress);
-                ZipCommandReport::S3Prefix(unspool::zip_s3_prefix_to_s3(&client, options).await?)
+                ZipCommandReport::S3Prefix(
+                    unspool::zip_s3_prefix_to_s3(
+                        &client,
+                        options.with_progress_handler(progress.clone()),
+                    )
+                    .await?,
+                )
             }
         }
         (TreeSource::S3(source), ZipDestination::Local(destination_zip)) => {
             let client = s3_client().await;
-            let mut options = unspool::S3PrefixLocalZipOptions::new(source, destination_zip);
-            options.include_catalog = include_catalog;
-            options.compression = compression;
+            let options = unspool::S3PrefixLocalZipOptions::new(source, destination_zip)
+                .with_compression(compression);
+            let options = if include_catalog {
+                options
+            } else {
+                options.without_catalog()
+            };
             if dry_run {
                 ZipCommandReport::DryRun(
                     unspool::dry_run_zip_s3_prefix_to_file(&client, options).await?,
                 )
             } else {
-                options.progress = Some(progress);
-                ZipCommandReport::Local(unspool::zip_s3_prefix_to_file(&client, options).await?)
+                ZipCommandReport::Local(
+                    unspool::zip_s3_prefix_to_file(
+                        &client,
+                        options.with_progress_handler(progress.clone()),
+                    )
+                    .await?,
+                )
             }
         }
     };

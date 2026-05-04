@@ -11,7 +11,7 @@ creation.
 | Destination bucket | `s3:ListBucket` | List destination keys and ETags once. |
 | Destination prefix | `s3:PutObject` | Write missing and changed objects. |
 | Destination prefix | `s3:GetObject` | Authorize conditional overwrites with `If-Match`. |
-| Destination prefix | `s3:DeleteObject` | Only needed when `delete_extra` is enabled. |
+| Destination prefix | `s3:DeleteObject` | Only needed for CLI `--delete-extra` or library `delete_extra_objects()`. |
 
 The destination `s3:GetObject` permission is required even though `s3-unspool`
 does not issue per-file destination `HeadObject` requests or read destination

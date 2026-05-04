@@ -29,6 +29,7 @@ pub(crate) async fn run_unzip(
     let dry_run = matches.get_flag("dry-run");
     let selection = unzip_selection_from_matches(matches);
     let report_destination = ReportDestination::from_cli_value(matches.get_one::<String>("report"));
+    let collect_operations = !matches!(report_destination, ReportDestination::None);
     let source = parse_zip_source(source)?;
     let destination = parse_tree_destination(destination)?;
     validate_delete_extra_destination(delete_extra, &destination)?;
@@ -67,13 +68,29 @@ pub(crate) async fn run_unzip(
     let report = match (source, destination) {
         (ZipSource::S3(source), TreeDestination::S3(destination)) => {
             let client = s3_client().await;
-            let mut options = unspool::SyncOptions::new(source, destination);
-            options.concurrency = concurrency;
-            options.delete_extra = delete_extra;
-            options.collect_diagnostics = diagnostics;
-            options.collect_operations = !matches!(report_destination, ReportDestination::None);
-            options.ignore_embedded_catalog = ignore_catalog;
-            options.selection = selection;
+            let options = unspool::SyncOptions::new(source, destination)
+                .with_concurrency(concurrency)
+                .with_selection(selection.clone());
+            let options = if delete_extra {
+                options.delete_extra_objects()
+            } else {
+                options
+            };
+            let options = if diagnostics {
+                options.collect_diagnostics()
+            } else {
+                options
+            };
+            let options = if collect_operations {
+                options
+            } else {
+                options.without_operations()
+            };
+            let options = if ignore_catalog {
+                options.force_hash_comparison()
+            } else {
+                options
+            };
             if dry_run {
                 UnzipCommandReport::DryRun(unspool::dry_run_sync_zip_to_s3(&client, options).await?)
             } else {
@@ -82,12 +99,24 @@ pub(crate) async fn run_unzip(
         }
         (ZipSource::Local(source_zip), TreeDestination::S3(destination)) => {
             let client = s3_client().await;
-            let mut options = unspool::LocalZipSyncOptions::new(source_zip, destination);
-            options.concurrency = concurrency;
-            options.delete_extra = delete_extra;
-            options.collect_operations = !matches!(report_destination, ReportDestination::None);
-            options.ignore_embedded_catalog = ignore_catalog;
-            options.selection = selection;
+            let options = unspool::LocalZipSyncOptions::new(source_zip, destination)
+                .with_concurrency(concurrency)
+                .with_selection(selection.clone());
+            let options = if delete_extra {
+                options.delete_extra_objects()
+            } else {
+                options
+            };
+            let options = if collect_operations {
+                options
+            } else {
+                options.without_operations()
+            };
+            let options = if ignore_catalog {
+                options.force_hash_comparison()
+            } else {
+                options
+            };
             if dry_run {
                 UnzipCommandReport::DryRun(
                     unspool::dry_run_unzip_file_to_s3(&client, options).await?,
@@ -98,12 +127,24 @@ pub(crate) async fn run_unzip(
         }
         (ZipSource::S3(source), TreeDestination::Local(destination_dir)) => {
             let client = s3_client().await;
-            let mut options = unspool::S3ZipLocalUnzipOptions::new(source, destination_dir);
-            options.concurrency = concurrency;
-            options.collect_diagnostics = diagnostics;
-            options.collect_operations = !matches!(report_destination, ReportDestination::None);
-            options.ignore_embedded_catalog = ignore_catalog;
-            options.selection = selection;
+            let options = unspool::S3ZipLocalUnzipOptions::new(source, destination_dir)
+                .with_concurrency(concurrency)
+                .with_selection(selection.clone());
+            let options = if diagnostics {
+                options.collect_diagnostics()
+            } else {
+                options
+            };
+            let options = if collect_operations {
+                options
+            } else {
+                options.without_operations()
+            };
+            let options = if ignore_catalog {
+                options.force_hash_comparison()
+            } else {
+                options
+            };
             if dry_run {
                 UnzipCommandReport::DryRun(
                     unspool::dry_run_unzip_s3_zip_to_local(&client, options).await?,
@@ -113,11 +154,19 @@ pub(crate) async fn run_unzip(
             }
         }
         (ZipSource::Local(source_zip), TreeDestination::Local(destination_dir)) => {
-            let mut options = unspool::LocalUnzipOptions::new(source_zip, destination_dir);
-            options.concurrency = concurrency;
-            options.collect_operations = !matches!(report_destination, ReportDestination::None);
-            options.ignore_embedded_catalog = ignore_catalog;
-            options.selection = selection;
+            let options = unspool::LocalUnzipOptions::new(source_zip, destination_dir)
+                .with_concurrency(concurrency)
+                .with_selection(selection);
+            let options = if collect_operations {
+                options
+            } else {
+                options.without_operations()
+            };
+            let options = if ignore_catalog {
+                options.force_hash_comparison()
+            } else {
+                options
+            };
             if dry_run {
                 UnzipCommandReport::DryRun(unspool::dry_run_unzip_file_to_local(options).await?)
             } else {

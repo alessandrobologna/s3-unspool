@@ -1,7 +1,8 @@
 # Diagnostics
 
-Source and PUT diagnostics are collected only when `collect_diagnostics`,
-`--diagnostics`, or Lambda payload `"diagnostics": true` is enabled.
+Source and PUT diagnostics are collected only when
+`SyncOptions::collect_diagnostics()`, CLI `--diagnostics`, or Lambda payload
+`"diagnostics": true` is enabled.
 
 Use these fields to explain a run after it completes. They are counters and
 sizes collected from the source scheduler and destination PUT retry logic; they
