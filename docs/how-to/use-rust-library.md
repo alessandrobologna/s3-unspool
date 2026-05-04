@@ -22,11 +22,11 @@ async fn main() -> s3_unspool::Result<()> {
     let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
     let client = Client::new(&config);
 
-    let mut extract = SyncOptions::new(
+    let extract = SyncOptions::new(
         S3Object::parse("s3://my-bucket/releases/site.zip")?,
         S3Prefix::parse("s3://my-bucket/www/")?,
-    );
-    extract.collect_diagnostics = true;
+    )
+    .collect_diagnostics();
 
     let report = sync_zip_to_s3(&client, extract).await?;
     println!("changed files: {}", report.summary.uploaded_changed);

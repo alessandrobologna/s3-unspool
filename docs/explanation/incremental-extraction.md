@@ -26,9 +26,9 @@ ignored, existing destination files with comparable single-part ETags are
 handled in a hash phase. The extractor reads those entries, computes MD5, and
 adds only changed entries to the later upload phase.
 
-Use `SyncOptions::ignore_embedded_catalog = true`, CLI `--ignore-catalog`, or
-Lambda payload `"ignoreCatalog": true` to force this fallback path. This is
-useful for measuring the catalog benefit against the same source ZIP.
+Use `SyncOptions::force_hash_comparison()`, CLI `--ignore-catalog`, or Lambda
+payload `"ignoreCatalog": true` to force this fallback path. This is useful for
+measuring the catalog benefit against the same source ZIP.
 
 ## Selective Extraction
 

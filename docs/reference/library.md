@@ -19,6 +19,10 @@ local and S3 endpoints.
 | `LocalUnzipOptions` | Options for extracting a local ZIP into a local directory. |
 | `UnzipSelection` | Include/exclude patterns for selective extraction. |
 | `ZipCompression` | Compression method for generated ZIP entries. |
+| `DestinationCleanup` | Cleanup policy for unzip-to-S3 operations. |
+| `ComparisonMode` | Catalog/hash comparison policy for unzip operations. |
+| `ConflictPolicy` | Conditional write conflict handling policy. |
+| `AdaptiveSourceWindow` | Named inputs for Lambda-style source window sizing. |
 
 ## Extraction Functions
 
@@ -61,24 +65,28 @@ local and S3 endpoints.
 
 ## Options That Affect Incremental Extraction
 
-| Option | Default | Meaning |
+| Builder or Policy | Default | Meaning |
 | --- | ---: | --- |
-| `SyncOptions::ignore_embedded_catalog` | `false` | Ignore the embedded catalog and force the extract-and-hash comparison path. |
-| `SyncOptions::selection` | none | Restrict extraction to include/exclude patterns. |
-| `SyncOptions::delete_extra` | `false` | Delete destination objects that are not in the ZIP. Not allowed with selection. |
-| `SyncOptions::fail_on_conditional_conflict` | `false` | Return an error on the first destination write conflict. |
+| `with_comparison_mode(ComparisonMode::CatalogThenHash)` | enabled | Use the embedded catalog when present, then fall back to entry hashing. |
+| `force_hash_comparison()` | disabled | Ignore the embedded catalog and force the extract-and-hash comparison path. |
+| `with_selection(...)` | none | Restrict extraction to include/exclude patterns. |
+| `delete_extra_objects()` | disabled | Delete destination objects that are not in the ZIP. Not allowed with selection. |
+| `with_conflict_policy(ConflictPolicy::ReportAndContinue)` | enabled | Record destination write conflicts and continue. |
+| `fail_on_conflict()` | disabled | Return an error on the first destination write conflict. |
+| `without_operations()` | disabled | Omit per-object operation records from the returned report. |
 
 ## Scheduler Tuning Options
 
-| Option | Default | Use it to control |
+| Builder | Default | Use it to control |
 | --- | ---: | --- |
-| `SyncOptions::concurrency` | `64` | ZIP entries processed concurrently. |
-| `SyncOptions::put_concurrency` | `16` | Destination `PutObject` requests in flight. |
-| `SyncOptions::source_block_size` | 8 MiB | Maximum planned source range size. |
-| `SyncOptions::source_block_merge_gap` | 256 KiB | Nearby ZIP spans coalesced into one source range. |
-| `SyncOptions::source_get_concurrency` | `4` | Ranged source `GetObject` requests in flight. |
-| `SyncOptions::source_window_capacity` | 64 MiB | Resident source block window. |
-| `SyncOptions::put_retry_policy` | 6 attempts | Destination PUT retry and `SlowDown` backoff behavior. |
+| `with_concurrency(...)` | `64` | ZIP entries processed concurrently. |
+| `with_put_concurrency(...)` | `16` | Destination `PutObject` requests in flight. |
+| `with_source_block_size(...)` | 8 MiB | Maximum planned source range size. |
+| `with_source_block_merge_gap(...)` | 256 KiB | Nearby ZIP spans coalesced into one source range. |
+| `with_source_get_concurrency(...)` | `4` | Ranged source `GetObject` requests in flight. |
+| `with_source_window_capacity(...)` | 64 MiB | Resident source block window. |
+| `with_source_window_memory_budget_mb(...)` | unset | Derive the resident source block window from available memory. |
+| `with_put_retry_policy(...)` | 6 attempts | Destination PUT retry and `SlowDown` backoff behavior. |
 
 ## See Also
 

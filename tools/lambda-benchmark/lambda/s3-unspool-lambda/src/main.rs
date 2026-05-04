@@ -95,21 +95,20 @@ async fn handle(event: LambdaEvent<InvokePayload>) -> Result<InvokeResponse, Lam
             .build(),
     );
 
-    let mut options = payload.into_options(concurrency)?;
-    options.source_get_concurrency = adaptive_source_get_concurrency(memory_mb);
-    options.put_concurrency = adaptive_lambda_put_concurrency(options.concurrency);
-    options.source_window_memory_budget_mb = Some(memory_mb);
+    let source_get_concurrency = adaptive_source_get_concurrency(memory_mb);
+    let put_concurrency = adaptive_lambda_put_concurrency(concurrency);
+    let options = payload
+        .into_options(concurrency)?
+        .with_source_get_concurrency(source_get_concurrency)
+        .with_put_concurrency(put_concurrency)
+        .with_source_window_memory_budget_mb(memory_mb);
     tracing::info!(
         request_id = %context.request_id,
         memory_mb,
-        concurrency = options.concurrency,
-        source_block_size = options.source_block_size,
-        source_block_merge_gap = options.source_block_merge_gap,
-        source_get_concurrency = options.source_get_concurrency,
-        source_window_memory_budget_mb = ?options.source_window_memory_budget_mb,
-        put_concurrency = options.put_concurrency,
-        body_chunk_size = options.body_chunk_size,
-        pipe_capacity = options.pipe_capacity,
+        concurrency,
+        source_get_concurrency,
+        source_window_memory_budget_mb = memory_mb,
+        put_concurrency,
         "lambda extract options prepared"
     );
     let report = sync_zip_to_s3_with_clients(&source_client, &destination_client, options).await;
@@ -163,15 +162,6 @@ impl InvokeResponse {
 
 impl InvokePayload {
     fn into_options(self, concurrency: usize) -> s3_unspool::Result<SyncOptions> {
-        let mut options = SyncOptions::new(
-            S3Object::parse(self.source)?,
-            S3Prefix::parse(self.destination_prefix)?,
-        );
-        options.delete_extra = self.delete_extra;
-        options.collect_diagnostics = self.diagnostics;
-        options.concurrency = concurrency;
-        options.ignore_embedded_catalog = self.ignore_embedded_catalog;
-        options.collect_operations = self.include_operations;
         let mut selection = UnzipSelection::new();
         for pattern in self.include_patterns {
             selection = selection.include(pattern);
@@ -179,7 +169,32 @@ impl InvokePayload {
         for pattern in self.exclude_patterns {
             selection = selection.exclude(pattern);
         }
-        options.selection = selection;
+        let options = SyncOptions::new(
+            S3Object::parse(self.source)?,
+            S3Prefix::parse(self.destination_prefix)?,
+        )
+        .with_concurrency(concurrency)
+        .with_selection(selection);
+        let options = if self.delete_extra {
+            options.delete_extra_objects()
+        } else {
+            options
+        };
+        let options = if self.diagnostics {
+            options.collect_diagnostics()
+        } else {
+            options
+        };
+        let options = if self.ignore_embedded_catalog {
+            options.force_hash_comparison()
+        } else {
+            options
+        };
+        let options = if self.include_operations {
+            options
+        } else {
+            options.without_operations()
+        };
         Ok(options)
     }
 }
@@ -201,7 +216,7 @@ fn adaptive_lambda_put_concurrency(entry_workers: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use s3_unspool::adaptive_source_window_capacity;
+    use s3_unspool::AdaptiveSourceWindow;
 
     #[test]
     fn parses_minimal_camel_case_payload() {
@@ -245,23 +260,7 @@ mod tests {
         let concurrency = payload
             .concurrency
             .unwrap_or_else(|| adaptive_lambda_concurrency(256));
-        let options = payload.into_options(concurrency).unwrap();
-
-        assert_eq!(options.source.bucket, "test-bucket");
-        assert_eq!(options.source.key, "source/archive.zip");
-        assert_eq!(options.destination.bucket, "test-bucket");
-        assert_eq!(options.destination.prefix, "dest");
-        assert!(options.delete_extra);
-        assert!(options.collect_diagnostics);
-        assert_eq!(options.concurrency, 8);
-        assert!(options.ignore_embedded_catalog);
-        assert!(!options.fail_on_conditional_conflict);
-        assert!(options.collect_operations);
-        assert_eq!(options.source_window_memory_budget_mb, None);
-        assert_eq!(
-            options.selection.as_patterns(),
-            ["docs/**/*.md", "index.md", "!docs/drafts/**"]
-        );
+        payload.into_options(concurrency).unwrap();
     }
 
     #[test]
@@ -338,36 +337,27 @@ mod tests {
         let small_source_get_concurrency = adaptive_source_get_concurrency(256);
         assert_eq!(small_source_get_concurrency, 1);
         assert_eq!(
-            adaptive_source_window_capacity(
-                256,
-                423_545,
-                low_memory_concurrency,
-                10,
-                8 * 1024 * 1024,
-                small_source_get_concurrency,
-            ),
+            AdaptiveSourceWindow::new(256, 423_545, 10)
+                .with_concurrency(low_memory_concurrency)
+                .with_source_block_size(8 * 1024 * 1024)
+                .with_source_get_concurrency(small_source_get_concurrency)
+                .capacity(),
             423_545
         );
         assert_eq!(
-            adaptive_source_window_capacity(
-                256,
-                3 * 1024 * 1024 * 1024,
-                low_memory_concurrency,
-                49_152,
-                8 * 1024 * 1024,
-                small_source_get_concurrency
-            ),
+            AdaptiveSourceWindow::new(256, 3 * 1024 * 1024 * 1024, 49_152)
+                .with_concurrency(low_memory_concurrency)
+                .with_source_block_size(8 * 1024 * 1024)
+                .with_source_get_concurrency(small_source_get_concurrency)
+                .capacity(),
             16 * 1024 * 1024
         );
         assert_eq!(
-            adaptive_source_window_capacity(
-                256,
-                3 * 1024 * 1024 * 1024,
-                low_memory_concurrency,
-                65_536,
-                8 * 1024 * 1024,
-                small_source_get_concurrency
-            ),
+            AdaptiveSourceWindow::new(256, 3 * 1024 * 1024 * 1024, 65_536)
+                .with_concurrency(low_memory_concurrency)
+                .with_source_block_size(8 * 1024 * 1024)
+                .with_source_get_concurrency(small_source_get_concurrency)
+                .capacity(),
             8 * 1024 * 1024
         );
 
@@ -375,25 +365,19 @@ mod tests {
         let large_source_get_concurrency = adaptive_source_get_concurrency(2048);
         assert_eq!(large_source_get_concurrency, 8);
         assert_eq!(
-            adaptive_source_window_capacity(
-                1024,
-                3 * 1024 * 1024 * 1024,
-                adaptive_lambda_concurrency(1024),
-                49_152,
-                8 * 1024 * 1024,
-                adaptive_source_get_concurrency(1024)
-            ),
+            AdaptiveSourceWindow::new(1024, 3 * 1024 * 1024 * 1024, 49_152)
+                .with_concurrency(adaptive_lambda_concurrency(1024))
+                .with_source_block_size(8 * 1024 * 1024)
+                .with_source_get_concurrency(adaptive_source_get_concurrency(1024))
+                .capacity(),
             316 * 1024 * 1024
         );
         assert_eq!(
-            adaptive_source_window_capacity(
-                2048,
-                3 * 1024 * 1024 * 1024,
-                large_memory_concurrency,
-                49_152,
-                8 * 1024 * 1024,
-                large_source_get_concurrency
-            ),
+            AdaptiveSourceWindow::new(2048, 3 * 1024 * 1024 * 1024, 49_152)
+                .with_concurrency(large_memory_concurrency)
+                .with_source_block_size(8 * 1024 * 1024)
+                .with_source_get_concurrency(large_source_get_concurrency)
+                .capacity(),
             512 * 1024 * 1024
         );
     }

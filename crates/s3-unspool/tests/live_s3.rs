@@ -84,12 +84,12 @@ async fn run_live_sync_case(client: &Client, bucket: &str, root: &str) -> Result
     )
     .await?;
 
-    let mut options = SyncOptions::new(
+    let options = SyncOptions::new(
         S3Object::parse(format!("s3://{bucket}/{source_key}"))?,
         S3Prefix::parse(format!("s3://{bucket}/{destination_prefix}"))?,
-    );
-    options.delete_extra = true;
-    options.concurrency = 4;
+    )
+    .delete_extra_objects()
+    .with_concurrency(4);
 
     let report = sync_zip_to_s3(client, options).await?;
 
