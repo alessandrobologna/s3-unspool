@@ -128,7 +128,7 @@ fn sync_options_reject_delete_extra_at_bucket_root() {
 
     let err = validate_options(&options).unwrap_err();
 
-    assert!(err.to_string().contains("delete_extra"));
+    assert!(err.to_string().contains("delete_extra_objects"));
 }
 
 #[test]

@@ -452,11 +452,11 @@ pub async fn sync_zip_to_s3_with_clients(
         source_key = %options.source.key,
         destination_bucket = %options.destination.bucket,
         destination_prefix = %options.destination.prefix,
-        delete_extra = options.cleanup.deletes_extra(),
-        ignore_embedded_catalog = options.comparison.ignores_embedded_catalog(),
+        cleanup = ?options.cleanup,
+        comparison = ?options.comparison,
         collect_diagnostics = options.collect_diagnostics,
         collect_operations = options.collect_operations,
-        fail_on_conditional_conflict = options.conflict_policy.fails_fast(),
+        conflict_policy = ?options.conflict_policy,
         concurrency = options.concurrency,
         source_block_size = options.source_block_size,
         source_block_merge_gap = options.source_block_merge_gap,
@@ -3377,7 +3377,7 @@ fn validate_local_zip_sync_options(options: &LocalZipSyncOptions) -> Result<()> 
     validate_upload_stream_options(options.body_chunk_size, options.pipe_capacity)?;
     if options.cleanup.deletes_extra() && options.destination.prefix.is_empty() {
         return Err(Error::InvalidOption(
-            "delete_extra requires a non-empty destination prefix".to_string(),
+            "delete_extra_objects requires a non-empty destination prefix".to_string(),
         ));
     }
     if options.concurrency == 0 {
@@ -4750,7 +4750,7 @@ fn is_conditional_put_conflict(err: &SdkError<PutObjectError>) -> bool {
 pub(crate) fn validate_options(options: &SyncOptions) -> Result<()> {
     if options.cleanup.deletes_extra() && options.destination.prefix.is_empty() {
         return Err(Error::InvalidOption(
-            "delete_extra requires a non-empty destination prefix".to_string(),
+            "delete_extra_objects requires a non-empty destination prefix".to_string(),
         ));
     }
     if options.concurrency == 0 {
@@ -5386,7 +5386,7 @@ mod tests {
 
         let err = validate_local_zip_sync_options(&options).unwrap_err();
 
-        assert!(err.to_string().contains("delete_extra"));
+        assert!(err.to_string().contains("delete_extra_objects"));
     }
 
     #[tokio::test]
