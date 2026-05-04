@@ -34,8 +34,9 @@ use crate::zip_manifest::{
     count_zip_file_entries, normalize_zip_entry_path, normalize_zip_file_path,
 };
 use crate::{
-    DryRunOperationStatus, Error, LocalUnzipOptions, LocalZipOptions, ObjectReport,
-    OperationStatus, PutRetryPolicy, S3Object, S3Prefix, S3PrefixLocalZipOptions, SyncOptions,
+    ComparisonMode, ConflictPolicy, DestinationCleanup, DryRunOperationStatus, Error,
+    LocalUnzipOptions, LocalZipOptions, LocalZipSyncOptions, ObjectReport, OperationStatus,
+    PutRetryPolicy, RetryJitter, S3Object, S3Prefix, S3PrefixLocalZipOptions, SyncOptions,
     SyncReport, SyncSummary, UnzipSelection, UploadProgress, UploadProgressHandler, ZipCompression,
     dry_run_unzip_file_to_local, dry_run_zip_directory_to_file, unzip_file_to_local,
     zip_directory_to_file, zip_s3_prefix_to_file,
@@ -111,46 +112,103 @@ fn sync_options_use_embedded_catalog_by_default() {
         S3Prefix::parse("s3://bucket/destination/").unwrap(),
     );
 
-    assert!(!options.ignore_embedded_catalog);
-    assert!(!options.fail_on_conditional_conflict);
-    assert!(options.collect_operations);
+    assert_eq!(options.cleanup(), DestinationCleanup::KeepExtra);
+    assert_eq!(options.comparison_mode(), ComparisonMode::CatalogThenHash);
+    assert_eq!(options.conflict_policy(), ConflictPolicy::ReportAndContinue);
+    assert!(options.collects_operations());
+}
+
+#[test]
+fn sync_options_accessors_expose_tuning_configuration() {
+    let retry_policy = PutRetryPolicy::default()
+        .with_max_attempts(3)
+        .with_base_delay(Duration::from_millis(25))
+        .with_max_delay(Duration::from_secs(2))
+        .with_slowdown_base_delay(Duration::from_millis(250))
+        .with_slowdown_max_delay(Duration::from_secs(8))
+        .with_jitter(RetryJitter::None);
+    let options = SyncOptions::new(
+        S3Object::parse("s3://bucket/source.zip").unwrap(),
+        S3Prefix::parse("s3://bucket/destination/").unwrap(),
+    )
+    .with_concurrency(7)
+    .with_put_concurrency(5)
+    .with_put_retry_policy(retry_policy)
+    .with_source_block_size(1024)
+    .with_source_block_merge_gap(128)
+    .with_source_get_concurrency(3)
+    .with_source_window_capacity(4096)
+    .with_source_window_memory_budget_mb(512)
+    .with_body_chunk_size(2048)
+    .with_pipe_capacity(8192);
+
+    assert_eq!(options.concurrency(), 7);
+    assert_eq!(options.put_concurrency(), 5);
+    assert_eq!(options.put_retry_policy().max_attempts(), 3);
+    assert_eq!(
+        options.put_retry_policy().base_delay(),
+        Duration::from_millis(25)
+    );
+    assert_eq!(
+        options.put_retry_policy().max_delay(),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        options.put_retry_policy().slowdown_base_delay(),
+        Duration::from_millis(250)
+    );
+    assert_eq!(
+        options.put_retry_policy().slowdown_max_delay(),
+        Duration::from_secs(8)
+    );
+    assert_eq!(options.put_retry_policy().jitter(), RetryJitter::None);
+    assert_eq!(options.source_block_size(), 1024);
+    assert_eq!(options.source_block_merge_gap(), 128);
+    assert_eq!(options.source_get_concurrency(), 3);
+    assert_eq!(options.source_window_capacity(), 4096);
+    assert_eq!(options.source_window_memory_budget_mb(), Some(512));
+    assert_eq!(options.body_chunk_size(), 2048);
+    assert_eq!(options.pipe_capacity(), 8192);
 }
 
 #[test]
 fn sync_options_reject_delete_extra_at_bucket_root() {
-    let mut options = SyncOptions::new(
+    let options = SyncOptions::new(
         S3Object::parse("s3://bucket/source.zip").unwrap(),
         S3Prefix::parse("s3://bucket").unwrap(),
-    );
-    options.delete_extra = true;
+    )
+    .delete_extra_objects();
 
     let err = validate_options(&options).unwrap_err();
 
-    assert!(err.to_string().contains("delete_extra"));
+    assert!(err.to_string().contains("delete_extra_objects"));
 }
 
 #[test]
 fn sync_options_reject_oversized_stream_buffers() {
-    let mut options = SyncOptions::new(
+    let options = SyncOptions::new(
         S3Object::parse("s3://bucket/source.zip").unwrap(),
         S3Prefix::parse("s3://bucket/destination/").unwrap(),
-    );
-    options.body_chunk_size = MAX_BODY_CHUNK_SIZE + 1;
+    )
+    .with_body_chunk_size(MAX_BODY_CHUNK_SIZE + 1);
     assert!(validate_options(&options).is_err());
 
-    options.body_chunk_size = MAX_BODY_CHUNK_SIZE;
-    options.pipe_capacity = MAX_PIPE_CAPACITY + 1;
+    let options = SyncOptions::new(
+        S3Object::parse("s3://bucket/source.zip").unwrap(),
+        S3Prefix::parse("s3://bucket/destination/").unwrap(),
+    )
+    .with_body_chunk_size(MAX_BODY_CHUNK_SIZE)
+    .with_pipe_capacity(MAX_PIPE_CAPACITY + 1);
     assert!(validate_options(&options).is_err());
 }
 
 #[test]
 fn sync_options_reject_invalid_put_retry_settings() {
-    let mut options = SyncOptions::new(
+    let options = SyncOptions::new(
         S3Object::parse("s3://bucket/source.zip").unwrap(),
         S3Prefix::parse("s3://bucket/destination/").unwrap(),
-    );
-
-    options.put_concurrency = 0;
+    )
+    .with_put_concurrency(0);
     assert!(
         validate_options(&options)
             .unwrap_err()
@@ -158,8 +216,11 @@ fn sync_options_reject_invalid_put_retry_settings() {
             .contains("put_concurrency")
     );
 
-    options.put_concurrency = 1;
-    options.put_retry_policy.max_attempts = 0;
+    let options = SyncOptions::new(
+        S3Object::parse("s3://bucket/source.zip").unwrap(),
+        S3Prefix::parse("s3://bucket/destination/").unwrap(),
+    )
+    .with_put_retry_policy(PutRetryPolicy::default().with_max_attempts(0));
     assert!(
         validate_options(&options)
             .unwrap_err()
@@ -167,11 +228,15 @@ fn sync_options_reject_invalid_put_retry_settings() {
             .contains("max_attempts")
     );
 
-    options.put_retry_policy = PutRetryPolicy {
-        base_delay: Duration::from_secs(2),
-        max_delay: Duration::from_secs(1),
-        ..PutRetryPolicy::default()
-    };
+    let options = SyncOptions::new(
+        S3Object::parse("s3://bucket/source.zip").unwrap(),
+        S3Prefix::parse("s3://bucket/destination/").unwrap(),
+    )
+    .with_put_retry_policy(
+        PutRetryPolicy::default()
+            .with_base_delay(Duration::from_secs(2))
+            .with_max_delay(Duration::from_secs(1)),
+    );
     assert!(
         validate_options(&options)
             .unwrap_err()
@@ -179,11 +244,15 @@ fn sync_options_reject_invalid_put_retry_settings() {
             .contains("max_delay")
     );
 
-    options.put_retry_policy = PutRetryPolicy {
-        slowdown_base_delay: Duration::from_secs(2),
-        slowdown_max_delay: Duration::from_secs(1),
-        ..PutRetryPolicy::default()
-    };
+    let options = SyncOptions::new(
+        S3Object::parse("s3://bucket/source.zip").unwrap(),
+        S3Prefix::parse("s3://bucket/destination/").unwrap(),
+    )
+    .with_put_retry_policy(
+        PutRetryPolicy::default()
+            .with_slowdown_base_delay(Duration::from_secs(2))
+            .with_slowdown_max_delay(Duration::from_secs(1)),
+    );
     assert!(
         validate_options(&options)
             .unwrap_err()
@@ -194,12 +263,12 @@ fn sync_options_reject_invalid_put_retry_settings() {
 
 #[test]
 fn sync_options_reject_source_blocks_larger_than_window() {
-    let mut options = SyncOptions::new(
+    let options = SyncOptions::new(
         S3Object::parse("s3://bucket/source.zip").unwrap(),
         S3Prefix::parse("s3://bucket/destination/").unwrap(),
-    );
-    options.source_window_capacity = 8;
-    options.source_block_size = 16;
+    )
+    .with_source_window_capacity(8)
+    .with_source_block_size(16);
 
     let err = validate_source_range_options(&options, 64).unwrap_err();
 
@@ -208,12 +277,12 @@ fn sync_options_reject_source_blocks_larger_than_window() {
 
 #[test]
 fn sync_options_allow_large_source_block_for_small_source_zip() {
-    let mut options = SyncOptions::new(
+    let options = SyncOptions::new(
         S3Object::parse("s3://bucket/source.zip").unwrap(),
         S3Prefix::parse("s3://bucket/destination/").unwrap(),
-    );
-    options.source_window_capacity = 8;
-    options.source_block_size = 16;
+    )
+    .with_source_window_capacity(8)
+    .with_source_block_size(16);
 
     validate_source_range_options(&options, 8).unwrap();
 }
@@ -223,16 +292,16 @@ fn adaptive_source_window_resolves_after_manifest_count_is_known() {
     let mut options = SyncOptions::new(
         S3Object::parse("s3://bucket/source.zip").unwrap(),
         S3Prefix::parse("s3://bucket/destination/").unwrap(),
-    );
-    options.source_window_capacity = 123;
-    options.source_window_memory_budget_mb = Some(256);
-    options.concurrency = 6;
-    options.source_get_concurrency = 1;
-    options.source_block_size = 8 * 1024 * 1024;
+    )
+    .with_source_window_capacity(123)
+    .with_source_window_memory_budget_mb(256)
+    .with_concurrency(6)
+    .with_source_get_concurrency(1)
+    .with_source_block_size(8 * 1024 * 1024);
 
     resolve_source_window_capacity(&mut options, 3 * 1024 * 1024 * 1024, 49_152);
 
-    assert_eq!(options.source_window_capacity, 16 * 1024 * 1024);
+    assert_eq!(options.source_window_capacity(), 16 * 1024 * 1024);
 }
 
 #[test]
@@ -608,8 +677,7 @@ async fn local_zip_can_disable_embedded_catalog() {
         .await
         .unwrap();
 
-    let mut options = LocalZipOptions::new(&root, &destination_zip);
-    options.include_catalog = false;
+    let options = LocalZipOptions::new(&root, &destination_zip).without_catalog();
     let report = zip_directory_to_file(options).await.unwrap();
     assert!(!report.include_catalog);
 
@@ -1075,8 +1143,7 @@ async fn local_unzip_creates_shared_missing_parent_concurrently() {
         .collect::<Vec<_>>();
     let zip_bytes = test_zip(&borrowed_entries).await;
     tokio::fs::write(&source_zip, zip_bytes).await.unwrap();
-    let mut options = LocalUnzipOptions::new(&source_zip, &destination);
-    options.concurrency = 64;
+    let options = LocalUnzipOptions::new(&source_zip, &destination).with_concurrency(64);
 
     let report = unzip_file_to_local(options).await.unwrap();
 
@@ -1884,6 +1951,34 @@ fn conditional_conflict_error_respects_fail_fast_option() {
 
     assert!(conditional_conflict_error(&destination, &operation, false).is_none());
     let err = conditional_conflict_error(&destination, &operation, true).unwrap();
+
+    assert_eq!(
+        err.to_string(),
+        "conditional write failed for s3://bucket/destination/file.txt: PreconditionFailed"
+    );
+}
+
+#[test]
+fn local_zip_sync_options_support_fail_fast_conflict_policy() {
+    let destination = S3Prefix::parse("s3://bucket/destination/").unwrap();
+    let options = LocalZipSyncOptions::new("source.zip", destination.clone()).fail_on_conflict();
+    let operation = ObjectReport {
+        status: OperationStatus::ConditionalConflict,
+        key: "destination/file.txt".to_string(),
+        zip_path: Some("file.txt".to_string()),
+        size: Some(12),
+        md5: None,
+        destination_etag: Some("old-etag".to_string()),
+        message: Some("PreconditionFailed".to_string()),
+    };
+
+    assert_eq!(options.conflict_policy(), ConflictPolicy::FailFast);
+    let err = conditional_conflict_error(
+        &destination,
+        &operation,
+        options.conflict_policy().fails_fast(),
+    )
+    .unwrap();
 
     assert_eq!(
         err.to_string(),

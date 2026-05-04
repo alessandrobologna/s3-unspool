@@ -3,12 +3,18 @@
 `s3-unspool` is a Rust crate for fast, streaming extraction of large ZIP
 archives from S3 into S3 prefixes.
 
-It is designed for large archives and low scratch-space environments: the source
-ZIP is read with ranged S3 `GetObject` calls, and extracted files can be
-streamed directly into S3 `PutObject` requests or written to a local directory.
-The crate also includes zip helpers that stream a local directory or existing S3
+This crate README focuses on the Rust API surface and the behavior a library
+consumer needs to know before embedding `s3-unspool`.
+
+The crate is designed for large archives and environments with limited local
+storage. It reads the source ZIP with ranged S3 `GetObject` calls, and streams
+extracted files directly into S3 `PutObject` requests or a local directory. The
+crate also includes zip helpers that stream a local directory or existing S3
 prefix into a local or S3 ZIP and embed the catalog used by later incremental
 extracts.
+
+For CLI usage, benchmark tooling, repository layout, and economics discussion,
+see the [project README](../../README.md).
 
 ## Install
 
@@ -17,6 +23,9 @@ cargo add s3-unspool
 ```
 
 ## Examples
+
+These examples show the most common S3 workflows. Local endpoint combinations
+are available through the same crate and through the `s3-unspool` CLI.
 
 ### Extract an S3 ZIP to a Destination Prefix
 
@@ -34,11 +43,11 @@ async fn main() -> s3_unspool::Result<()> {
     let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
     let client = Client::new(&config);
 
-    let mut extract = SyncOptions::new(
+    let extract = SyncOptions::new(
         S3Object::parse("s3://my-bucket/releases/site.zip")?,
         S3Prefix::parse("s3://my-bucket/www/")?,
-    );
-    extract.delete_extra = true;
+    )
+    .delete_extra_objects();
 
     let report = sync_zip_to_s3(&client, extract).await?;
     println!("changed files: {}", report.summary.uploaded_changed);
@@ -47,11 +56,50 @@ async fn main() -> s3_unspool::Result<()> {
 }
 ```
 
+### Extract Selected ZIP Entries
+
+Use `SyncOptions::with_selection()` when only part of an archive should be restored.
+Selection patterns use gitignore-style syntax and are matched against normalized
+ZIP paths before source range planning, so `s3-unspool` only plans the source
+blocks the selection requires. Exclude-only selections restore every
+non-excluded ZIP entry.
+
+```rust
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::Client;
+use s3_unspool::{S3Object, S3Prefix, SyncOptions, UnzipSelection, sync_zip_to_s3};
+
+#[tokio::main]
+async fn main() -> s3_unspool::Result<()> {
+    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let client = Client::new(&config);
+
+    let extract = SyncOptions::new(
+        S3Object::parse("s3://my-bucket/releases/site.zip")?,
+        S3Prefix::parse("s3://my-bucket/www/")?,
+    )
+    .with_selection(
+        UnzipSelection::new()
+            .include("index.md")
+            .include("docs/**/*.md")
+            .exclude("docs/drafts/**"),
+    );
+
+    let report = sync_zip_to_s3(&client, extract).await?;
+    println!("processed entries: {}", report.summary.zip_files);
+
+    Ok(())
+}
+```
+
+Selected extracts cannot be combined with `delete_extra_objects()`, because
+unselected destination objects are outside the restore scope.
+
 ### Upload a Directory as a Cataloged ZIP
 
 Use `upload_directory_zip_to_s3` when you want the crate to produce the source
-ZIP and embed the catalog used by fast future extracts. Empty local directories
-are written as ZIP directory entries.
+ZIP and embed the catalog used by later incremental extracts. Empty local
+directories are written as ZIP directory entries.
 
 ```rust
 use aws_config::BehaviorVersion;
@@ -105,6 +153,8 @@ async fn main() -> s3_unspool::Result<()> {
 
 ## Behavior
 
+The high-level extraction contract is:
+
 - Reads source ZIP data with ranged S3 `GetObject` requests.
 - Lists the destination prefix once with `ListObjectsV2`.
 - Uses listed destination ETags instead of per-object `HeadObject` calls.
@@ -118,16 +168,16 @@ async fn main() -> s3_unspool::Result<()> {
 - Uploads generated source ZIPs with S3 multipart upload.
 - Uploads existing S3 prefixes into generated ZIPs without local object storage.
 - Preserves ZIP directory entries and zero-byte S3 folder marker objects.
-- Emits optional upload progress events through upload option progress handlers.
-- Can ignore the embedded catalog with `SyncOptions::ignore_embedded_catalog`
-  when you need to force the fallback extract-and-hash comparison path.
-- Can fail fast on destination write races with
-  `SyncOptions::fail_on_conditional_conflict`.
-- Keeps source ZIP blocks in a bounded memory window and reuses cached blocks
-  across destination `PutObject` retries when possible.
-- Exposes `SyncOptions::put_concurrency` and
-  `SyncOptions::put_retry_policy` for destination write backoff, including shared
-  throttling for S3 `SlowDown`.
+- Emits optional progress events to handlers configured on upload options.
+- Can force the fallback extract-and-hash path with
+  `SyncOptions::force_hash_comparison()`.
+- Can fail fast on destination write races with `SyncOptions::fail_on_conflict()`
+  or `LocalZipSyncOptions::fail_on_conflict()`.
+- Keeps source ZIP blocks in a bounded memory window and replays cached blocks
+  across destination `PutObject` retries when they are still resident.
+- Exposes `SyncOptions::with_put_concurrency()` and
+  `SyncOptions::with_put_retry_policy()` for destination write backoff,
+  including shared throttling for S3 `SlowDown`.
 
 ## Required S3 Permissions
 
@@ -139,7 +189,7 @@ Extraction needs:
 | Destination bucket | `s3:ListBucket` | List destination keys and ETags once. |
 | Destination prefix | `s3:PutObject` | Write missing and changed objects. |
 | Destination prefix | `s3:GetObject` | Authorize conditional overwrites with `If-Match`. |
-| Destination prefix | `s3:DeleteObject` | Only needed when `delete_extra` is enabled. |
+| Destination prefix | `s3:DeleteObject` | Only needed when `delete_extra_objects()` is enabled. |
 
 S3-prefix upload additionally needs `s3:ListBucket` for the source bucket,
 `s3:GetObject` for the source prefix, and multipart-upload write permissions for
@@ -155,31 +205,25 @@ destination object bodies. S3 authorizes `PutObject` requests with
 
 Use `sync_zip_to_s3_with_clients` when source ranged reads and destination
 streaming writes should use different S3 client configuration. This is useful
-for high-concurrency extraction, where the destination client may disable AWS
-SDK upload stalled-stream protection while the source client keeps download
-protection enabled.
+for high-concurrency extraction, where a destination request body can pause
+while waiting for planned ZIP bytes. Configure the destination client with AWS
+SDK upload stalled-stream protection relaxed or disabled, and keep download
+stalled-stream protection enabled for source reads.
 
 Use `inspect_s3_zip` to read source ZIP size and file count before choosing
-memory settings. `adaptive_source_get_concurrency` and
-`adaptive_source_window_capacity` can then derive scheduler settings for
-memory-bounded runtimes such as Lambda.
-
-For high-concurrency extracts, configure the destination S3 client so AWS SDK
-upload stalled-stream protection is relaxed or disabled. The source scheduler can
-legitimately pause a destination body while waiting for planned ZIP bytes. Keep
-download stalled-stream protection enabled for source reads.
+memory settings. `adaptive_source_get_concurrency` and `AdaptiveSourceWindow`
+can then derive scheduler settings for memory-bounded runtimes such as Lambda.
 
 ZIPs created by `upload_directory_zip_to_s3` include an embedded catalog at
 `.s3-unspool/catalog.v1.json`. The catalog stores each file path and MD5 digest
 so later extracts can skip unchanged files before decompressing them.
 
 Generated ZIPs use Deflate for regular file entries by default. With default
-features enabled, set `UploadOptions::compression`,
-`LocalZipOptions::compression`, `S3PrefixUploadOptions::compression`, or
-`S3PrefixLocalZipOptions::compression` to `ZipCompression::Zstd` to write
-Zstandard method 93 entries. Use `default-features = false` to compile without
-Zstd support. Zstd-in-ZIP support is not universal in OS-native ZIP tools, so
-prefer Deflate when broad compatibility matters.
+features enabled, use `with_compression(ZipCompression::Zstd)` on the relevant
+ZIP option type to write Zstandard method 93 entries. Use
+`default-features = false` to compile without Zstd support. Zstd-in-ZIP support
+is not universal in OS-native ZIP tools, so prefer Deflate when broad
+compatibility matters.
 
 Directory markers are preserved explicitly. ZIP directory entries such as
 `assets/empty/` extract to zero-byte S3 objects with trailing-slash keys, and

@@ -15,8 +15,8 @@
 //! changed objects are uploaded with `If-Match` against the listed destination
 //! ETag so newer destination data is not overwritten accidentally.
 //! Conditional write conflicts are recorded and skipped by default; set
-//! [`SyncOptions::fail_on_conditional_conflict`] to return an error on the first
-//! observed conflict.
+//! [`SyncOptions::fail_on_conflict`] or [`LocalZipSyncOptions::fail_on_conflict`]
+//! to return an error on the first observed conflict.
 //!
 //! Conditional overwrites require `s3:GetObject` permission on destination
 //! objects as well as `s3:PutObject`. `s3-unspool` does not issue per-file
@@ -33,24 +33,23 @@
 //!
 //! [`inspect_s3_zip`] reads source ZIP size and file count without downloading
 //! the archive. It is useful before choosing memory-sensitive scheduler options
-//! such as [`SyncOptions::source_window_capacity`] or
-//! [`SyncOptions::source_window_memory_budget_mb`].
+//! with [`AdaptiveSourceWindow`] or
+//! [`SyncOptions::with_source_window_memory_budget_mb`].
 //!
 //! ZIPs created with [`upload_directory_zip_to_s3`], [`zip_directory_to_file`],
 //! [`zip_s3_prefix_to_s3`], or [`zip_s3_prefix_to_file`] include an embedded catalog at
 //! [`EMBEDDED_CATALOG_PATH`] by default. The catalog stores each file path and
 //! MD5 digest so later extracts can skip unchanged files before decompressing
-//! them. Set [`SyncOptions::ignore_embedded_catalog`] when you need to measure
+//! them. Set [`SyncOptions::force_hash_comparison`] when you need to measure
 //! or force the fallback extract-and-hash path.
 //!
-//! Set [`SyncOptions::selection`] or the equivalent local unzip option field
+//! Set [`SyncOptions::with_selection`] or the equivalent local unzip option
 //! when only a subset of ZIP paths should be restored. Selection patterns use
 //! gitignore-style syntax and are applied before source range planning, so
 //! ranged `GetObject` requests are planned only for selected entries that still
 //! need source bytes. Exclude-only selections restore every non-excluded ZIP
-//! path. Selected extracts reject
-//! [`SyncOptions::delete_extra`] because unselected destination objects are
-//! outside the restore scope.
+//! path. Selected extracts reject [`SyncOptions::delete_extra_objects`] because
+//! unselected destination objects are outside the restore scope.
 //!
 //! ZIP directory entries round-trip as zero-byte S3 marker objects whose keys
 //! end in `/`. Local upload preserves empty directories as ZIP directory
@@ -69,11 +68,11 @@
 //! let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
 //! let client = Client::new(&config);
 //!
-//! let mut extract = SyncOptions::new(
+//! let extract = SyncOptions::new(
 //!     S3Object::parse("s3://my-bucket/releases/site.zip")?,
 //!     S3Prefix::parse("s3://my-bucket/www/")?,
-//! );
-//! extract.delete_extra = true;
+//! )
+//! .delete_extra_objects();
 //!
 //! let report = sync_zip_to_s3(&client, extract).await?;
 //! println!("uploaded changed files: {}", report.summary.uploaded_changed);
@@ -182,10 +181,10 @@ pub use extract::{
 };
 pub use inspect::{S3ZipInfo, inspect_s3_zip};
 pub use options::{
-    LocalUnzipOptions, LocalZipOptions, LocalZipSyncOptions, PutRetryPolicy, RetryJitter,
-    S3PrefixLocalZipOptions, S3PrefixUploadOptions, S3ZipLocalUnzipOptions, SyncOptions,
-    UnzipSelection, UploadOptions, UploadProgress, UploadProgressHandler, ZipCompression,
-    adaptive_source_get_concurrency, adaptive_source_window_capacity,
+    AdaptiveSourceWindow, ComparisonMode, ConflictPolicy, DestinationCleanup, LocalUnzipOptions,
+    LocalZipOptions, LocalZipSyncOptions, PutRetryPolicy, RetryJitter, S3PrefixLocalZipOptions,
+    S3PrefixUploadOptions, S3ZipLocalUnzipOptions, SyncOptions, UnzipSelection, UploadOptions,
+    UploadProgress, UploadProgressHandler, ZipCompression, adaptive_source_get_concurrency,
 };
 pub use report::{
     DryRunDiagnostics, DryRunObjectReport, DryRunOperationStatus, LocalUnzipDiagnostics,

@@ -54,8 +54,8 @@ use crate::constants::{MAX_BODY_CHUNK_SIZE, MAX_PIPE_CAPACITY};
 use crate::entry_reader::{EntryReader, entry_reader};
 use crate::error::{Error, Result, aws_error_context, aws_error_message};
 use crate::options::{
-    LocalUnzipOptions, LocalZipSyncOptions, PutRetryPolicy, RetryJitter, S3ZipLocalUnzipOptions,
-    SyncOptions, UnzipSelection, adaptive_source_window_capacity,
+    AdaptiveSourceWindow, LocalUnzipOptions, LocalZipSyncOptions, PutRetryPolicy, RetryJitter,
+    S3ZipLocalUnzipOptions, SyncOptions, UnzipSelection,
 };
 use crate::range::{
     BlockStore, SourceClient, SourceDiagnosticsCollector, plan_source_blocks,
@@ -445,18 +445,18 @@ pub async fn sync_zip_to_s3_with_clients(
 ) -> Result<SyncReport> {
     validate_options(&options)?;
     let selection = normalize_unzip_selection(&options.selection)?;
-    validate_delete_extra_selection(options.delete_extra, &selection)?;
+    validate_delete_extra_selection(options.cleanup.deletes_extra(), &selection)?;
     let started = Instant::now();
     tracing::info!(
         source_bucket = %options.source.bucket,
         source_key = %options.source.key,
         destination_bucket = %options.destination.bucket,
         destination_prefix = %options.destination.prefix,
-        delete_extra = options.delete_extra,
-        ignore_embedded_catalog = options.ignore_embedded_catalog,
+        cleanup = ?options.cleanup,
+        comparison = ?options.comparison,
         collect_diagnostics = options.collect_diagnostics,
         collect_operations = options.collect_operations,
-        fail_on_conditional_conflict = options.fail_on_conditional_conflict,
+        conflict_policy = ?options.conflict_policy,
         concurrency = options.concurrency,
         source_block_size = options.source_block_size,
         source_block_merge_gap = options.source_block_merge_gap,
@@ -503,7 +503,7 @@ pub async fn sync_zip_to_s3_with_clients(
         load_zip_manifest(
             Arc::clone(&source),
             &options.destination,
-            options.ignore_embedded_catalog,
+            options.comparison.ignores_embedded_catalog(),
             options.source_block_size,
             Some(crate::constants::S3_SINGLE_PUT_LIMIT),
         )
@@ -512,7 +512,7 @@ pub async fn sync_zip_to_s3_with_clients(
         load_zip_manifest_with_filter(
             Arc::clone(&source),
             &options.destination,
-            options.ignore_embedded_catalog,
+            options.comparison.ignores_embedded_catalog(),
             options.source_block_size,
             Some(crate::constants::S3_SINGLE_PUT_LIMIT),
             |entry| selection.matches(entry),
@@ -543,7 +543,7 @@ pub async fn sync_zip_to_s3_with_clients(
         "destination prefix listed"
     );
     let total_entries = entries.len();
-    let expected_keys = options.delete_extra.then(|| {
+    let expected_keys = options.cleanup.deletes_extra().then(|| {
         entries
             .iter()
             .map(|entry| entry.key.clone())
@@ -667,7 +667,7 @@ pub async fn sync_zip_to_s3_with_clients(
         return Err(err);
     }
 
-    if options.delete_extra {
+    if options.cleanup.deletes_extra() {
         let expected_keys = expected_keys.expect("delete-extra expected keys are prepared");
         let extras = destination_objects
             .keys()
@@ -766,7 +766,7 @@ pub async fn unzip_file_to_s3(
 ) -> Result<LocalZipToS3Report> {
     validate_local_zip_sync_options(&options)?;
     let selection = normalize_unzip_selection(&options.selection)?;
-    validate_delete_extra_selection(options.delete_extra, &selection)?;
+    validate_delete_extra_selection(options.cleanup.deletes_extra(), &selection)?;
     let reader = open_local_zip_reader(&options.source_zip).await?;
     let source_len = tokio::fs::metadata(&options.source_zip).await?.len();
     let mut entries = local_zip_entries_for_s3(
@@ -776,13 +776,13 @@ pub async fn unzip_file_to_s3(
         true,
         |entry| selection.matches(entry),
     )?;
-    if !options.ignore_embedded_catalog {
+    if !options.comparison.ignores_embedded_catalog() {
         let catalog = load_local_embedded_catalog(&reader, entries.catalog_index).await;
         apply_local_catalog(&mut entries.entries, catalog);
     }
 
     let destination_objects = list_destination(client, &options.destination).await?;
-    let expected_keys = options.delete_extra.then(|| {
+    let expected_keys = options.cleanup.deletes_extra().then(|| {
         entries
             .entries
             .iter()
@@ -796,6 +796,7 @@ pub async fn unzip_file_to_s3(
         ..SyncSummary::default()
     };
     let mut operations = Vec::new();
+    let mut fail_fast_error = None;
 
     let mut stream = stream::iter(entries.entries)
         .map(|entry| {
@@ -805,13 +806,27 @@ pub async fn unzip_file_to_s3(
 
     while let Some(operation) = stream.next().await {
         summarize_operation(&mut summary, &operation);
+        if let Some(err) = conditional_conflict_error(
+            &options.destination,
+            &operation,
+            options.conflict_policy.fails_fast(),
+        ) {
+            fail_fast_error = Some(err);
+        }
         if options.collect_operations {
             operations.push(operation);
+        }
+        if fail_fast_error.is_some() {
+            break;
         }
     }
     drop(stream);
 
-    if options.delete_extra {
+    if let Some(err) = fail_fast_error {
+        return Err(err);
+    }
+
+    if options.cleanup.deletes_extra() {
         let expected_keys = expected_keys.expect("delete-extra expected keys are prepared");
         let extras = destination_objects
             .keys()
@@ -867,7 +882,7 @@ pub async fn unzip_s3_zip_to_local(
         load_zip_manifest(
             Arc::clone(&source),
             &local_destination,
-            options.ignore_embedded_catalog,
+            options.comparison.ignores_embedded_catalog(),
             options.source_block_size,
             None,
         )
@@ -876,7 +891,7 @@ pub async fn unzip_s3_zip_to_local(
         load_zip_manifest_with_filter(
             Arc::clone(&source),
             &local_destination,
-            options.ignore_embedded_catalog,
+            options.comparison.ignores_embedded_catalog(),
             options.source_block_size,
             None,
             |entry| selection.matches(entry),
@@ -1025,7 +1040,7 @@ pub async fn dry_run_sync_zip_to_s3_with_clients(
 ) -> Result<UnzipDryRunReport> {
     validate_options(&options)?;
     let selection = normalize_unzip_selection(&options.selection)?;
-    validate_delete_extra_selection(options.delete_extra, &selection)?;
+    validate_delete_extra_selection(options.cleanup.deletes_extra(), &selection)?;
     let source_head = head_source(source_client, &options.source).await?;
     let diagnostics = options
         .collect_diagnostics
@@ -1043,7 +1058,7 @@ pub async fn dry_run_sync_zip_to_s3_with_clients(
         load_zip_manifest(
             Arc::clone(&source),
             &options.destination,
-            options.ignore_embedded_catalog,
+            options.comparison.ignores_embedded_catalog(),
             options.source_block_size,
             Some(crate::constants::S3_SINGLE_PUT_LIMIT),
         )
@@ -1052,7 +1067,7 @@ pub async fn dry_run_sync_zip_to_s3_with_clients(
         load_zip_manifest_with_filter(
             Arc::clone(&source),
             &options.destination,
-            options.ignore_embedded_catalog,
+            options.comparison.ignores_embedded_catalog(),
             options.source_block_size,
             Some(crate::constants::S3_SINGLE_PUT_LIMIT),
             |entry| selection.matches(entry),
@@ -1065,7 +1080,7 @@ pub async fn dry_run_sync_zip_to_s3_with_clients(
     let destination_objects = list_destination(destination_client, &options.destination).await?;
     let entries = manifest.entries;
     let total_entries = entries.len();
-    let expected_keys = options.delete_extra.then(|| {
+    let expected_keys = options.cleanup.deletes_extra().then(|| {
         entries
             .iter()
             .map(|entry| entry.key.clone())
@@ -1120,7 +1135,7 @@ pub async fn dry_run_sync_zip_to_s3_with_clients(
         );
     }
 
-    if options.delete_extra {
+    if options.cleanup.deletes_extra() {
         let expected_keys = expected_keys.expect("delete-extra expected keys are prepared");
         for key in destination_objects
             .keys()
@@ -1158,7 +1173,7 @@ pub async fn dry_run_unzip_file_to_s3(
 ) -> Result<UnzipDryRunReport> {
     validate_local_zip_sync_options(&options)?;
     let selection = normalize_unzip_selection(&options.selection)?;
-    validate_delete_extra_selection(options.delete_extra, &selection)?;
+    validate_delete_extra_selection(options.cleanup.deletes_extra(), &selection)?;
     let reader = open_local_zip_reader(&options.source_zip).await?;
     let source_len = tokio::fs::metadata(&options.source_zip).await?.len();
     let mut entries = local_zip_entries_for_s3(
@@ -1168,13 +1183,13 @@ pub async fn dry_run_unzip_file_to_s3(
         true,
         |entry| selection.matches(entry),
     )?;
-    if !options.ignore_embedded_catalog {
+    if !options.comparison.ignores_embedded_catalog() {
         let catalog = load_local_embedded_catalog(&reader, entries.catalog_index).await;
         apply_local_catalog(&mut entries.entries, catalog);
     }
 
     let destination_objects = list_destination(client, &options.destination).await?;
-    let expected_keys = options.delete_extra.then(|| {
+    let expected_keys = options.cleanup.deletes_extra().then(|| {
         entries
             .entries
             .iter()
@@ -1203,7 +1218,7 @@ pub async fn dry_run_unzip_file_to_s3(
     }
     drop(stream);
 
-    if options.delete_extra {
+    if options.cleanup.deletes_extra() {
         let expected_keys = expected_keys.expect("delete-extra expected keys are prepared");
         for key in destination_objects
             .keys()
@@ -1256,7 +1271,7 @@ pub async fn dry_run_unzip_s3_zip_to_local(
         load_zip_manifest(
             Arc::clone(&source),
             &local_destination,
-            options.ignore_embedded_catalog,
+            options.comparison.ignores_embedded_catalog(),
             options.source_block_size,
             None,
         )
@@ -1265,7 +1280,7 @@ pub async fn dry_run_unzip_s3_zip_to_local(
         load_zip_manifest_with_filter(
             Arc::clone(&source),
             &local_destination,
-            options.ignore_embedded_catalog,
+            options.comparison.ignores_embedded_catalog(),
             options.source_block_size,
             None,
             |entry| selection.matches(entry),
@@ -3375,9 +3390,9 @@ async fn reject_existing_symlink_or_directory(path: &Path) -> Result<()> {
 
 fn validate_local_zip_sync_options(options: &LocalZipSyncOptions) -> Result<()> {
     validate_upload_stream_options(options.body_chunk_size, options.pipe_capacity)?;
-    if options.delete_extra && options.destination.prefix.is_empty() {
+    if options.cleanup.deletes_extra() && options.destination.prefix.is_empty() {
         return Err(Error::InvalidOption(
-            "delete_extra requires a non-empty destination prefix".to_string(),
+            "delete_extra_objects requires a non-empty destination prefix".to_string(),
         ));
     }
     if options.concurrency == 0 {
@@ -3431,14 +3446,12 @@ fn resolve_s3_zip_local_window_capacity(
     zip_file_count: usize,
 ) {
     if let Some(memory_mb) = options.source_window_memory_budget_mb {
-        options.source_window_capacity = adaptive_source_window_capacity(
-            memory_mb,
-            source_zip_bytes,
-            options.concurrency,
-            zip_file_count,
-            options.source_block_size,
-            options.source_get_concurrency,
-        );
+        options.source_window_capacity =
+            AdaptiveSourceWindow::new(memory_mb, source_zip_bytes, zip_file_count)
+                .with_concurrency(options.concurrency)
+                .with_source_block_size(options.source_block_size)
+                .with_source_get_concurrency(options.source_get_concurrency)
+                .capacity();
     }
 }
 
@@ -3451,7 +3464,7 @@ fn local_unzip_source_sync_options(options: &S3ZipLocalUnzipOptions) -> SyncOpti
         },
     );
     sync.collect_diagnostics = options.collect_diagnostics;
-    sync.ignore_embedded_catalog = options.ignore_embedded_catalog;
+    sync.comparison = options.comparison;
     sync.collect_operations = options.collect_operations;
     sync.concurrency = options.concurrency;
     sync.source_block_size = options.source_block_size;
@@ -3542,7 +3555,7 @@ fn record_operation(
     if let Some(err) = conditional_conflict_error(
         &options.destination,
         &operation,
-        options.fail_on_conditional_conflict,
+        options.conflict_policy.fails_fast(),
     ) {
         *fail_fast_error = Some(err);
     }
@@ -3852,7 +3865,7 @@ async fn run_upload_phase(
     while let Some(report) = stream.next().await {
         observers.progress.record_operation(&report);
         log_operation_issue(&report, &observers.progress);
-        stopped_early = options.fail_on_conditional_conflict
+        stopped_early = options.conflict_policy.fails_fast()
             && report.status == OperationStatus::ConditionalConflict;
         reports.push(report);
         if stopped_early {
@@ -4750,9 +4763,9 @@ fn is_conditional_put_conflict(err: &SdkError<PutObjectError>) -> bool {
 }
 
 pub(crate) fn validate_options(options: &SyncOptions) -> Result<()> {
-    if options.delete_extra && options.destination.prefix.is_empty() {
+    if options.cleanup.deletes_extra() && options.destination.prefix.is_empty() {
         return Err(Error::InvalidOption(
-            "delete_extra requires a non-empty destination prefix".to_string(),
+            "delete_extra_objects requires a non-empty destination prefix".to_string(),
         ));
     }
     if options.concurrency == 0 {
@@ -4825,14 +4838,12 @@ pub(crate) fn resolve_source_window_capacity(
     let Some(memory_mb) = options.source_window_memory_budget_mb else {
         return;
     };
-    options.source_window_capacity = adaptive_source_window_capacity(
-        memory_mb,
-        source_zip_bytes,
-        options.concurrency,
-        zip_file_count,
-        options.source_block_size,
-        options.source_get_concurrency,
-    );
+    options.source_window_capacity =
+        AdaptiveSourceWindow::new(memory_mb, source_zip_bytes, zip_file_count)
+            .with_concurrency(options.concurrency)
+            .with_source_block_size(options.source_block_size)
+            .with_source_get_concurrency(options.source_get_concurrency)
+            .capacity();
 }
 
 fn validate_put_retry_policy(policy: &PutRetryPolicy) -> Result<()> {
@@ -5382,15 +5393,15 @@ mod tests {
 
     #[test]
     fn local_zip_sync_options_reject_delete_extra_at_bucket_root() {
-        let mut options = LocalZipSyncOptions::new(
+        let options = LocalZipSyncOptions::new(
             "source.zip",
             S3Prefix::parse("s3://destination-bucket").unwrap(),
-        );
-        options.delete_extra = true;
+        )
+        .delete_extra_objects();
 
         let err = validate_local_zip_sync_options(&options).unwrap_err();
 
-        assert!(err.to_string().contains("delete_extra"));
+        assert!(err.to_string().contains("delete_extra_objects"));
     }
 
     #[tokio::test]
