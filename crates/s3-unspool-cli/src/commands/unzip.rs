@@ -65,12 +65,12 @@ pub(crate) async fn run_unzip(
         },
         None,
     );
-    let report = match (source, destination) {
-        (ZipSource::S3(source), TreeDestination::S3(destination)) => {
+    let report = match (source, destination, selection) {
+        (ZipSource::S3(source), TreeDestination::S3(destination), selection) => {
             let client = s3_client().await;
             let options = unspool::SyncOptions::new(source, destination)
                 .with_concurrency(concurrency)
-                .with_selection(selection.clone());
+                .with_selection(selection);
             let options = if delete_extra {
                 options.delete_extra_objects()
             } else {
@@ -97,11 +97,11 @@ pub(crate) async fn run_unzip(
                 UnzipCommandReport::S3(unspool::sync_zip_to_s3(&client, options).await?)
             }
         }
-        (ZipSource::Local(source_zip), TreeDestination::S3(destination)) => {
+        (ZipSource::Local(source_zip), TreeDestination::S3(destination), selection) => {
             let client = s3_client().await;
             let options = unspool::LocalZipSyncOptions::new(source_zip, destination)
                 .with_concurrency(concurrency)
-                .with_selection(selection.clone());
+                .with_selection(selection);
             let options = if delete_extra {
                 options.delete_extra_objects()
             } else {
@@ -125,11 +125,11 @@ pub(crate) async fn run_unzip(
                 UnzipCommandReport::LocalZipToS3(unspool::unzip_file_to_s3(&client, options).await?)
             }
         }
-        (ZipSource::S3(source), TreeDestination::Local(destination_dir)) => {
+        (ZipSource::S3(source), TreeDestination::Local(destination_dir), selection) => {
             let client = s3_client().await;
             let options = unspool::S3ZipLocalUnzipOptions::new(source, destination_dir)
                 .with_concurrency(concurrency)
-                .with_selection(selection.clone());
+                .with_selection(selection);
             let options = if diagnostics {
                 options.collect_diagnostics()
             } else {
@@ -153,7 +153,7 @@ pub(crate) async fn run_unzip(
                 UnzipCommandReport::Local(unspool::unzip_s3_zip_to_local(&client, options).await?)
             }
         }
-        (ZipSource::Local(source_zip), TreeDestination::Local(destination_dir)) => {
+        (ZipSource::Local(source_zip), TreeDestination::Local(destination_dir), selection) => {
             let options = unspool::LocalUnzipOptions::new(source_zip, destination_dir)
                 .with_concurrency(concurrency)
                 .with_selection(selection);
