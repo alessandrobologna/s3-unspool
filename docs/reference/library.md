@@ -88,6 +88,11 @@ local and S3 endpoints.
 | `with_source_window_memory_budget_mb(...)` | unset | Derive the resident source block window from available memory. |
 | `with_put_retry_policy(...)` | 6 attempts | Destination PUT retry and `SlowDown` backoff behavior. |
 
+`SyncOptions` has read-only accessors for these tuning knobs. For adaptive
+window sizing, the accessor returns the configured value; collect diagnostics
+and read `SyncDiagnostics::source_window_capacity` to inspect the effective
+post-manifest capacity used by a run.
+
 ## See Also
 
 - [Use the Rust Library](../how-to/use-rust-library.md)

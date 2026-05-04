@@ -35,11 +35,11 @@ use crate::zip_manifest::{
 };
 use crate::{
     ComparisonMode, ConflictPolicy, DestinationCleanup, DryRunOperationStatus, Error,
-    LocalUnzipOptions, LocalZipOptions, ObjectReport, OperationStatus, PutRetryPolicy, S3Object,
-    S3Prefix, S3PrefixLocalZipOptions, SyncOptions, SyncReport, SyncSummary, UnzipSelection,
-    UploadProgress, UploadProgressHandler, ZipCompression, dry_run_unzip_file_to_local,
-    dry_run_zip_directory_to_file, unzip_file_to_local, zip_directory_to_file,
-    zip_s3_prefix_to_file,
+    LocalUnzipOptions, LocalZipOptions, ObjectReport, OperationStatus, PutRetryPolicy, RetryJitter,
+    S3Object, S3Prefix, S3PrefixLocalZipOptions, SyncOptions, SyncReport, SyncSummary,
+    UnzipSelection, UploadProgress, UploadProgressHandler, ZipCompression,
+    dry_run_unzip_file_to_local, dry_run_zip_directory_to_file, unzip_file_to_local,
+    zip_directory_to_file, zip_s3_prefix_to_file,
 };
 
 #[test]
@@ -112,10 +112,63 @@ fn sync_options_use_embedded_catalog_by_default() {
         S3Prefix::parse("s3://bucket/destination/").unwrap(),
     );
 
-    assert_eq!(options.cleanup, DestinationCleanup::KeepExtra);
-    assert_eq!(options.comparison, ComparisonMode::CatalogThenHash);
-    assert_eq!(options.conflict_policy, ConflictPolicy::ReportAndContinue);
-    assert!(options.collect_operations);
+    assert_eq!(options.cleanup(), DestinationCleanup::KeepExtra);
+    assert_eq!(options.comparison_mode(), ComparisonMode::CatalogThenHash);
+    assert_eq!(options.conflict_policy(), ConflictPolicy::ReportAndContinue);
+    assert!(options.collects_operations());
+}
+
+#[test]
+fn sync_options_accessors_expose_tuning_configuration() {
+    let retry_policy = PutRetryPolicy::default()
+        .with_max_attempts(3)
+        .with_base_delay(Duration::from_millis(25))
+        .with_max_delay(Duration::from_secs(2))
+        .with_slowdown_base_delay(Duration::from_millis(250))
+        .with_slowdown_max_delay(Duration::from_secs(8))
+        .with_jitter(RetryJitter::None);
+    let options = SyncOptions::new(
+        S3Object::parse("s3://bucket/source.zip").unwrap(),
+        S3Prefix::parse("s3://bucket/destination/").unwrap(),
+    )
+    .with_concurrency(7)
+    .with_put_concurrency(5)
+    .with_put_retry_policy(retry_policy)
+    .with_source_block_size(1024)
+    .with_source_block_merge_gap(128)
+    .with_source_get_concurrency(3)
+    .with_source_window_capacity(4096)
+    .with_source_window_memory_budget_mb(512)
+    .with_body_chunk_size(2048)
+    .with_pipe_capacity(8192);
+
+    assert_eq!(options.concurrency(), 7);
+    assert_eq!(options.put_concurrency(), 5);
+    assert_eq!(options.put_retry_policy().max_attempts(), 3);
+    assert_eq!(
+        options.put_retry_policy().base_delay(),
+        Duration::from_millis(25)
+    );
+    assert_eq!(
+        options.put_retry_policy().max_delay(),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        options.put_retry_policy().slowdown_base_delay(),
+        Duration::from_millis(250)
+    );
+    assert_eq!(
+        options.put_retry_policy().slowdown_max_delay(),
+        Duration::from_secs(8)
+    );
+    assert_eq!(options.put_retry_policy().jitter(), RetryJitter::None);
+    assert_eq!(options.source_block_size(), 1024);
+    assert_eq!(options.source_block_merge_gap(), 128);
+    assert_eq!(options.source_get_concurrency(), 3);
+    assert_eq!(options.source_window_capacity(), 4096);
+    assert_eq!(options.source_window_memory_budget_mb(), Some(512));
+    assert_eq!(options.body_chunk_size(), 2048);
+    assert_eq!(options.pipe_capacity(), 8192);
 }
 
 #[test]
@@ -248,7 +301,7 @@ fn adaptive_source_window_resolves_after_manifest_count_is_known() {
 
     resolve_source_window_capacity(&mut options, 3 * 1024 * 1024 * 1024, 49_152);
 
-    assert_eq!(options.source_window_capacity, 16 * 1024 * 1024);
+    assert_eq!(options.source_window_capacity(), 16 * 1024 * 1024);
 }
 
 #[test]

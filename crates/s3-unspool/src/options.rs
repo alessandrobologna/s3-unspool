@@ -307,9 +307,53 @@ impl SyncOptions {
         self.concurrency
     }
 
+    /// Returns the maximum number of destination `PutObject` requests in flight.
+    pub fn put_concurrency(&self) -> usize {
+        self.put_concurrency
+    }
+
+    /// Returns the retry and backoff policy for destination `PutObject` attempts.
+    pub fn put_retry_policy(&self) -> &PutRetryPolicy {
+        &self.put_retry_policy
+    }
+
+    /// Returns the maximum size for planned source ZIP blocks.
+    pub fn source_block_size(&self) -> usize {
+        self.source_block_size
+    }
+
+    /// Returns the maximum gap that can be read while coalescing adjacent source spans.
+    pub fn source_block_merge_gap(&self) -> usize {
+        self.source_block_merge_gap
+    }
+
+    /// Returns the maximum number of ranged source `GetObject` requests in flight.
+    pub fn source_get_concurrency(&self) -> usize {
+        self.source_get_concurrency
+    }
+
+    /// Returns the configured source block window capacity.
+    ///
+    /// When [`Self::with_source_window_memory_budget_mb`] is used, extraction
+    /// derives the effective post-manifest value at runtime and reports it in
+    /// [`crate::SyncDiagnostics::source_window_capacity`] when diagnostics are collected.
+    pub fn source_window_capacity(&self) -> usize {
+        self.source_window_capacity
+    }
+
     /// Returns the available memory budget, in MiB, used to derive the source block window.
     pub fn source_window_memory_budget_mb(&self) -> Option<u64> {
         self.source_window_memory_budget_mb
+    }
+
+    /// Returns the buffer size used when streaming entry bodies to S3.
+    pub fn body_chunk_size(&self) -> usize {
+        self.body_chunk_size
+    }
+
+    /// Returns the in-memory pipe capacity between decompression and S3 upload.
+    pub fn pipe_capacity(&self) -> usize {
+        self.pipe_capacity
     }
 
     /// Sets ZIP entry selection patterns.
@@ -470,6 +514,36 @@ impl Default for PutRetryPolicy {
 }
 
 impl PutRetryPolicy {
+    /// Returns the maximum number of application-level `PutObject` attempts.
+    pub fn max_attempts(&self) -> usize {
+        self.max_attempts
+    }
+
+    /// Returns the base delay for retryable non-throttling failures.
+    pub fn base_delay(&self) -> Duration {
+        self.base_delay
+    }
+
+    /// Returns the maximum delay for retryable non-throttling failures.
+    pub fn max_delay(&self) -> Duration {
+        self.max_delay
+    }
+
+    /// Returns the base delay for throttling failures such as S3 `SlowDown`.
+    pub fn slowdown_base_delay(&self) -> Duration {
+        self.slowdown_base_delay
+    }
+
+    /// Returns the maximum delay for throttling failures such as S3 `SlowDown`.
+    pub fn slowdown_max_delay(&self) -> Duration {
+        self.slowdown_max_delay
+    }
+
+    /// Returns the jitter mode applied to computed retry delays.
+    pub fn jitter(&self) -> RetryJitter {
+        self.jitter
+    }
+
     /// Sets the maximum number of application-level `PutObject` attempts.
     pub fn with_max_attempts(mut self, max_attempts: usize) -> Self {
         self.max_attempts = max_attempts;

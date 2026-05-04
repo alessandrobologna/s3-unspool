@@ -12,8 +12,8 @@ All notable changes to this project are documented here.
   how-to guides, reference pages, and explanation pages.
 - Added storage economics guidance and generated SVG chart assets for
   compressed-storage scenarios.
-- Added read-only accessors for `SyncOptions` so callers can inspect resolved
-  configuration without mutating public fields.
+- Added read-only accessors for `SyncOptions` so callers can inspect
+  extraction configuration without mutating public fields.
 
 ### Changed
 
