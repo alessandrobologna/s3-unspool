@@ -216,7 +216,7 @@ fn adaptive_lambda_put_concurrency(entry_workers: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use s3_unspool::AdaptiveSourceWindow;
+    use s3_unspool::{AdaptiveSourceWindow, ComparisonMode, ConflictPolicy, DestinationCleanup};
 
     #[test]
     fn parses_minimal_camel_case_payload() {
@@ -260,7 +260,23 @@ mod tests {
         let concurrency = payload
             .concurrency
             .unwrap_or_else(|| adaptive_lambda_concurrency(256));
-        payload.into_options(concurrency).unwrap();
+        let options = payload.into_options(concurrency).unwrap();
+
+        assert_eq!(options.source().bucket, "test-bucket");
+        assert_eq!(options.source().key, "source/archive.zip");
+        assert_eq!(options.destination().bucket, "test-bucket");
+        assert_eq!(options.destination().prefix, "dest");
+        assert_eq!(options.cleanup(), DestinationCleanup::DeleteExtra);
+        assert!(options.collects_diagnostics());
+        assert_eq!(options.concurrency(), 8);
+        assert_eq!(options.comparison_mode(), ComparisonMode::HashEntries);
+        assert_eq!(options.conflict_policy(), ConflictPolicy::ReportAndContinue);
+        assert!(options.collects_operations());
+        assert_eq!(options.source_window_memory_budget_mb(), None);
+        assert_eq!(
+            options.selection().as_patterns(),
+            ["docs/**/*.md", "index.md", "!docs/drafts/**"]
+        );
     }
 
     #[test]

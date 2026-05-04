@@ -262,6 +262,56 @@ impl SyncOptions {
         }
     }
 
+    /// Returns the source ZIP object.
+    pub fn source(&self) -> &S3Object {
+        &self.source
+    }
+
+    /// Returns the destination prefix.
+    pub fn destination(&self) -> &S3Prefix {
+        &self.destination
+    }
+
+    /// Returns the destination cleanup policy.
+    pub fn cleanup(&self) -> DestinationCleanup {
+        self.cleanup
+    }
+
+    /// Returns the ZIP entry selection patterns.
+    pub fn selection(&self) -> &UnzipSelection {
+        &self.selection
+    }
+
+    /// Returns whether source scheduler diagnostics are collected.
+    pub fn collects_diagnostics(&self) -> bool {
+        self.collect_diagnostics
+    }
+
+    /// Returns the ZIP entry comparison policy.
+    pub fn comparison_mode(&self) -> ComparisonMode {
+        self.comparison
+    }
+
+    /// Returns the conditional write conflict handling policy.
+    pub fn conflict_policy(&self) -> ConflictPolicy {
+        self.conflict_policy
+    }
+
+    /// Returns whether per-object operation records are collected.
+    pub fn collects_operations(&self) -> bool {
+        self.collect_operations
+    }
+
+    /// Returns the maximum number of ZIP entries processed concurrently.
+    pub fn concurrency(&self) -> usize {
+        self.concurrency
+    }
+
+    /// Returns the available memory budget, in MiB, used to derive the source block window.
+    pub fn source_window_memory_budget_mb(&self) -> Option<u64> {
+        self.source_window_memory_budget_mb
+    }
+
     /// Sets ZIP entry selection patterns.
     pub fn with_selection(mut self, selection: impl Into<UnzipSelection>) -> Self {
         self.selection = selection.into();
