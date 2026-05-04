@@ -9,7 +9,7 @@ Install the pre-release binary with `cargo-binstall` when GitHub Release
 artifacts are available:
 
 ```sh
-cargo binstall s3-unspool-cli --version 0.1.0-beta.5
+cargo binstall s3-unspool-cli --version 0.1.0-beta.6
 ```
 
 The package name is `s3-unspool-cli`, but the installed command is
