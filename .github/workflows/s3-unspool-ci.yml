@@ -7,6 +7,7 @@ on:
     paths:
       - ".github/workflows/publish-s3-unspool.yml"
       - ".github/workflows/s3-unspool-ci.yml"
+      - "CHANGELOG.md"
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/s3-unspool/**"
@@ -14,6 +15,7 @@ on:
       - "dist-workspace.toml"
       - "rust-toolchain.toml"
       - "scripts/check-crates-io-publish-target.sh"
+      - "scripts/render-release-notes.sh"
 
 permissions: {}
 
@@ -43,6 +45,9 @@ jobs:
             --component rustfmt
           rustup default "$RUSTUP_TOOLCHAIN"
           rustc --version
+
+      - name: Check release scripts
+        run: bash -n scripts/check-crates-io-publish-target.sh scripts/render-release-notes.sh
 
       - name: Check formatting
         run: cargo fmt --all -- --check
