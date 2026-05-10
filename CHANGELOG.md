@@ -4,6 +4,32 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+## 0.1.0 - 2026-05-10
+
+### Added
+
+- Prepared the first stable release of the `s3-unspool` library and
+  `s3-unspool-cli` command-line tool.
+- Included the current archive feature set: bounded-memory S3 ZIP extraction,
+  local ZIP helpers, cataloged incremental extraction, selective glob-based
+  extraction, safe conditional destination writes, Deflate support, and
+  Zstandard ZIP method 93 support.
+- Included the Diataxis-style documentation set, benchmark snapshots, fixture
+  tooling docs, release/versioning guidance, and storage economics guidance.
+
+### Changed
+
+- Promoted the library and CLI crates from `0.1.0-beta.6` to the first stable
+  `0.1.0` release.
+- Kept the builder-style Rust option APIs and explicit policy enums introduced
+  during the beta series as the stable `0.1.0` API surface.
+- Updated install and versioning documentation to use stable Cargo and
+  `cargo-binstall` commands by default.
+
+### Fixed
+
+- Scoped a Unix-only path-case helper so Windows builds stay warning-clean.
+
 ## 0.1.0-beta.6 - 2026-05-04
 
 ### Added
