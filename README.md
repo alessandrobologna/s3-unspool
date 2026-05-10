@@ -39,6 +39,39 @@ Deflate, and Zstandard method 93 entries when default features are enabled;
 destination writes are single `PutObject` requests, and destination ETags are
 expected to be single-part MD5 ETags.
 
+## Storage Economics
+
+`s3-unspool` is useful when the archive is also the storage format, not just a
+transport format. Compressible corpora such as Markdown, source code, JSON,
+logs, generated reports, and documentation snapshots can be stored as sharded
+ZIPs in S3 Standard, then restored by glob only when needed.
+
+The economic case comes from two separate effects:
+
+- compression reduces stored bytes and selected read bytes for any
+  highly-compressible corpus
+- aggregation avoids the 128 KiB minimum billable object size that applies to
+  S3 Standard-IA, S3 One Zone-IA, and S3 Glacier Instant Retrieval objects
+
+For example, the [economics model](docs/explanation/economics.md) estimates a
+100 GiB logical corpus with 1% monthly access, stored uncompressed as individual
+files versus 4:1 compressed ZIPs in S3 Standard:
+
+| Workload | ZIPs in Standard | Individual Standard | Standard-IA | Glacier Instant |
+| --- | ---: | ---: | ---: | ---: |
+| 8 KiB text files | `$0.63/mo` | `$2.35/mo` | `$20.14/mo` | `$7.74/mo` |
+| 4 MiB text files | `$0.58/mo` | `$2.30/mo` | `$1.26/mo` | `$0.43/mo` |
+
+That is not a universal win. Individual objects are usually better when callers
+need direct per-file `GetObject` access, per-file metadata, lifecycle policies,
+event notifications, CDN URLs, or frequent single-file updates. Glacier Instant
+Retrieval can also be cheaper for larger files with very cold access. The fit is
+strongest when content is mostly immutable, compresses well, and is restored by
+project, date, tenant, package, prefix, or glob.
+
+The cost examples use us-east-1 public pricing checked on 2026-05-03. Refresh
+pricing before making production storage decisions.
+
 ## Install
 
 Add the library crate:
