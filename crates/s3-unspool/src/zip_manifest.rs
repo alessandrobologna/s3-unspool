@@ -4,7 +4,9 @@ use std::sync::Arc;
 use async_zip::base::read::{WithoutEntry, ZipEntryReader};
 use async_zip::tokio::read::seek::ZipFileReader;
 use async_zip::{Compression, StoredZipEntry, ZipFile};
-use futures_lite::io::AsyncReadExt as FuturesAsyncReadExt;
+use futures_lite::io::{
+    AsyncReadExt as FuturesAsyncReadExt, AsyncSeekExt as FuturesAsyncSeekExt, SeekFrom,
+};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::catalog::{EmbeddedCatalog, catalog_md5_by_path};
@@ -12,6 +14,10 @@ use crate::constants::{EMBEDDED_CATALOG_MAX_BYTES, EMBEDDED_CATALOG_PATH, S3_SIN
 use crate::error::{Error, Result};
 use crate::range::{S3RangeReader, SourceClient};
 use crate::s3_uri::S3Prefix;
+
+// StoredZipEntry::header_size uses the 30-byte local-header fixed length with
+// central-directory name and extra lengths. Central records have 46 fixed bytes.
+const CENTRAL_DIRECTORY_FIXED_HEADER_DELTA: u64 = 46 - 30;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ZipEntryPath {
@@ -75,12 +81,19 @@ pub(crate) async fn load_zip_manifest_with_filter(
     include_entry: impl Fn(&ZipEntryPath) -> bool,
 ) -> Result<ZipManifest> {
     let reader = S3RangeReader::new(Arc::clone(&source), source_block_size);
-    let reader = ZipFileReader::with_tokio(reader).await?;
+    let mut reader = ZipFileReader::with_tokio(reader).await?;
+    let central_directory_records_end = reader.inner_mut().seek(SeekFrom::Current(0)).await?;
     let zip_file = reader.file().clone();
+    let central_directory_start = central_directory_start(
+        zip_file.entries(),
+        central_directory_records_end,
+        source.len,
+    )?;
     let build = build_manifest_entries_with_size_limit_and_filter(
         zip_file.entries(),
         destination,
         source.len,
+        central_directory_start,
         entry_size_limit,
         include_entry,
     )?;
@@ -104,11 +117,13 @@ pub(crate) fn build_manifest_entries(
     entries: &[StoredZipEntry],
     destination: &S3Prefix,
     source_len: u64,
+    central_directory_start: u64,
 ) -> Result<ManifestBuild> {
     build_manifest_entries_with_size_limit(
         entries,
         destination,
         source_len,
+        central_directory_start,
         Some(S3_SINGLE_PUT_LIMIT),
     )
 }
@@ -118,12 +133,14 @@ pub(crate) fn build_manifest_entries_with_size_limit(
     entries: &[StoredZipEntry],
     destination: &S3Prefix,
     source_len: u64,
+    central_directory_start: u64,
     entry_size_limit: Option<u64>,
 ) -> Result<ManifestBuild> {
     build_manifest_entries_with_size_limit_and_filter(
         entries,
         destination,
         source_len,
+        central_directory_start,
         entry_size_limit,
         |_| true,
     )
@@ -133,9 +150,19 @@ pub(crate) fn build_manifest_entries_with_size_limit_and_filter(
     entries: &[StoredZipEntry],
     destination: &S3Prefix,
     source_len: u64,
+    central_directory_start: u64,
     entry_size_limit: Option<u64>,
     include_entry: impl Fn(&ZipEntryPath) -> bool,
 ) -> Result<ManifestBuild> {
+    if central_directory_start > source_len {
+        return Err(Error::InvalidZipEntry {
+            path: "<central directory>".to_string(),
+            reason: format!(
+                "central directory starts at {central_directory_start}, beyond source ZIP length {source_len}"
+            ),
+        });
+    }
+
     let mut seen = HashSet::new();
     let mut manifest = Vec::new();
     let mut catalog_index = None;
@@ -178,18 +205,11 @@ pub(crate) fn build_manifest_entries_with_size_limit_and_filter(
                 ),
             });
         }
-        let payload_span_end = source_span_start
-            .checked_add(stored.header_size())
-            .and_then(|offset| offset.checked_add(stored.compressed_size()))
-            .ok_or_else(|| Error::InvalidZipEntry {
-                path: zip_path.clone(),
-                reason: "central directory entry source span overflowed".to_string(),
-            })?;
-        if payload_span_end > source_len {
+        if source_span_start >= central_directory_start {
             return Err(Error::InvalidZipEntry {
                 path: zip_path,
                 reason: format!(
-                    "central directory entry source span ends at {payload_span_end}, beyond source ZIP length {source_len}"
+                    "local file header offset {source_span_start} is not before central directory offset {central_directory_start}"
                 ),
             });
         }
@@ -210,8 +230,8 @@ pub(crate) fn build_manifest_entries_with_size_limit_and_filter(
             continue;
         }
         let source_span_end = next_source_offset(&source_offsets, source_span_start)
-            .unwrap_or(payload_span_end)
-            .min(payload_span_end);
+            .unwrap_or(central_directory_start)
+            .min(central_directory_start);
         if source_span_end <= source_span_start {
             return Err(Error::InvalidZipEntry {
                 path: zip_path,
@@ -240,6 +260,48 @@ pub(crate) fn build_manifest_entries_with_size_limit_and_filter(
         entries: manifest,
         catalog_index,
     })
+}
+
+pub(crate) fn central_directory_start(
+    entries: &[StoredZipEntry],
+    records_end: u64,
+    source_len: u64,
+) -> Result<u64> {
+    if records_end > source_len {
+        return Err(Error::InvalidZipEntry {
+            path: "<central directory>".to_string(),
+            reason: format!(
+                "central directory records end at {records_end}, beyond source ZIP length {source_len}"
+            ),
+        });
+    }
+
+    let records_size = entries.iter().try_fold(0_u64, |size, entry| {
+        let raw_comment = entry
+            .comment()
+            .alternative()
+            .unwrap_or_else(|| entry.comment().as_bytes());
+        let comment_len = u64::try_from(raw_comment.len()).map_err(|_| Error::InvalidZipEntry {
+            path: "<central directory>".to_string(),
+            reason: "central directory comment length does not fit in u64".to_string(),
+        })?;
+        size.checked_add(entry.header_size())
+            .and_then(|size| size.checked_add(CENTRAL_DIRECTORY_FIXED_HEADER_DELTA))
+            .and_then(|size| size.checked_add(comment_len))
+            .ok_or_else(|| Error::InvalidZipEntry {
+                path: "<central directory>".to_string(),
+                reason: "central directory size overflowed".to_string(),
+            })
+    })?;
+
+    records_end
+        .checked_sub(records_size)
+        .ok_or_else(|| Error::InvalidZipEntry {
+            path: "<central directory>".to_string(),
+            reason: format!(
+                "central directory size {records_size} exceeds its ending offset {records_end}"
+            ),
+        })
 }
 
 pub(crate) fn count_zip_file_entries(entries: &[StoredZipEntry]) -> Result<usize> {

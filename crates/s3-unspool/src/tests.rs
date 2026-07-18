@@ -31,7 +31,8 @@ use crate::upload::{
 use crate::zip_manifest::{
     ManifestBuild, ManifestEntry, apply_embedded_catalog, build_manifest_entries,
     build_manifest_entries_with_size_limit, build_manifest_entries_with_size_limit_and_filter,
-    count_zip_file_entries, normalize_zip_entry_path, normalize_zip_file_path,
+    central_directory_start, count_zip_file_entries, normalize_zip_entry_path,
+    normalize_zip_file_path,
 };
 use crate::{
     ComparisonMode, ConflictPolicy, DestinationCleanup, DryRunOperationStatus, Error,
@@ -1995,13 +1996,19 @@ async fn builds_manifest_from_stored_and_deflated_entries() {
     ])
     .await;
     let source_len = data.len() as u64;
+    let central_directory_start = central_directory_offset(&data);
     let reader = async_zip::base::read::mem::ZipFileReader::new(data)
         .await
         .unwrap();
     let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
 
-    let manifest =
-        build_manifest_entries(reader.file().entries(), &destination, source_len).unwrap();
+    let manifest = build_manifest_entries(
+        reader.file().entries(),
+        &destination,
+        source_len,
+        central_directory_start,
+    )
+    .unwrap();
     let catalog = EmbeddedCatalog {
         version: EMBEDDED_CATALOG_VERSION,
         entries: vec![EmbeddedCatalogEntry {
@@ -2063,13 +2070,19 @@ async fn manifest_rejects_directory_entries_with_nonzero_crc() {
     let data = test_zip(&[("nested/", Compression::Stored, b"".as_slice())]).await;
     let data = set_central_crc32(data, "nested/", 1);
     let source_len = data.len() as u64;
+    let central_directory_start = central_directory_offset(&data);
     let reader = async_zip::base::read::mem::ZipFileReader::new(data)
         .await
         .unwrap();
     let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
 
-    let err =
-        build_manifest_entries(reader.file().entries(), &destination, source_len).unwrap_err();
+    let err = build_manifest_entries(
+        reader.file().entries(),
+        &destination,
+        source_len,
+        central_directory_start,
+    )
+    .unwrap_err();
 
     assert!(matches!(
         err,
@@ -2082,6 +2095,7 @@ async fn manifest_rejects_directory_entries_with_nonzero_crc() {
 async fn manifest_size_limit_can_be_disabled_for_local_unzip() {
     let data = test_zip(&[("large.txt", Compression::Stored, b"alpha".as_slice())]).await;
     let source_len = data.len() as u64;
+    let central_directory_start = central_directory_offset(&data);
     let reader = async_zip::base::read::mem::ZipFileReader::new(data)
         .await
         .unwrap();
@@ -2091,6 +2105,7 @@ async fn manifest_size_limit_can_be_disabled_for_local_unzip() {
         reader.file().entries(),
         &destination,
         source_len,
+        central_directory_start,
         Some(4),
     )
     .unwrap_err();
@@ -2102,6 +2117,7 @@ async fn manifest_size_limit_can_be_disabled_for_local_unzip() {
         reader.file().entries(),
         &destination,
         source_len,
+        central_directory_start,
         None,
     )
     .unwrap();
@@ -2119,6 +2135,7 @@ async fn manifest_selection_skips_unselected_size_limit_failures() {
     ])
     .await;
     let source_len = data.len() as u64;
+    let central_directory_start = central_directory_offset(&data);
     let reader = async_zip::base::read::mem::ZipFileReader::new(data)
         .await
         .unwrap();
@@ -2128,6 +2145,7 @@ async fn manifest_selection_skips_unselected_size_limit_failures() {
         reader.file().entries(),
         &destination,
         source_len,
+        central_directory_start,
         Some(4),
         |entry| entry.path == "selected.txt",
     )
@@ -2138,23 +2156,25 @@ async fn manifest_selection_skips_unselected_size_limit_failures() {
 }
 
 #[tokio::test]
-async fn manifest_uses_payload_end_as_last_entry_span_end() {
+async fn manifest_uses_central_directory_start_as_last_entry_span_end() {
     let data = test_zip(&[("last.txt", Compression::Stored, b"alpha".as_slice())]).await;
     let source_len = data.len() as u64;
+    let central_directory_start = central_directory_offset(&data);
     let reader = async_zip::base::read::mem::ZipFileReader::new(data)
         .await
         .unwrap();
     let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
 
-    let manifest =
-        build_manifest_entries(reader.file().entries(), &destination, source_len).unwrap();
+    let manifest = build_manifest_entries(
+        reader.file().entries(),
+        &destination,
+        source_len,
+        central_directory_start,
+    )
+    .unwrap();
 
     assert_eq!(manifest.entries.len(), 1);
-    let stored = &reader.file().entries()[0];
-    assert_eq!(
-        manifest.entries[0].source_span_end,
-        stored.header_offset() + stored.header_size() + stored.compressed_size()
-    );
+    assert_eq!(manifest.entries[0].source_span_end, central_directory_start);
     assert!(manifest.entries[0].source_span_end < source_len);
 }
 
@@ -2165,19 +2185,25 @@ async fn manifest_rejects_header_offsets_outside_source_length() {
         ("b.txt", Compression::Stored, b"bravo".as_slice()),
     ])
     .await;
+    let central_directory_start = central_directory_offset(&data);
     let reader = async_zip::base::read::mem::ZipFileReader::new(data)
         .await
         .unwrap();
     let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
     let truncated_source_len = reader.file().entries()[1].header_offset();
 
-    let err = build_manifest_entries(reader.file().entries(), &destination, truncated_source_len)
-        .unwrap_err();
+    let err = build_manifest_entries(
+        reader.file().entries(),
+        &destination,
+        truncated_source_len,
+        central_directory_start,
+    )
+    .unwrap_err();
 
     assert!(matches!(
         err,
         Error::InvalidZipEntry { ref path, ref reason }
-            if path == "b.txt" && reason.contains("outside source ZIP length")
+            if path == "<central directory>" && reason.contains("beyond source ZIP length")
     ));
 }
 
@@ -2209,12 +2235,18 @@ async fn entry_reader_streams_stored_and_deflated_entries_from_cached_ranges() {
     ])
     .await;
     let source_len = data.len() as u64;
+    let central_directory_start = central_directory_offset(&data);
     let reader = async_zip::base::read::mem::ZipFileReader::new(data.clone())
         .await
         .unwrap();
     let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
-    let manifest =
-        build_manifest_entries(reader.file().entries(), &destination, source_len).unwrap();
+    let manifest = build_manifest_entries(
+        reader.file().entries(),
+        &destination,
+        source_len,
+        central_directory_start,
+    )
+    .unwrap();
     let store = block_store_from_zip(data, &manifest.entries);
 
     let mut stored_reader = entry_reader(Arc::clone(&store), &manifest.entries[0])
@@ -2234,17 +2266,129 @@ async fn entry_reader_streams_stored_and_deflated_entries_from_cached_ranges() {
     assert_eq!(deflated, b"bravo");
 }
 
+#[tokio::test]
+async fn entry_reader_streams_infozip_entries_with_longer_local_timestamp_extras() {
+    let local_timestamp = [
+        0x55, 0x54, 0x09, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let central_timestamp = [0x55, 0x54, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
+    let fixture = stored_zip_with_asymmetric_extras(&[
+        StoredZipFixtureEntry {
+            path: "first.txt",
+            data: b"a",
+            local_extra: &local_timestamp,
+            central_extra: &central_timestamp,
+            force_local_zip64: false,
+        },
+        StoredZipFixtureEntry {
+            path: "last.txt",
+            data: b"bravo",
+            local_extra: &local_timestamp,
+            central_extra: &central_timestamp,
+            force_local_zip64: false,
+        },
+    ]);
+    let source_len = fixture.bytes.len() as u64;
+    let reader = async_zip::base::read::mem::ZipFileReader::new(fixture.bytes.clone())
+        .await
+        .unwrap();
+    let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
+    let manifest = build_manifest_entries(
+        reader.file().entries(),
+        &destination,
+        source_len,
+        fixture.central_directory_start,
+    )
+    .unwrap();
+
+    assert_eq!(manifest.entries.len(), 2);
+    assert_eq!(
+        manifest.entries[0].source_span_end,
+        manifest.entries[1].source_span_start
+    );
+    assert_eq!(
+        manifest.entries[1].source_span_end,
+        fixture.central_directory_start
+    );
+
+    let store = block_store_from_zip(fixture.bytes, &manifest.entries);
+    for (entry, expected) in manifest.entries.iter().zip([b"a".as_slice(), b"bravo"]) {
+        let mut reader = entry_reader(Arc::clone(&store), entry).await.unwrap();
+        let mut actual = Vec::new();
+        TokioAsyncReadExt::read_to_end(&mut reader, &mut actual)
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[tokio::test]
+async fn entry_reader_streams_python_force_zip64_local_extra() {
+    let local_zip64 = [
+        0x01, 0x00, 0x10, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let fixture = stored_zip_with_asymmetric_extras(&[StoredZipFixtureEntry {
+        path: "python.txt",
+        data: b"alpha",
+        local_extra: &local_zip64,
+        central_extra: &[],
+        force_local_zip64: true,
+    }]);
+    let source_len = fixture.bytes.len() as u64;
+    let reader = async_zip::base::read::mem::ZipFileReader::new(fixture.bytes.clone())
+        .await
+        .unwrap();
+    let parsed_central_directory_start = central_directory_start(
+        reader.file().entries(),
+        fixture.central_directory_end,
+        source_len,
+    )
+    .unwrap();
+    assert_eq!(
+        parsed_central_directory_start,
+        fixture.central_directory_start
+    );
+
+    let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
+    let manifest = build_manifest_entries(
+        reader.file().entries(),
+        &destination,
+        source_len,
+        parsed_central_directory_start,
+    )
+    .unwrap();
+    assert_eq!(
+        manifest.entries[0].source_span_end,
+        fixture.central_directory_start
+    );
+
+    let store = block_store_from_zip(fixture.bytes, &manifest.entries);
+    let mut reader = entry_reader(store, &manifest.entries[0]).await.unwrap();
+    let mut actual = Vec::new();
+    TokioAsyncReadExt::read_to_end(&mut reader, &mut actual)
+        .await
+        .unwrap();
+    assert_eq!(actual, b"alpha");
+}
+
 #[cfg(feature = "zstd")]
 #[tokio::test]
 async fn entry_reader_streams_zstd_entries_from_cached_ranges() {
     let data = test_zip(&[("zstd.txt", Compression::Zstd, b"charlie".as_slice())]).await;
     let source_len = data.len() as u64;
+    let central_directory_start = central_directory_offset(&data);
     let reader = async_zip::base::read::mem::ZipFileReader::new(data.clone())
         .await
         .unwrap();
     let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
-    let manifest =
-        build_manifest_entries(reader.file().entries(), &destination, source_len).unwrap();
+    let manifest = build_manifest_entries(
+        reader.file().entries(),
+        &destination,
+        source_len,
+        central_directory_start,
+    )
+    .unwrap();
     let store = block_store_from_zip(data, &manifest.entries);
 
     assert_eq!(manifest.entries[0].compression, Compression::Zstd);
@@ -2263,12 +2407,18 @@ async fn entry_reader_rejects_local_header_name_mismatch() {
     let data = test_zip(&[("a.txt", Compression::Stored, b"alpha".as_slice())]).await;
     let data = replace_first_local_file_name(data, b"a.txt", b"b.txt");
     let source_len = data.len() as u64;
+    let central_directory_start = central_directory_offset(&data);
     let reader = async_zip::base::read::mem::ZipFileReader::new(data.clone())
         .await
         .unwrap();
     let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
-    let manifest =
-        build_manifest_entries(reader.file().entries(), &destination, source_len).unwrap();
+    let manifest = build_manifest_entries(
+        reader.file().entries(),
+        &destination,
+        source_len,
+        central_directory_start,
+    )
+    .unwrap();
     let store = block_store_from_zip(data, &manifest.entries);
 
     let err = match entry_reader(store, &manifest.entries[0]).await {
@@ -2283,12 +2433,18 @@ async fn entry_reader_rejects_local_header_name_mismatch() {
 async fn entry_reader_rejects_local_header_lengths_outside_source_span() {
     let data = test_zip(&[("a.txt", Compression::Stored, b"alpha".as_slice())]).await;
     let source_len = data.len() as u64;
+    let central_directory_start = central_directory_offset(&data);
     let reader = async_zip::base::read::mem::ZipFileReader::new(data.clone())
         .await
         .unwrap();
     let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
-    let mut manifest =
-        build_manifest_entries(reader.file().entries(), &destination, source_len).unwrap();
+    let mut manifest = build_manifest_entries(
+        reader.file().entries(),
+        &destination,
+        source_len,
+        central_directory_start,
+    )
+    .unwrap();
     manifest.entries[0].source_span_end = manifest.entries[0].source_offset + 30;
     let store = block_store_from_zip(data, &manifest.entries);
 
@@ -2309,12 +2465,18 @@ async fn entry_reader_rejects_encrypted_local_header() {
     let data = test_zip(&[("a.txt", Compression::Stored, b"alpha".as_slice())]).await;
     let mut data = set_first_local_general_purpose_flags(data, 1);
     let source_len = data.len() as u64;
+    let central_directory_start = central_directory_offset(&data);
     let reader = async_zip::base::read::mem::ZipFileReader::new(data.clone())
         .await
         .unwrap();
     let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
-    let manifest =
-        build_manifest_entries(reader.file().entries(), &destination, source_len).unwrap();
+    let manifest = build_manifest_entries(
+        reader.file().entries(),
+        &destination,
+        source_len,
+        central_directory_start,
+    )
+    .unwrap();
     let store = block_store_from_zip(std::mem::take(&mut data), &manifest.entries);
 
     let err = match entry_reader(store, &manifest.entries[0]).await {
@@ -2341,13 +2503,19 @@ async fn manifest_ignores_embedded_catalog_entry() {
     ])
     .await;
     let source_len = data.len() as u64;
+    let central_directory_start = central_directory_offset(&data);
     let reader = async_zip::base::read::mem::ZipFileReader::new(data)
         .await
         .unwrap();
     let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
 
-    let manifest =
-        build_manifest_entries(reader.file().entries(), &destination, source_len).unwrap();
+    let manifest = build_manifest_entries(
+        reader.file().entries(),
+        &destination,
+        source_len,
+        central_directory_start,
+    )
+    .unwrap();
 
     assert_eq!(manifest.entries.len(), 1);
     assert_eq!(manifest.entries[0].zip_path, "a.txt");
@@ -2598,13 +2766,19 @@ async fn rejects_duplicate_zip_paths_in_manifest() {
     ])
     .await;
     let source_len = data.len() as u64;
+    let central_directory_start = central_directory_offset(&data);
     let reader = async_zip::base::read::mem::ZipFileReader::new(data)
         .await
         .unwrap();
     let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
 
-    let err =
-        build_manifest_entries(reader.file().entries(), &destination, source_len).unwrap_err();
+    let err = build_manifest_entries(
+        reader.file().entries(),
+        &destination,
+        source_len,
+        central_directory_start,
+    )
+    .unwrap_err();
 
     assert!(matches!(err, Error::DuplicateZipPath(path) if path == "same.txt"));
 }
@@ -2617,20 +2791,22 @@ async fn manifest_last_entry_span_excludes_central_directory() {
     ])
     .await;
     let source_len = data.len() as u64;
+    let central_directory_start = central_directory_offset(&data);
     let reader = async_zip::base::read::mem::ZipFileReader::new(data)
         .await
         .unwrap();
     let destination = S3Prefix::parse("s3://bucket/prefix/").unwrap();
 
-    let manifest =
-        build_manifest_entries(reader.file().entries(), &destination, source_len).unwrap();
+    let manifest = build_manifest_entries(
+        reader.file().entries(),
+        &destination,
+        source_len,
+        central_directory_start,
+    )
+    .unwrap();
     let last = manifest.entries.last().unwrap();
-    let stored = reader.file().entries().last().unwrap();
 
-    assert_eq!(
-        last.source_span_end,
-        stored.header_offset() + stored.header_size() + stored.compressed_size()
-    );
+    assert_eq!(last.source_span_end, central_directory_start);
     assert!(last.source_span_end < source_len);
 }
 
@@ -2641,6 +2817,118 @@ async fn test_zip(entries: &[(&str, Compression, &[u8])]) -> Vec<u8> {
         writer.write_entry_whole(entry, data).await.unwrap();
     }
     writer.close().await.unwrap()
+}
+
+struct StoredZipFixture {
+    bytes: Vec<u8>,
+    central_directory_start: u64,
+    central_directory_end: u64,
+}
+
+struct StoredZipFixtureEntry<'a> {
+    path: &'a str,
+    data: &'a [u8],
+    local_extra: &'a [u8],
+    central_extra: &'a [u8],
+    force_local_zip64: bool,
+}
+
+fn stored_zip_with_asymmetric_extras(entries: &[StoredZipFixtureEntry<'_>]) -> StoredZipFixture {
+    let mut bytes = Vec::new();
+    let mut central_entries = Vec::with_capacity(entries.len());
+
+    for entry in entries {
+        let StoredZipFixtureEntry {
+            path,
+            data,
+            local_extra,
+            central_extra,
+            force_local_zip64,
+        } = entry;
+        let local_header_offset = u32::try_from(bytes.len()).unwrap();
+        let size = u32::try_from(data.len()).unwrap();
+        let local_size = if *force_local_zip64 { u32::MAX } else { size };
+        let version_needed = if *force_local_zip64 { 45_u16 } else { 20_u16 };
+        let crc32 = crc32fast::hash(data);
+
+        bytes.extend_from_slice(&0x0403_4b50_u32.to_le_bytes());
+        bytes.extend_from_slice(&version_needed.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&crc32.to_le_bytes());
+        bytes.extend_from_slice(&local_size.to_le_bytes());
+        bytes.extend_from_slice(&local_size.to_le_bytes());
+        bytes.extend_from_slice(&u16::try_from(path.len()).unwrap().to_le_bytes());
+        bytes.extend_from_slice(&u16::try_from(local_extra.len()).unwrap().to_le_bytes());
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.extend_from_slice(local_extra);
+        bytes.extend_from_slice(data);
+
+        central_entries.push((
+            *path,
+            central_extra,
+            version_needed,
+            crc32,
+            size,
+            local_header_offset,
+        ));
+    }
+
+    let central_directory_start = bytes.len() as u64;
+    for (path, extra, version_needed, crc32, size, local_header_offset) in central_entries {
+        bytes.extend_from_slice(&0x0201_4b50_u32.to_le_bytes());
+        bytes.extend_from_slice(&20_u16.to_le_bytes());
+        bytes.extend_from_slice(&version_needed.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&crc32.to_le_bytes());
+        bytes.extend_from_slice(&size.to_le_bytes());
+        bytes.extend_from_slice(&size.to_le_bytes());
+        bytes.extend_from_slice(&u16::try_from(path.len()).unwrap().to_le_bytes());
+        bytes.extend_from_slice(&u16::try_from(extra.len()).unwrap().to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&local_header_offset.to_le_bytes());
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.extend_from_slice(extra);
+    }
+    let central_directory_end = bytes.len() as u64;
+    let central_directory_size =
+        u32::try_from(central_directory_end - central_directory_start).unwrap();
+    let entry_count = u16::try_from(entries.len()).unwrap();
+
+    bytes.extend_from_slice(&0x0605_4b50_u32.to_le_bytes());
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes.extend_from_slice(&entry_count.to_le_bytes());
+    bytes.extend_from_slice(&entry_count.to_le_bytes());
+    bytes.extend_from_slice(&central_directory_size.to_le_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(central_directory_start)
+            .unwrap()
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+
+    StoredZipFixture {
+        bytes,
+        central_directory_start,
+        central_directory_end,
+    }
+}
+
+fn central_directory_offset(data: &[u8]) -> u64 {
+    let eocd = data
+        .windows(4)
+        .rposition(|window| window == [0x50, 0x4b, 0x05, 0x06])
+        .expect("test fixture should contain an end-of-central-directory record");
+    u32::from_le_bytes(data[eocd + 16..eocd + 20].try_into().unwrap()) as u64
 }
 
 async fn load_catalog_from_zip(
