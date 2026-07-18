@@ -1,11 +1,19 @@
 # Release and Versioning
 
+Stable releases use normal Cargo SemVer versions. Consumers can install the
+library and CLI without a pre-release qualifier:
+
+```sh
+cargo add s3-unspool
+cargo binstall s3-unspool-cli
+```
+
 Pre-release versions, when available, use standard Cargo SemVer pre-release
-identifiers such as `0.1.0-alpha.1`, `0.1.0-beta.1`, or `0.1.0-rc.1`.
+identifiers such as `0.2.0-alpha.1`, `0.2.0-beta.1`, or `0.2.0-rc.1`.
 Consumers opt into a pre-release explicitly:
 
 ```sh
-cargo add s3-unspool@0.1.0-beta.6
+cargo add s3-unspool@0.2.0-beta.1
 ```
 
 Releases are published by the manual `Publish s3-unspool` GitHub Actions

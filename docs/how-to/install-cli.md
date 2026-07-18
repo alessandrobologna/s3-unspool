@@ -5,16 +5,16 @@ terminal.
 
 ## Install a Prebuilt Release
 
-Install the pre-release binary with `cargo-binstall` when GitHub Release
-artifacts are available:
+Install the binary with `cargo-binstall` when GitHub Release artifacts are
+available:
 
 ```sh
-cargo binstall s3-unspool-cli --version 0.1.0-beta.6
+cargo binstall s3-unspool-cli
 ```
 
 The package name is `s3-unspool-cli`, but the installed command is
-`s3-unspool`. Current releases are prereleases, so include the explicit version.
-An unqualified `cargo binstall s3-unspool-cli` resolves stable versions only.
+`s3-unspool`. To pin the first stable release explicitly, use
+`cargo binstall s3-unspool-cli@0.1.0`.
 
 ## Build from a Checkout
 

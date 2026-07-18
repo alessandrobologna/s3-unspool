@@ -87,14 +87,16 @@ cargo add aws-config aws-sdk-s3
 cargo add tokio --features macros,rt-multi-thread
 ```
 
-Install the pre-release CLI when GitHub Release artifacts are available:
+Install the CLI with `cargo-binstall` when GitHub Release artifacts are
+available:
 
 ```sh
-cargo binstall s3-unspool-cli --version 0.1.0-beta.6
+cargo binstall s3-unspool-cli
 ```
 
 The CLI crate is named `s3-unspool-cli`, but the installed command is
-`s3-unspool`. Current releases are prereleases, so include the explicit version.
+`s3-unspool`. To pin the first stable release explicitly, use
+`cargo binstall s3-unspool-cli@0.1.0`.
 
 ## Minimal Rust Example
 
@@ -141,7 +143,7 @@ Start at [docs/README.md](docs/README.md) for the full documentation map.
 | Path | Purpose |
 | --- | --- |
 | `crates/s3-unspool` | Published Rust library crate |
-| `crates/s3-unspool-cli` | Published pre-release CLI crate; installs `s3-unspool` |
+| `crates/s3-unspool-cli` | Published CLI crate; installs `s3-unspool` |
 | `tools/lambda-benchmark` | SAM/Cargo Lambda benchmark harness and runner |
 | `tools/fixturegen` | Local fixture generation package |
 | `docs/` | Tutorials, how-to guides, reference, explanation, and generated chart assets |
